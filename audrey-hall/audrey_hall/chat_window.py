@@ -389,6 +389,9 @@ class ChatWindow:
             int(self.window_theme['min_width'] * scale),
             int(self.window_theme['min_height'] * scale),
         )
+        # 全局 Ctrl+C 复制快捷键
+        self.window.bind('<Control-c>', self._handle_window_copy)
+        self.window.bind('<Control-C>', self._handle_window_copy)
         self.window.configure(bg=self.colors['bg'])
         self.window.protocol('WM_DELETE_WINDOW', self.close)
 
@@ -571,13 +574,18 @@ class ChatWindow:
                 was_at_bottom = yview[1] >= 0.99
             except Exception:
                 pass
+            msg_char_width = self._pixels_to_chars(self._transcript_width - 60)
             for widget in self._message_widgets:
                 try:
                     if widget.winfo_exists():
                         widget.configure(width=self._transcript_width)
                         # 同步更新子行组件的宽度
                         for child in widget.winfo_children():
-                            child.configure(width=self._transcript_width)
+                            if isinstance(child, tk.Text):
+                                # Text 组件的 width 以字符为单位
+                                child.configure(width=msg_char_width)
+                            else:
+                                child.configure(width=self._transcript_width)
                 except Exception:
                     pass
             # 清理已销毁的组件引用
@@ -702,6 +710,17 @@ class ChatWindow:
         toolbar.pack(fill=tk.X, padx=12, pady=(10, 8))
         create_button(
             toolbar,
+            text='新建会话',
+            command=self._new_conversation,
+            theme=self.theme,
+            variant='secondary',
+            font=self.fonts['small'],
+            style_overrides=self._aurora_button_style(),
+            padx=8,
+            pady=4,
+        ).pack(side=tk.RIGHT)
+        create_button(
+            toolbar,
             text='刷新',
             command=self._refresh_history_sidebar,
             theme=self.theme,
@@ -710,7 +729,7 @@ class ChatWindow:
             style_overrides=self._aurora_button_style(),
             padx=8,
             pady=4,
-        ).pack(side=tk.LEFT)
+        ).pack(side=tk.RIGHT, padx=(0, 6))
 
         list_frame = tk.Frame(parent, bg=self.colors['panel'])
         list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
@@ -1027,7 +1046,7 @@ class ChatWindow:
             self._reset_transcript_view()
             self._append_message(
                 'assistant',
-                '你好，我已经准备好作为 Audrey Hall 的本地 Claude Code 助手。\n\n按 Ctrl+Enter 发送。',
+                '不属于这个时代的愚者...\n\n灰雾之上的神秘主宰...\n\n执掌好运的黄黑之王...\n\n \n\n按 Ctrl+Enter 发送。',
             )
             self._append_inline_status('已删除当前会话，准备开启新对话。')
             self._reconnect_session(announce=True)
@@ -1048,7 +1067,7 @@ class ChatWindow:
         self._reset_transcript_view()
         self._append_message(
             'assistant',
-            '你好，我已经准备好作为 Audrey Hall 的本地 Claude Code 助手。\n\n按 Ctrl+Enter 发送。',
+            '不属于这个时代的愚者...\n\n灰雾之上的神秘主宰...\n\n执掌好运的黄黑之王...\n\n \n\n按 Ctrl+Enter 发送。',
         )
         self._append_inline_status('已清除当前对话，准备开启新会话。')
         self._reconnect_session(announce=True)
@@ -1057,6 +1076,22 @@ class ChatWindow:
         if current_session_id:
             self._delete_session_file(current_session_id)
 
+        self._refresh_history_sidebar()
+
+    def _new_conversation(self):
+        if self._busy:
+            self._append_inline_status('Claude 正在处理当前请求，请稍后再新建会话。')
+            return
+
+        self._resume_session_id = ''
+        self._active_session_id = ''
+        self._reset_transcript_view()
+        self._append_message(
+            'assistant',
+            '不属于这个时代的愚者...\n\n灰雾之上的神秘主宰...\n\n执掌好运的黄黑之王...\n\n \n\n按 Ctrl+Enter 发送。',
+        )
+        self._append_inline_status('已创建新会话。')
+        self._reconnect_session(announce=True)
         self._refresh_history_sidebar()
 
     def _reset_transcript_view(self):
@@ -2337,21 +2372,31 @@ class ChatWindow:
             bubble_wrap = tk.Frame(content_col, bg=self.colors['panel'])
             bubble_wrap.pack(anchor='e', fill=tk.X)
 
-            bubble = tk.Label(
+            text_width_chars = self._pixels_to_chars(520)
+            text_height = self._calc_text_display_lines(text, text_width_chars)
+            bubble = tk.Text(
                 bubble_wrap,
-                text=text,
                 font=self.fonts['base'],
                 bg=bubble_bg,
                 fg=self.colors['text_strong'],
-                justify='left',
-                anchor='w',
-                wraplength=520,
-                padx=18,
-                pady=14,
+                wrap=tk.WORD,
+                width=text_width_chars,
+                height=text_height,
+                padx=14,
+                pady=10,
                 highlightbackground='#C8D8F4',
                 highlightthickness=1,
+                bd=0,
+                relief=tk.FLAT,
+                cursor='arrow',
+                exportselection=True,
+                spacing1=4,
+                spacing3=4,
             )
+            bubble.insert('1.0', text)
+            bubble.configure(state=tk.DISABLED)
             bubble.pack(anchor='e')
+            self._bind_message_copy_events(bubble, text)
 
             meta = tk.Frame(content_col, bg=self.colors['panel'])
             meta.pack(anchor='e', pady=(6, 0))
@@ -2384,21 +2429,31 @@ class ChatWindow:
             content_col = tk.Frame(row, bg=self.colors['panel'])
             content_col.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-            bubble = tk.Label(
+            text_width_chars = self._pixels_to_chars(520)
+            text_height = self._calc_text_display_lines(text, text_width_chars)
+            bubble = tk.Text(
                 content_col,
-                text=text,
                 font=self.fonts['base'],
                 bg=bubble_bg,
                 fg=self.colors['text_strong'],
-                justify='left',
-                anchor='w',
-                wraplength=520,
-                padx=18,
-                pady=14,
+                wrap=tk.WORD,
+                width=text_width_chars,
+                height=text_height,
+                padx=14,
+                pady=10,
                 highlightbackground='#CFE2D3' if is_assistant else self.colors['gold_soft'],
                 highlightthickness=1,
+                bd=0,
+                relief=tk.FLAT,
+                cursor='arrow',
+                exportselection=True,
+                spacing1=4,
+                spacing3=4,
             )
+            bubble.insert('1.0', text)
+            bubble.configure(state=tk.DISABLED)
             bubble.pack(anchor='w')
+            self._bind_message_copy_events(bubble, text)
 
             meta = tk.Frame(content_col, bg=self.colors['panel'])
             meta.pack(anchor='w', pady=(6, 0))
@@ -2520,6 +2575,103 @@ class ChatWindow:
         if 2 <= len(options) <= 6:
             return options
         return []
+
+    # ── 文本选择与复制支持 ──────────────────────────────────────────
+
+    def _pixels_to_chars(self, pixel_width: int) -> int:
+        """将像素宽度转换为以当前字体为基准的字符宽度。"""
+        try:
+            font = tkfont.Font(font=self.fonts['base'])
+            # 使用中文字符测量，因为对话主要是中文
+            char_px = font.measure('中')
+            if char_px <= 0:
+                char_px = 10
+            return max(20, pixel_width // char_px)
+        except Exception:
+            return 50
+
+    def _calc_text_display_lines(self, text: str, char_width: int) -> int:
+        """估算文本在给定字符宽度下所需的显示行数。"""
+        lines = text.count('\n') + 1
+        # 为每行中超出宽度的部分增加额外的换行估算
+        for line in text.split('\n'):
+            if len(line) > char_width:
+                lines += len(line) // char_width
+        return max(1, min(lines, 40))
+
+    def _copy_to_clipboard(self, text: str):
+        """将文本复制到系统剪贴板。"""
+        if not text or self.window is None:
+            return
+        try:
+            self.window.clipboard_clear()
+            self.window.clipboard_append(text)
+        except Exception:
+            pass
+
+    def _copy_selection_to_clipboard(self, widget):
+        """将 Text 组件中选中的文本复制到剪贴板。"""
+        try:
+            if not widget.winfo_exists():
+                return
+            if hasattr(widget, 'tag_ranges'):
+                ranges = widget.tag_ranges(tk.SEL)
+                if ranges and len(ranges) >= 2:
+                    selected = widget.get(ranges[0], ranges[-1])
+                    if selected:
+                        self._copy_to_clipboard(selected)
+                        return True
+        except Exception:
+            pass
+        return False
+
+    def _handle_window_copy(self, event):
+        """窗口级 Ctrl+C 处理器：优先复制选中文本，否则复制焦点组件内容。"""
+        try:
+            focused = self.window.focus_get()
+            if focused is not None and hasattr(focused, 'tag_ranges'):
+                if self._copy_selection_to_clipboard(focused):
+                    return
+            # 如果焦点在主 text_area，尝试从中取选中文本
+            if self.text_area is not None:
+                try:
+                    ranges = self.text_area.tag_ranges(tk.SEL)
+                    if ranges and len(ranges) >= 2:
+                        selected = self.text_area.get(ranges[0], ranges[-1])
+                        if selected:
+                            self._copy_to_clipboard(selected)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # ── 消息组件右键复制菜单 ──────────────────────────────────────
+
+    def _show_message_context_menu(self, event, text: str, widget):
+        """在消息气泡上显示右键复制菜单。"""
+        menu = tk.Menu(event.widget, tearoff=0)
+        menu.add_command(
+            label='复制全文',
+            command=lambda: self._copy_to_clipboard(text),
+        )
+        menu.add_command(
+            label='复制选中内容',
+            command=lambda: self._copy_selection_to_clipboard(widget),
+        )
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _bind_message_copy_events(self, widget, full_text: str):
+        """为消息 Text 组件绑定选择/复制相关事件。"""
+        # 右键菜单
+        widget.bind(
+            '<Button-3>',
+            lambda e, t=full_text, w=widget: self._show_message_context_menu(e, t, w),
+        )
+        # 允许通过点击获得焦点（用于 Ctrl+C 复制）
+        widget.bind('<Button-1>', lambda e: e.widget.focus_set(), add='+')
 
     def close(self):
         if self._connection_time_timer is not None:
