@@ -1,0 +1,70 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "start \"\" \"C:\\Users\\25428\\Desktop\\File_About\\canway\\claude-code\\audrey-hall\\.venv\\Scripts\\pythonw.exe\" \"C:\\Users\\25428\\Desktop\\File_About\\canway\\claude-code\\audrey-hall\\main.py\""
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:9527/api/hook/thinking"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:9527/api/hook/working"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:9527/api/hook/done"
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:9527/api/hook/permission"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:9527/api/hook/idle"
+          }
+        ]
+      }
+    ]
+  }
+}
