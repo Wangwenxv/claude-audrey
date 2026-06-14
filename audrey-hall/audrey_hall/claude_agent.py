@@ -86,6 +86,34 @@ def _extract_tool_use_blocks(content) -> list[dict]:
     return tool_uses
 
 
+def _extract_tool_result_blocks(content) -> list[dict]:
+    """从 assistant 消息的 content 数组中提取 tool_result 块。
+    这些块包含 Edit/Write 等工具的 diff 输出，在终端上直接可见。"""
+    if not isinstance(content, list):
+        return []
+    results = []
+    for block in content:
+        if isinstance(block, dict) and block.get('type') == 'tool_result':
+            results.append(block)
+    return results
+
+
+def _safe_get_tool_result_text(block: dict) -> str:
+    """从 tool_result 块中提取文本内容（含 diff）。"""
+    inner = block.get('content')
+    if isinstance(inner, str):
+        return inner.strip()
+    if isinstance(inner, list):
+        parts = []
+        for item in inner:
+            if isinstance(item, dict) and item.get('type') == 'text':
+                t = item.get('text')
+                if isinstance(t, str) and t.strip():
+                    parts.append(t.strip())
+        return '\n'.join(parts)
+    return ''
+
+
 def _summarize_tool_input(tool_name: str, input_payload) -> str:
     if not isinstance(input_payload, dict):
         return ''
@@ -577,10 +605,13 @@ class ClaudeCodeSession:
         if msg_type == 'system':
             subtype = message.get('subtype')
             if subtype == 'init':
-                # SDK/print mode may emit system:init more than once across turns.
-                # The initialize control_response already covers the user-visible
-                # "connected" moment, so keep this internal to avoid repeated
-                # "苏醒" status spam every time a new turn starts.
+                # system:init 每轮都触发，不暴露给 UI。initialize control_response
+                # 的 ready 事件已经覆盖了连接确认，无需重复通知。
+                return
+
+            # 抑制纯内部系统子类型——它们在 CLI 终端上也不显示，
+            # 不应通过兜底分支泄漏到 UI。
+            if subtype in ('init', 'thinking_tokens', 'running'):
                 return
 
             if subtype == 'task_started':
@@ -690,12 +721,25 @@ class ClaudeCodeSession:
                 )
                 return
 
+            # 未识别的系统子类型——尝试从消息中提取有意义的内容，
+            # 不再只传 subtype 名。这样 "Updated plan" 等消息不会丢失。
+            content = (
+                _extract_string(message.get('message'))
+                or _extract_string(message.get('content'))
+                or _extract_string(message.get('text'))
+                or _extract_string(message.get('description'))
+                or _extract_string(message.get('status'))
+                or _extract_string(message.get('detail'))
+                or _extract_string(subtype)
+                or 'system'
+            )
             self._emit(
                 {
                     'kind': 'status',
                     'status': 'working',
-                    'text': subtype or 'system',
+                    'text': content,
                     'source': 'system',
+                    'raw_subtype': subtype,
                     'session_id': self._session_id,
                 }
             )
@@ -727,6 +771,18 @@ class ClaudeCodeSession:
                         'session_id': self._session_id,
                     }
                 )
+
+            # 提取 tool_result 块——包含 Edit/Write 的 diff 输出
+            for tool_result in _extract_tool_result_blocks(content):
+                result_text = _safe_get_tool_result_text(tool_result)
+                if result_text:
+                    self._emit(
+                        {
+                            'kind': 'tool_use_summary',
+                            'summary': result_text,
+                            'session_id': self._session_id,
+                        }
+                    )
 
             thinking_text = _safe_get_thinking_block(content)
             if thinking_text:
