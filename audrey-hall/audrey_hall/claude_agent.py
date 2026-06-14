@@ -12,7 +12,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CLAUDE_CODE_ROOT = PROJECT_ROOT.parent
 
 # AI 对话启动时 Claude 的默认工作目录。
-FALLBACK_WORKING_DIR = Path(r'C:\Users\25428\Desktop\File_About')
+FALLBACK_WORKING_DIR = Path(__file__).parent.parent
 DEFAULT_WORKING_DIR = (
     CLAUDE_CODE_ROOT if CLAUDE_CODE_ROOT.exists() else FALLBACK_WORKING_DIR
 )
