@@ -117,6 +117,7 @@ class ChatWindow:
         self._task_widget_done_font = None
         self._tool_status_widget = None
         self._tool_status_font = None
+        self._auto_follow_transcript = True
         self.status_var = tk.StringVar(value='正在唤醒奥黛丽的助手...')
         self._event_queue = queue.Queue()
         self._busy = False
@@ -515,7 +516,40 @@ class ChatWindow:
             pass
         self._last_message_char_width = msg_char_width
         if was_at_bottom:
-            self.text_area.after(10, lambda: self.text_area.see(tk.END))
+            self.text_area.after(10, self._maybe_follow_transcript_end)
+
+    def _capture_transcript_follow_state(self):
+        if self.text_area is None:
+            self._auto_follow_transcript = True
+            return self._auto_follow_transcript
+        try:
+            yview = self.text_area.yview()
+            self._auto_follow_transcript = yview[1] >= 0.98
+        except Exception:
+            self._auto_follow_transcript = True
+        return self._auto_follow_transcript
+
+    def _maybe_follow_transcript_end(self):
+        if self.text_area is None or not self._auto_follow_transcript:
+            return
+        try:
+            self.text_area.see(tk.END)
+        except Exception:
+            pass
+
+    def _handle_transcript_scroll_activity(self, _event=None):
+        self._capture_transcript_follow_state()
+
+    def _handle_transcript_yscroll(self, first, last):
+        if self.text_area is None:
+            return
+        try:
+            self._auto_follow_transcript = float(last) >= 0.98
+        except Exception:
+            pass
+        scrollbar = getattr(self, '_transcript_scrollbar', None)
+        if scrollbar is not None:
+            scrollbar.set(first, last)
 
     def _schedule_ui(self, callback):
         if self.window is None:
@@ -759,6 +793,7 @@ class ChatWindow:
 
         scrollbar = tk.Scrollbar(transcript_frame)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self._transcript_scrollbar = scrollbar
 
         self.text_area = tk.Text(
             transcript_frame,
@@ -769,12 +804,19 @@ class ChatWindow:
             bd=0,
             padx=self.chat_theme['transcript_pad_x'],
             pady=self.chat_theme['transcript_pad_y'],
-            yscrollcommand=scrollbar.set,
+            yscrollcommand=self._handle_transcript_yscroll,
             state=tk.DISABLED,
         )
         self.text_area.pack(fill=tk.BOTH, expand=True)
         self._transcript_container = transcript_frame
         scrollbar.config(command=self.text_area.yview)
+        self.text_area.bind('<MouseWheel>', self._handle_transcript_scroll_activity, add='+')
+        self.text_area.bind('<Button-4>', self._handle_transcript_scroll_activity, add='+')
+        self.text_area.bind('<Button-5>', self._handle_transcript_scroll_activity, add='+')
+        self.text_area.bind('<Prior>', self._handle_transcript_scroll_activity, add='+')
+        self.text_area.bind('<Next>', self._handle_transcript_scroll_activity, add='+')
+        scrollbar.bind('<ButtonPress-1>', self._handle_transcript_scroll_activity, add='+')
+        scrollbar.bind('<B1-Motion>', self._handle_transcript_scroll_activity, add='+')
 
         def sync_transcript_width(event):
             new_width = max(320, event.width - self.chat_theme['transcript_pad_x'] * 2 - 24)
@@ -1849,12 +1891,13 @@ class ChatWindow:
             pass
 
     def _insert_inline_card(self, card):
+        self._capture_transcript_follow_state()
         self.text_area.config(state=tk.NORMAL)
         self.text_area.insert(tk.END, '\n')
         self.text_area.window_create(tk.END, window=card, padx=6, pady=4)
         self.text_area.insert(tk.END, '\n\n')
         self.text_area.config(state=tk.DISABLED)
-        self.text_area.see(tk.END)
+        self._maybe_follow_transcript_end()
 
     def _on_stop(self):
         try:
@@ -2254,7 +2297,7 @@ class ChatWindow:
         self.text_area.window_create(tk.END, window=card, padx=6, pady=4)
         self.text_area.insert(tk.END, '\n\n')
         self.text_area.config(state=tk.DISABLED)
-        self.text_area.see(tk.END)
+        self._maybe_follow_transcript_end()
         self._pending_perm_frames[request_id] = card
 
     def _set_busy(self, busy: bool):
@@ -2268,10 +2311,11 @@ class ChatWindow:
             if compact:
                 self.status_var.set(compact)
             return
+        self._capture_transcript_follow_state()
         self.text_area.config(state=tk.NORMAL)
         self.text_area.insert(tk.END, f'[状态] {text}\n\n', ('status',))
         self.text_area.config(state=tk.DISABLED)
-        self.text_area.see(tk.END)
+        self._maybe_follow_transcript_end()
 
     # ── 统一状态管理 ─────────────────────────────────────────────
     # 所有状态更新通过 _set_status 写入，确保 status_var 只由一处管理，
@@ -2302,7 +2346,7 @@ class ChatWindow:
             self.text_area.delete(ranges[0], ranges[-1])
         self.text_area.insert(tk.END, f'[状态] {compact}\n\n', ('status', 'inline_status'))
         self.text_area.config(state=tk.DISABLED)
-        self.text_area.see(tk.END)
+        self._maybe_follow_transcript_end()
 
     def _clear_inline_status(self):
         """清除文本区中的内嵌状态行并重置去重缓存。"""
@@ -2393,10 +2437,7 @@ class ChatWindow:
             text=f'{self._pick_tool_icon(compact)} {compact}',
             wraplength=max(240, self._transcript_width - 60),
         )
-        try:
-            self.text_area.see(tk.END)
-        except Exception:
-            pass
+        self._maybe_follow_transcript_end()
 
     def _clear_tool_status_widget(self):
         widget = self._tool_status_widget
@@ -2473,11 +2514,7 @@ class ChatWindow:
             fg=self.colors['subtext'] if done else self.colors['muted'],
             wraplength=max(240, self._transcript_width - 60),
         )
-        if done:
-            try:
-                self.text_area.see(tk.END)
-            except Exception:
-                pass
+        self._maybe_follow_transcript_end()
 
     def _render_summary_status(self, text: str):
         compact = self._task_progress_compact_text(text)
@@ -3022,13 +3059,14 @@ class ChatWindow:
             self._insert_terminal_event(role, text)
             return
 
+        self._capture_transcript_follow_state()
         self.text_area.config(state=tk.NORMAL)
         card = self._create_message_widget(role, text)
         self.text_area.insert(tk.END, '\n')
         self.text_area.window_create(tk.END, window=card, padx=4, pady=4)
         self.text_area.insert(tk.END, '\n')
         self.text_area.config(state=tk.DISABLED)
-        self.text_area.see(tk.END)
+        self._maybe_follow_transcript_end()
 
         if record_history and role in {'user', 'assistant'}:
             self._conversation_history.append({'role': role, 'text': text})
@@ -3211,6 +3249,7 @@ class ChatWindow:
         if not text:
             return
 
+        self._capture_transcript_follow_state()
         self.text_area.config(state=tk.NORMAL)
 
         if role == 'thinking_inline':
@@ -3226,7 +3265,7 @@ class ChatWindow:
                 self._render_system_info_terminal(text)
 
         self.text_area.config(state=tk.DISABLED)
-        self.text_area.see(tk.END)
+        self._maybe_follow_transcript_end()
 
     # ── 思考块（流式更新 + 默认展开） ────────────────────────────
     # 实现思路：
