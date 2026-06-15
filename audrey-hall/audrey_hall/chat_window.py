@@ -15,6 +15,7 @@ from .claude_agent import (
     ClaudeCodeSession,
     normalize_connection_target,
 )
+from .terminal_view import TerminalViewWindow
 from .ui import create_button, create_card, create_dropdown, get_theme
 from .utils import resource_path
 
@@ -34,6 +35,12 @@ CHOICE_LINE_PATTERNS = (
     re.compile(r'^\s*(?:[-*]|\d+\.)\s+\*\*(.+?)\*\*(?:\s*[—-]\s*(.+))?\s*$'),
     re.compile(r'^\s*(?:[-*]|\d+\.)\s+(.+?)\s*[—-]\s*(.+)\s*$'),
 )
+MARKDOWN_INLINE_PATTERN = re.compile(r'(\*\*[^*\n]+\*\*|`[^`\n]+`)')
+CHOICE_PROMPT_CUES = (
+    '请选择', '可以选择', '以下选项', '你想', '你希望', '你要',
+    '选一个', '选哪一个', '告诉我你的选择', '回复对应选项', '怎么选',
+)
+TASK_TOOL_PREFIXES = ('task',)
 
 MAX_SIDE_CONTEXT_MESSAGES = 6
 MAX_SIDE_CONTEXT_CHARS = 2800
@@ -50,16 +57,32 @@ CONNECTION_TARGET_CHOICES = [
 MODE_CHOICES = [
     ('default', '默认陪伴'),
     ('acceptEdits', '赐予更改权限'),
-    ('auto', '赐予全部权限'),
+    ('bypassPermissions', '赐予全部权限'),
     ('plan', '还是先做个计划吧'),
 ]
 MODE_LABELS = {key: label for key, label in MODE_CHOICES}
 CONNECTION_OPTION_LABELS = {key: label for key, label in CONNECTION_TARGET_CHOICES}
 CLAUDE_PROJECTS_DIR = Path.home() / '.claude' / 'projects'
+PERMISSION_MODE_ALIASES = {
+    'default': 'default',
+    'acceptedits': 'acceptEdits',
+    'accept': 'acceptEdits',
+    'edits': 'acceptEdits',
+    'auto': 'bypassPermissions',
+    'bypasspermissions': 'bypassPermissions',
+    'plan': 'plan',
+}
 
 
 def _sanitize_project_path(path_text: str) -> str:
     return re.sub(r'[^a-zA-Z0-9]', '-', path_text or '')
+
+
+def _normalize_permission_mode(mode: str | None) -> str:
+    normalized = (mode or 'default').strip()
+    if not normalized:
+        return 'default'
+    return PERMISSION_MODE_ALIASES.get(normalized.lower(), normalized)
 
 
 class ChatWindow:
@@ -76,6 +99,10 @@ class ChatWindow:
         self._input_bg_photo = None
         self._input_bg_image_id = None
         self._input_canvas = None
+        self._input_bg_cache = {}
+        self._input_bg_resize_job = None
+        self._pending_input_bg_size = None
+        self._current_input_bg_size = None
         self._avatar_source = None
         self._assistant_avatar = None
         self._user_avatar_source = None
@@ -83,6 +110,13 @@ class ChatWindow:
         self._transcript_container = None
         self._transcript_width = 700
         self._message_widgets = []
+        self._message_layout_job = None
+        self._last_message_char_width = None
+        self._task_widgets = {}
+        self._task_widget_font = None
+        self._task_widget_done_font = None
+        self._tool_status_widget = None
+        self._tool_status_font = None
         self.status_var = tk.StringVar(value='正在唤醒奥黛丽的助手...')
         self._event_queue = queue.Queue()
         self._busy = False
@@ -98,6 +132,17 @@ class ChatWindow:
         self._current_input_tokens = None
         self._current_output_tokens = None
         self._last_summary_status = ''
+        self._last_status_texts = {}  # tag -> compact_text 用于统一状态去重
+        self._raw_mode = False  # /raw 命令开启的 CLI 原始输出调试模式
+        # 抑制列表：这些内部状态不显示在对话区
+        self._suppressed_statuses = {'init', 'thinking_tokens', 'running'}
+        self._last_busy_event_time = None  # 用于连接看门狗
+        self._last_thinking_tokens = None
+        # ── 终端风格流式渲染状态 ──
+        self._turn_thinking_range = None   # (start, end) thinking 块的 Text 索引
+        self._turn_thinking_text = ''      # 当前思考全文（用于折叠/展开重绘）
+        self._turn_thinking_expanded = True  # 思考默认展开（流式可见）
+        self._turn_thinking_user_closed = False  # 用户是否手动折叠（手动折叠后本轮流式不自动展开）
         self._mode_var = tk.StringVar(value=self._format_mode_status())
         self._connection_var = tk.StringVar(value=self._format_connection_status())
         self._resume_session_id = ''
@@ -110,6 +155,9 @@ class ChatWindow:
         self._connection_start_time = None
         self._connection_time_var = tk.StringVar(value='')
         self._connection_time_timer = None
+        self._terminal_view = None
+        self._terminal_view_visible = False
+        self._terminal_button = None
 
         self.theme = get_theme()
         self.fonts = self.theme['fonts']
@@ -167,12 +215,14 @@ class ChatWindow:
         self._busy = False
         self._set_busy(False)
         self._pending_perm_frames = {}
-        self._main_status_text = ''
-        self._task_progress_text = ''
+        self._last_status_texts.clear()
+        self._last_thinking_tokens = None
         self._current_total_tokens = None
         self._current_input_tokens = None
         self._current_output_tokens = None
         self._last_summary_status = ''
+        if self._terminal_view is not None:
+            self._terminal_view.load_buffer(self.session.terminal_events_snapshot())
         self._active_session_id = self._resume_session_id
         self._active_permission_mode = 'default'
         self._refresh_mode_buttons()
@@ -197,6 +247,56 @@ class ChatWindow:
             self._connection_time_var.set('')
             self.status_var.set('呼唤失败')
             self._append_message('error', f'呼唤助手失败：{exc}')
+
+    def _ensure_terminal_view(self):
+        if self._terminal_view is None:
+            host = self.window if self.window is not None else self.parent
+            self._terminal_view = TerminalViewWindow(host, self.theme, on_close=self._handle_terminal_view_closed)
+            self._terminal_view.set_show_raw(self._raw_mode)
+        return self._terminal_view
+
+    def _handle_terminal_view_closed(self):
+        self._terminal_view_visible = False
+        self._refresh_terminal_button()
+
+    def _refresh_terminal_button(self):
+        if self._terminal_button is None:
+            return
+        label = '隐藏过程视图' if self._terminal_view_visible else '打开过程视图'
+        self._terminal_button.config(text=label)
+
+    def _show_terminal_view(self):
+        if self.window is None:
+            return
+        terminal_view = self._ensure_terminal_view()
+        initial_events = None
+        if not terminal_view.is_open() and not getattr(terminal_view, '_events', None):
+            initial_events = self.session.terminal_events_snapshot()
+        terminal_view.show(initial_events=initial_events, host_window=self.window)
+        self._terminal_view_visible = True
+        self._refresh_terminal_button()
+
+    def _hide_terminal_view(self):
+        if self._terminal_view is not None:
+            self._terminal_view.hide(notify=False)
+        self._terminal_view_visible = False
+        self._refresh_terminal_button()
+
+    def _toggle_terminal_view(self):
+        if self._terminal_view_visible:
+            self._hide_terminal_view()
+        else:
+            self._show_terminal_view()
+
+    def _sync_terminal_view_position(self, *, animate=False):
+        if not self._terminal_view_visible or self._terminal_view is None or self.window is None:
+            return
+        self._terminal_view.sync_with_host(self.window, animate=animate)
+
+    def _handle_window_configure(self, event):
+        if self.window is None or event.widget is not self.window:
+            return
+        self._sync_terminal_view_position()
 
     def _update_connection_time(self):
         """每秒更新连接时长显示"""
@@ -305,15 +405,49 @@ class ChatWindow:
         if width <= 1 or height <= 1:
             return
 
+        target_size = (int(width), int(height))
+        if target_size == self._pending_input_bg_size and self._input_bg_resize_job is not None:
+            return
+        self._pending_input_bg_size = target_size
+        if self.window is None:
+            self._apply_input_background_update()
+            return
+        if self._input_bg_resize_job is not None:
+            try:
+                self.window.after_cancel(self._input_bg_resize_job)
+            except Exception:
+                pass
+        self._input_bg_resize_job = self.window.after(60, self._apply_input_background_update)
+
+    def _apply_input_background_update(self):
+        self._input_bg_resize_job = None
+        if self._input_canvas is None or self._input_bg_source is None:
+            return
+        size = self._pending_input_bg_size
+        if not size:
+            return
+        width, height = size
+        if width <= 1 or height <= 1:
+            return
+        if self._current_input_bg_size == size and self._input_bg_image_id is not None:
+            return
+
         source_width, source_height = self._input_bg_source.size
         scale = max(width / source_width, height / source_height)
         resized_width = max(1, int(source_width * scale))
         resized_height = max(1, int(source_height * scale))
-        resized = self._input_bg_source.resize((resized_width, resized_height), Image.Resampling.LANCZOS)
+        resized_key = (resized_width, resized_height)
+        resized = self._input_bg_cache.get(resized_key)
+        if resized is None:
+            resized = self._input_bg_source.resize((resized_width, resized_height), Image.Resampling.LANCZOS)
+            self._input_bg_cache[resized_key] = resized
+            if len(self._input_bg_cache) > 6:
+                self._input_bg_cache.pop(next(iter(self._input_bg_cache)))
 
         offset_x = (width - resized_width) // 2
         offset_y = (height - resized_height) // 2
         self._input_bg_photo = ImageTk.PhotoImage(resized)
+        self._current_input_bg_size = size
 
         if self._input_bg_image_id is None:
             self._input_bg_image_id = self._input_canvas.create_image(offset_x, offset_y, anchor='nw', image=self._input_bg_photo)
@@ -322,6 +456,66 @@ class ChatWindow:
             self._input_canvas.coords(self._input_bg_image_id, offset_x, offset_y)
 
         self._input_canvas.tag_lower(self._input_bg_image_id)
+
+    def _schedule_message_layout_refresh(self):
+        if self.text_area is None or self.window is None:
+            return
+        if self._message_layout_job is not None:
+            try:
+                self.window.after_cancel(self._message_layout_job)
+            except Exception:
+                pass
+        self._message_layout_job = self.window.after(50, self._refresh_message_layout)
+
+    def _refresh_message_layout(self):
+        self._message_layout_job = None
+        if not self._message_widgets or self.text_area is None:
+            return
+        was_at_bottom = False
+        try:
+            yview = self.text_area.yview()
+            was_at_bottom = yview[1] >= 0.99
+        except Exception:
+            pass
+        msg_char_width = self._pixels_to_chars(self._transcript_width - 60)
+        char_width_changed = msg_char_width != self._last_message_char_width
+        live_widgets = []
+        for widget in self._message_widgets:
+            try:
+                if not widget.winfo_exists():
+                    continue
+                widget.configure(width=self._transcript_width)
+                bubble = getattr(widget, '_message_bubble', None)
+                raw_text = getattr(widget, '_message_text', '')
+                if bubble is not None and bubble.winfo_exists() and char_width_changed:
+                    bubble.configure(
+                        width=msg_char_width,
+                        height=self._calc_text_display_lines(
+                            self._markdown_to_plain_text(raw_text),
+                            msg_char_width,
+                        ),
+                    )
+                live_widgets.append(widget)
+            except Exception:
+                pass
+        self._message_widgets = live_widgets
+        for item in list(self._task_widgets.values()):
+            try:
+                label = item.get('label')
+                if label is not None and label.winfo_exists():
+                    label.config(wraplength=max(240, self._transcript_width - 60))
+            except Exception:
+                pass
+        try:
+            if self._tool_status_widget is not None:
+                label = self._tool_status_widget.get('label')
+                if label is not None and label.winfo_exists():
+                    label.config(wraplength=max(240, self._transcript_width - 60))
+        except Exception:
+            pass
+        self._last_message_char_width = msg_char_width
+        if was_at_bottom:
+            self.text_area.after(10, lambda: self.text_area.see(tk.END))
 
     def _schedule_ui(self, callback):
         if self.window is None:
@@ -354,6 +548,8 @@ class ChatWindow:
         if self.window is not None and self.window.winfo_exists():
             self.window.lift()
             self.window.focus_force()
+            if self._terminal_view_visible:
+                self._show_terminal_view()
             return
 
         self._create_window()
@@ -362,6 +558,7 @@ class ChatWindow:
         # 初次把窗口放到桌宠附近；之后由桌宠的 window_snap 逻辑自动附着到本窗口
         # 顶部（与贴靠微信的机制一致），无需窗口反向跟随桌宠。
         self._position_beside_pet(initial=True)
+        self._sync_terminal_view_position(animate=True)
 
     def _create_window(self):
         self.window = tk.Toplevel(self.parent)
@@ -394,6 +591,7 @@ class ChatWindow:
         self.window.bind('<Control-C>', self._handle_window_copy)
         self.window.configure(bg=self.colors['bg'])
         self.window.protocol('WM_DELETE_WINDOW', self.close)
+        self.window.bind('<Configure>', self._handle_window_configure, add='+')
 
         try:
             icon_path = resource_path('gifs/audrey-hall.ico')
@@ -509,6 +707,30 @@ class ChatWindow:
         mode_dropdown.pack(side=tk.LEFT, anchor='w')
         self._refresh_mode_buttons()
 
+        terminal_row = tk.Frame(header, bg=self.colors['bg'])
+        terminal_row.pack(fill=tk.X, pady=(10, 0))
+        self._terminal_button = create_button(
+            terminal_row,
+            text='打开过程视图',
+            command=self._toggle_terminal_view,
+            theme=self.theme,
+            variant='secondary',
+            font=self.fonts['small'],
+            style_overrides=self._aurora_button_style(),
+            padx=8,
+            pady=5,
+        )
+        self._terminal_button.pack(side=tk.LEFT)
+        tk.Label(
+            terminal_row,
+            text='过程视图承载过程流与原始输出，主界面只保留对话。',
+            font=self.fonts['small'],
+            bg=self.colors['bg'],
+            fg=self.colors['muted'],
+            anchor='w',
+        ).pack(side=tk.LEFT, padx=(12, 0))
+        self._refresh_terminal_button()
+
         # 先把底部的输入区和按钮行用 side=BOTTOM 占住空间，再让会话区填充剩余
         # 区域。这样无论窗口被压到多小（高 DPI / 小屏），输入框都不会被会话区
         # 挤出窗口——之前正是这个问题导致"只有会话、看不到输入框"。
@@ -559,49 +781,76 @@ class ChatWindow:
             if new_width == self._transcript_width:
                 return
             self._transcript_width = new_width
-            self._refresh_message_layout()
+            self._schedule_message_layout_refresh()
 
         self.text_area.bind('<Configure>', sync_transcript_width, add='+')
-
-        def _refresh_message_layout():
-            """当窗口大小变化时，刷新所有消息组件的宽度，并保持滚动位置"""
-            if not self._message_widgets:
-                return
-            # 记住当前是否在底部
-            was_at_bottom = False
-            try:
-                yview = self.text_area.yview()
-                was_at_bottom = yview[1] >= 0.99
-            except Exception:
-                pass
-            msg_char_width = self._pixels_to_chars(self._transcript_width - 60)
-            for widget in self._message_widgets:
-                try:
-                    if widget.winfo_exists():
-                        widget.configure(width=self._transcript_width)
-                        # 同步更新子行组件的宽度
-                        for child in widget.winfo_children():
-                            if isinstance(child, tk.Text):
-                                # Text 组件的 width 以字符为单位
-                                child.configure(width=msg_char_width)
-                            else:
-                                child.configure(width=self._transcript_width)
-                except Exception:
-                    pass
-            # 清理已销毁的组件引用
-            self._message_widgets = [
-                w for w in self._message_widgets
-                if w.winfo_exists()
-            ]
-            # 如果之前在底部，延迟滚动回去（等 tk 完成内部重新布局）
-            if was_at_bottom:
-                self.text_area.after(10, lambda: self.text_area.see(tk.END))
-
-        self._refresh_message_layout = _refresh_message_layout
 
         self.text_area.tag_configure('status', foreground=self.colors['muted'])
         self.text_area.tag_configure('main_status', foreground=self.colors['muted'])
         self.text_area.tag_configure('task_progress', foreground=self.colors['muted'])
+        # ── 终端风格标签 ──────────────────────────────────────────
+        self.text_area.tag_configure(
+            'term_tool', foreground='#3D8884',
+            font=('Consolas', 10, 'bold'),
+        )
+        self.text_area.tag_configure(
+            'term_tool_detail', foreground='#6B8587',
+            font=('Consolas', 9),
+        )
+        self.text_area.tag_configure(
+            'term_result', foreground='#555548',
+            font=('Consolas', 9),
+        )
+        self.text_area.tag_configure(
+            'term_system', foreground='#8A9C9E',
+            font=self.fonts['small'],
+        )
+        self.text_area.tag_configure(
+            'term_prefix', foreground='#A09078',
+            font=('Consolas', 9),
+        )
+        self.text_area.tag_configure(
+            'diff_add', background='#E8F5E0', foreground='#2E7D22',
+            font=('Consolas', 9),
+        )
+        self.text_area.tag_configure(
+            'diff_del', background='#FFEBEB', foreground='#C62828',
+            font=('Consolas', 9),
+        )
+        self.text_area.tag_configure(
+            'diff_hunk', background='#E3F2FD', foreground='#1565C0',
+            font=('Consolas', 9),
+        )
+        self.text_area.tag_configure(
+            'term_sep', foreground='#D8DDD8',
+            font=('Consolas', 9),
+        )
+        # 思考标题行——可点击切换折叠/展开
+        self.text_area.tag_configure(
+            'term_thinking_header',
+            foreground='#6B5E4B',
+            font=('Consolas', 9, 'bold'),
+            underline=False,
+        )
+        # 思考内容展开时的文本
+        self.text_area.tag_configure(
+            'term_thinking', foreground='#8B7E6B',
+            font=('Consolas', 9),
+        )
+        # 绑定点击事件：点击 thinking_toggle 标签区切换折叠
+        self.text_area.tag_bind(
+            'thinking_toggle', '<Button-1>',
+            lambda e: self._toggle_thinking(e),
+        )
+        # 悬停时切换手型光标
+        self.text_area.tag_bind(
+            'thinking_toggle', '<Enter>',
+            lambda e: self.text_area.configure(cursor='hand2'),
+        )
+        self.text_area.tag_bind(
+            'thinking_toggle', '<Leave>',
+            lambda e: self.text_area.configure(cursor='xterm'),
+        )
 
         self.input_box = tk.Text(
             input_shell,
@@ -975,6 +1224,7 @@ class ChatWindow:
 
         def handle_click(_event=None, target_session_id=session_id):
             self._resume_history_session(target_session_id)
+            return 'break'
 
         for widget in (card, inner):
             widget.bind('<Button-1>', handle_click, add='+')
@@ -1098,8 +1348,12 @@ class ChatWindow:
         self._conversation_history = []
         self._pending_perm_frames = {}
         self._message_widgets = []
-        self._main_status_text = ''
-        self._task_progress_text = ''
+        self._task_widgets = {}
+        self._tool_status_widget = None
+        self._last_message_char_width = None
+        self._last_status_texts.clear()
+        self._last_thinking_tokens = None
+        self._reset_turn_state()
         self._last_summary_status = ''
         self._current_total_tokens = None
         self._current_input_tokens = None
@@ -1228,9 +1482,23 @@ class ChatWindow:
         if not text:
             return
 
+        # 新轮次开始前彻底清理上一轮的状态缓存，防止去重逻辑复用旧值
+        self._last_status_texts.clear()
+        self._reset_turn_state()
+        if self.text_area is not None:
+            try:
+                ranges = self.text_area.tag_ranges('inline_status')
+                if len(ranges) >= 2:
+                    self.text_area.config(state=tk.NORMAL)
+                    self.text_area.delete(ranges[0], ranges[-1])
+                    self.text_area.config(state=tk.DISABLED)
+            except Exception:
+                pass
+
         self._append_message('user', display_text or text)
         self.status_var.set('奥黛丽 正在思考...')
         self._set_busy(True)
+        self._last_busy_event_time = datetime.now()
         self._update_bubble_state('thinking', {'prompt': text})
 
         try:
@@ -1268,13 +1536,22 @@ class ChatWindow:
             self._handle_btw_command(args)
             return True
 
+        if command == 'raw':
+            self._append_message('user', text, record_history=False)
+            self._raw_mode = not self._raw_mode
+            if self._terminal_view is not None:
+                self._terminal_view.set_show_raw(self._raw_mode)
+            state = '开启' if self._raw_mode else '关闭'
+            self._append_inline_status(f'过程视图原始输出模式已{state}')
+            return True
+
         if command == 'cost':
             return False
 
         self._append_message('user', text, record_history=False)
         self._append_message(
             'warn',
-            f'当前对话框尚未适配本地命令：/{command}。当前已支持：/model、/mode、/btw；/cost 将交给 Claude Code 处理。',
+            f'当前对话框尚未适配本地命令：/{command}。当前已支持：/model、/mode、/btw、/raw；/cost 将交给 Claude Code 处理。',
         )
         return True
 
@@ -1285,7 +1562,7 @@ class ChatWindow:
         self._mode_var.set(self._format_mode_status())
 
     def _set_active_permission_mode(self, mode: str, *, announce: bool = False):
-        normalized = (mode or 'default').strip() or 'default'
+        normalized = _normalize_permission_mode(mode)
         if normalized not in MODE_LABELS:
             normalized = 'default'
         changed = normalized != self._active_permission_mode
@@ -1297,7 +1574,7 @@ class ChatWindow:
             self._append_inline_status(f'模式已切换：{label}')
 
     def _apply_permission_mode(self, mode: str):
-        normalized = (mode or '').strip()
+        normalized = _normalize_permission_mode(mode)
         if normalized not in MODE_LABELS:
             self._append_message('error', f'不支持的模式：{mode}')
             return
@@ -1329,15 +1606,7 @@ class ChatWindow:
             self._append_inline_status(self._format_mode_status())
             return
 
-        mode_aliases = {
-            'default': 'default',
-            'acceptedits': 'acceptEdits',
-            'accept': 'acceptEdits',
-            'edits': 'acceptEdits',
-            'auto': 'auto',
-            'plan': 'plan',
-        }
-        target_mode = mode_aliases.get(lowered)
+        target_mode = PERMISSION_MODE_ALIASES.get(lowered)
         if target_mode is None:
             self._append_message('warn', '不支持的模式。可用：default、acceptEdits、auto、plan。')
             return
@@ -1607,11 +1876,26 @@ class ChatWindow:
             except queue.Empty:
                 break
             self._handle_event(event)
+            if self._terminal_view is not None:
+                self._terminal_view.consume_event(event)
+
+        # 连接看门狗：如果 _busy 且超过 120 秒没有任何事件，认为连接已静默断开
+        if self._busy and self._last_busy_event_time is not None:
+            idle_seconds = (datetime.now() - self._last_busy_event_time).total_seconds()
+            if idle_seconds > 120:
+                self._append_inline_status('⚠️ 连接可能已断开（超过 120 秒无响应）')
+                self._set_busy(False)
+                self._last_busy_event_time = None
 
         self.window.after(EVENT_POLL_INTERVAL_MS, self._drain_events)
 
     def _handle_event(self, event: dict):
         kind = event.get('kind')
+        # 记录最后收到事件的时间（用于看门狗检测静默断开）
+        self._last_busy_event_time = datetime.now()
+
+        if kind in {'terminal_line', 'stdout_raw_line', 'stderr_raw_line'}:
+            return
 
         if kind == 'assistant':
             text = event.get('text') or ''
@@ -1623,11 +1907,12 @@ class ChatWindow:
                 return
             if text:
                 self._append_message('assistant', text)
+                self.status_var.set(self._compose_status_text('奥黛丽 正在回复...'))
                 self._maybe_show_choice_buttons(text)
             return
 
         if kind == 'working':
-            tool_name = event.get('tool_name')
+            tool_name = event.get('tool_name') or '未知工具'
             input_payload = event.get('input') or {}
             self._update_total_tokens(event.get('total_tokens'))
             self._update_total_io_tokens(event.get('input_tokens'), event.get('output_tokens'))
@@ -1638,17 +1923,26 @@ class ChatWindow:
                     'input': input_payload,
                 },
             )
-            self._render_main_status(self._format_main_tool_status(event))
+            summary = event.get('summary') or self._summarize_working_input(tool_name, input_payload)
+            terminal_text = str(tool_name)
+            if summary:
+                terminal_text = f'{terminal_text} | {summary}'
+            if self._is_task_tool_name(tool_name):
+                self._render_task_tool_event(tool_name, terminal_text)
+            else:
+                self._render_tool_status_widget(terminal_text)
+            self.status_var.set(self._compose_status_text(f'🔧 {tool_name}'))
             return
 
         if kind == 'thinking':
             self._update_total_tokens(event.get('total_tokens'))
             self._update_total_io_tokens(event.get('input_tokens'), event.get('output_tokens'))
-            reminder_text = self._translate_system_reminder(event.get('text') or '')
+            thinking_text = event.get('text') or ''
+            reminder_text = self._translate_system_reminder(thinking_text)
             if reminder_text:
                 self._render_main_status(reminder_text)
                 return
-            self._render_thinking_status(event.get('output_tokens'))
+            self.status_var.set(self._compose_status_text('奥黛丽 正在思考...'))
             return
 
         if kind == 'status':
@@ -1673,7 +1967,7 @@ class ChatWindow:
                 self._append_inline_status(f'已连接：{target_label}')
                 self.status_var.set(self._compose_status_text(f'已连接：{target_label}'))
 
-            # 连接断开：清除计时器
+            # 连接断开：清除计时器并重置 UI 状态，防止永久锁死
             if status == 'disconnected':
                 self._connection_start_time = None
                 self._connection_time_var.set('')
@@ -1683,13 +1977,31 @@ class ChatWindow:
                     except Exception:
                         pass
                     self._connection_time_timer = None
+                self._set_busy(False)
+                self._seal_thinking_block()
+                self._clear_inline_status()
 
             if text:
-                self._render_main_status(text)
+                source = event.get('source')
+                status_val = event.get('status')
+                raw_subtype = event.get('raw_subtype') or ''
+                # 抑制纯内部状态事件——init 每轮都发，thinking_tokens 每秒数次
+                # 既要检查 status_val（sdk_status 路径），也要检查 raw_subtype
+                # （兜底分支路径，兜底硬编码 status='working' 会绕过前者）
+                if source == 'system':
+                    if status_val in self._suppressed_statuses:
+                        return
+                    if raw_subtype in self._suppressed_statuses:
+                        return
+                if source == 'system':
+                    display = f'[{raw_subtype}] {text}' if raw_subtype else text
+                    self._render_main_status(display)
+                else:
+                    self._render_main_status(text)
                 connection_target = event.get('connection_target')
                 if isinstance(connection_target, str):
                     self._set_connection_target(connection_target)
-                if status == 'working' and not event.get('tool_name') and event.get('source') != 'system':
+                if status == 'working' and not event.get('tool_name') and source != 'system':
                     self._update_bubble_state('working', {'message': text})
             return
 
@@ -1699,19 +2011,34 @@ class ChatWindow:
             return
 
         if kind == 'tool_use_summary':
-            self._render_main_status(event.get('summary') or '')
+            summary = event.get('summary') or ''
+            if summary:
+                self._append_message('tool_result', summary, record_history=False)
             return
 
         if kind == 'tool_progress':
-            self._render_main_status(self._format_tool_progress(event))
             return
 
         if kind == 'hook_status':
-            self._render_main_status(self._format_hook_status(event))
             return
 
         if kind == 'sdk_status':
-            self._handle_sdk_status(event)
+            status = event.get('status')
+            permission_mode = event.get('permission_mode')
+            if isinstance(permission_mode, str):
+                self._set_active_permission_mode(permission_mode, announce=True)
+            if status == 'thinking_tokens':
+                estimated_tokens = event.get('estimated_tokens')
+                if isinstance(estimated_tokens, int):
+                    self._render_thinking_tokens_status(estimated_tokens)
+                return
+            if status in self._suppressed_statuses:
+                # 纯内部状态，不产生任何可见输出
+                return
+            if status == 'compacting':
+                self._render_main_status('正在压缩上下文...')
+            elif isinstance(status, str) and status:
+                self._render_main_status(status)
             return
 
         if kind == 'session_state':
@@ -1734,8 +2061,6 @@ class ChatWindow:
                 reminder_text = self._translate_system_reminder(text)
                 if reminder_text:
                     self._render_main_status(reminder_text)
-                else:
-                    self._append_message('warn', text)
             return
 
         if kind == 'permission':
@@ -1753,8 +2078,9 @@ class ChatWindow:
             self._set_busy(False)
             self._update_total_tokens(event.get('total_tokens'))
             self._update_total_io_tokens(event.get('input_tokens'), event.get('output_tokens'))
-            self._clear_main_status()
-            self._clear_task_progress()
+            self._clear_thinking_tokens_status()
+            self._clear_tool_status_widget()
+            self._clear_inline_status()
             self._update_bubble_state('done', {'result': event.get('text') or ''})
             self._refresh_history_sidebar()
             if event.get('ok'):
@@ -1765,16 +2091,27 @@ class ChatWindow:
                 self._append_message('error', text)
             return
 
+        if kind == 'log':
+            # CLI 产生的 JSON 解析警告等日志事件，之前被静默丢弃
+            text = event.get('text') or ''
+            if text:
+                self._append_inline_status(f'[CLI] {text}')
+            return
+
         if kind == 'error':
             self._set_busy(False)
-            self._clear_main_status()
-            self._clear_task_progress()
+            self._clear_thinking_tokens_status()
+            self._clear_tool_status_widget()
+            self._clear_inline_status()
             if event.get('request_subtype') == 'set_permission_mode':
                 self.status_var.set(self._compose_status_text('模式切换失败'))
             else:
                 self.status_var.set(self._compose_status_text('Claude Code 发生错误'))
             self._clear_bubble_state()
-            self._append_message('error', event.get('text') or '未知错误')
+            error_text = event.get('text') or '未知错误'
+            if event.get('request_subtype') == 'set_permission_mode':
+                error_text = self._translate_permission_mode_error(error_text)
+            self._append_message('error', error_text)
 
     def _handle_permission_request(self, event: dict):
         tool_name = event.get('tool_name') or '未知工具'
@@ -1860,8 +2197,7 @@ class ChatWindow:
             if always and allow:
                 self._auto_allow_tools.add(tool_name)
             self.session.respond_permission(request_id, allow)
-            self._clear_main_status()
-            self._clear_task_progress()
+            self._clear_inline_status()
             frame = self._pending_perm_frames.pop(request_id, None)
             if frame is not None:
                 try:
@@ -1924,7 +2260,7 @@ class ChatWindow:
     def _set_busy(self, busy: bool):
         self._busy = busy
         if self.send_button is not None:
-            self.send_button.config(state=tk.NORMAL)
+            self.send_button.config(state=tk.DISABLED if busy else tk.NORMAL)
 
     def _append_inline_status(self, text: str):
         if self.text_area is None:
@@ -1937,76 +2273,240 @@ class ChatWindow:
         self.text_area.config(state=tk.DISABLED)
         self.text_area.see(tk.END)
 
-    def _clear_main_status(self):
-        if self.text_area is None:
-            self._main_status_text = ''
-            return
-        if not self._main_status_text:
-            return
-        ranges = self.text_area.tag_ranges('main_status')
-        self.text_area.config(state=tk.NORMAL)
-        if len(ranges) >= 2:
-            self.text_area.delete(ranges[0], ranges[-1])
-        self.text_area.config(state=tk.DISABLED)
-        self._main_status_text = ''
+    # ── 统一状态管理 ─────────────────────────────────────────────
+    # 所有状态更新通过 _set_status 写入，确保 status_var 只由一处管理，
+    # 文本区中只保留一条内嵌状态行（统一标签 'inline_status'）。
 
-    def _render_main_status(self, text: str):
+    def _set_status(self, text: str, tag: str = 'main'):
+        """统一状态入口。tag 用于去重，'inline_status' 用于文本区定位。"""
         compact = self._compose_status_text(text)
         if not compact:
             return
-        if compact == self._main_status_text:
+
+        key = (tag, compact)
+        last = self._last_status_texts.get(tag)
+        if last == compact:
+            # 文本未变，但确保状态栏同步
             self.status_var.set(compact)
             return
+        self._last_status_texts[tag] = compact
 
+        self.status_var.set(compact)
         if self.text_area is None:
-            self._main_status_text = compact
-            self.status_var.set(compact)
             return
 
-        ranges = self.text_area.tag_ranges('main_status')
+        # 清除上一条内嵌状态行（统一标签，始终只保留一条）
+        ranges = self.text_area.tag_ranges('inline_status')
         self.text_area.config(state=tk.NORMAL)
         if len(ranges) >= 2:
             self.text_area.delete(ranges[0], ranges[-1])
-        self.text_area.insert(tk.END, f'[状态] {compact}\n\n', ('status', 'main_status'))
+        self.text_area.insert(tk.END, f'[状态] {compact}\n\n', ('status', 'inline_status'))
         self.text_area.config(state=tk.DISABLED)
         self.text_area.see(tk.END)
-        self._main_status_text = compact
-        self.status_var.set(compact)
 
-    def _clear_task_progress(self):
+    def _clear_inline_status(self):
+        """清除文本区中的内嵌状态行并重置去重缓存。"""
+        self._last_status_texts.clear()
         if self.text_area is None:
-            self._task_progress_text = ''
             return
-        if not self._task_progress_text:
-            return
-        ranges = self.text_area.tag_ranges('task_progress')
+        ranges = self.text_area.tag_ranges('inline_status')
         self.text_area.config(state=tk.NORMAL)
         if len(ranges) >= 2:
             self.text_area.delete(ranges[0], ranges[-1])
         self.text_area.config(state=tk.DISABLED)
-        self._task_progress_text = ''
+
+    def _clear_main_status(self):
+        self._last_status_texts.pop('main', None)
+
+    def _clear_task_progress(self):
+        self._last_status_texts.pop('task', None)
+
+    def _render_main_status(self, text: str):
+        self._set_status(text, 'main')
 
     def _render_task_progress(self, event: dict):
         text = self._format_task_progress(event)
         if not text:
             return
-        if text == self._task_progress_text:
+        if self._render_task_widget(event, text):
             return
+        self._set_status(text, 'task')
 
-        self.status_var.set(text)
+    def _is_task_tool_name(self, tool_name: str) -> bool:
+        lowered = str(tool_name or '').strip().lower()
+        return lowered.startswith(TASK_TOOL_PREFIXES)
+
+    def _task_widget_key(self, event: dict) -> str:
+        task_id = str(event.get('task_id') or '').strip()
+        if task_id:
+            return task_id
+        description = self._task_progress_compact_text(event.get('description'))
+        summary = self._task_progress_compact_text(event.get('summary'))
+        return description or summary
+
+    def _render_task_tool_event(self, tool_name: str, text: str):
+        tool_key = 'tool:' + str(tool_name or '').strip().lower()
+        compact = self._task_progress_compact_text(text)
+        if compact:
+            self._upsert_task_widget(tool_key, compact, done=False)
+
+    def _ensure_tool_status_font(self):
+        if self._tool_status_font is None:
+            self._tool_status_font = tkfont.Font(family='Consolas', size=9)
+
+    def _render_tool_status_widget(self, text: str):
         if self.text_area is None:
-            self._task_progress_text = text
             return
+        compact = self._task_progress_compact_text(text)
+        if not compact:
+            return
+        self._ensure_tool_status_font()
+        existing = self._tool_status_widget
+        if existing is None:
+            card = create_card(
+                self.text_area,
+                self.theme,
+                bg='panel',
+                border='border',
+            )
+            label = tk.Label(
+                card,
+                text='',
+                font=self._tool_status_font,
+                bg=self.colors['panel'],
+                fg='#3D8884',
+                justify='left',
+                anchor='w',
+                wraplength=max(240, self._transcript_width - 60),
+                padx=10,
+                pady=8,
+            )
+            label.pack(fill=tk.X)
+            self.text_area.config(state=tk.NORMAL)
+            self.text_area.insert(tk.END, '\n')
+            self.text_area.window_create(tk.END, window=card, padx=4, pady=2)
+            self.text_area.insert(tk.END, '\n')
+            self.text_area.config(state=tk.DISABLED)
+            existing = {'card': card, 'label': label}
+            self._tool_status_widget = existing
+        existing['label'].config(
+            text=f'{self._pick_tool_icon(compact)} {compact}',
+            wraplength=max(240, self._transcript_width - 60),
+        )
+        try:
+            self.text_area.see(tk.END)
+        except Exception:
+            pass
 
-        ranges = self.text_area.tag_ranges('task_progress')
-        self.text_area.config(state=tk.NORMAL)
-        if len(ranges) >= 2:
-            self.text_area.delete(ranges[0], ranges[-1])
-        self.text_area.insert(tk.END, f'[状态] {text}\n\n', ('status', 'task_progress'))
-        self.text_area.config(state=tk.DISABLED)
-        self.text_area.see(tk.END)
-        self._task_progress_text = text
-        self._last_summary_status = ''
+    def _clear_tool_status_widget(self):
+        widget = self._tool_status_widget
+        self._tool_status_widget = None
+        if not widget:
+            return
+        card = widget.get('card')
+        if card is not None:
+            try:
+                card.destroy()
+            except Exception:
+                pass
+
+    def _render_task_widget(self, event: dict, text: str) -> bool:
+        task_key = self._task_widget_key(event)
+        if not task_key:
+            return False
+        status = str(event.get('status') or 'running').strip().lower()
+        done = status in {'completed', 'failed', 'stopped'}
+        final_text = text
+        if done:
+            final_text = f'{text} (已结束)'
+        self._upsert_task_widget(task_key, final_text, done=done)
+        return True
+
+    def _ensure_task_widget_fonts(self):
+        if self._task_widget_font is not None and self._task_widget_done_font is not None:
+            return
+        base_font = tkfont.Font(font=self.fonts['small'])
+        done_font = tkfont.Font(font=self.fonts['small'])
+        done_font.configure(overstrike=1)
+        self._task_widget_font = base_font
+        self._task_widget_done_font = done_font
+
+    def _upsert_task_widget(self, task_key: str, text: str, *, done: bool):
+        if self.text_area is None:
+            return
+        compact = self._task_progress_compact_text(text)
+        if not compact:
+            return
+        self._ensure_task_widget_fonts()
+        existing = self._task_widgets.get(task_key)
+        if existing is None:
+            card = create_card(
+                self.text_area,
+                self.theme,
+                bg='panel',
+                border='border',
+            )
+            label = tk.Label(
+                card,
+                text='',
+                font=self._task_widget_font,
+                bg=self.colors['panel'],
+                fg=self.colors['muted'],
+                justify='left',
+                anchor='w',
+                wraplength=max(240, self._transcript_width - 60),
+                padx=10,
+                pady=8,
+            )
+            label.pack(fill=tk.X)
+            self.text_area.config(state=tk.NORMAL)
+            self.text_area.insert(tk.END, '\n')
+            self.text_area.window_create(tk.END, window=card, padx=4, pady=2)
+            self.text_area.insert(tk.END, '\n')
+            self.text_area.config(state=tk.DISABLED)
+            existing = {'card': card, 'label': label}
+            self._task_widgets[task_key] = existing
+        label = existing['label']
+        label.config(
+            text=compact,
+            font=self._task_widget_done_font if done else self._task_widget_font,
+            fg=self.colors['subtext'] if done else self.colors['muted'],
+            wraplength=max(240, self._transcript_width - 60),
+        )
+        if done:
+            try:
+                self.text_area.see(tk.END)
+            except Exception:
+                pass
+
+    def _render_summary_status(self, text: str):
+        compact = self._task_progress_compact_text(text)
+        if not compact:
+            return
+        self._set_status(compact, 'summary')
+
+    def _render_thinking_tokens_status(self, estimated_tokens: int):
+        if not isinstance(estimated_tokens, int) or estimated_tokens < 0:
+            return
+        if self._last_thinking_tokens == estimated_tokens:
+            return
+        self._last_thinking_tokens = estimated_tokens
+        self._set_status(f'奥黛丽思考中...<{self._format_token_count(estimated_tokens)}>', 'thinking')
+
+    def _clear_thinking_tokens_status(self):
+        self._last_thinking_tokens = None
+        self._last_status_texts.pop('thinking', None)
+
+    def _render_thinking_status(self, output_tokens: int | None = None):
+        compact = '正在理解...'
+        thinking_tokens = output_tokens if isinstance(output_tokens, int) and output_tokens >= 0 else None
+        if thinking_tokens is None:
+            current_output = getattr(self, '_current_output_tokens', None)
+            if isinstance(current_output, int) and current_output > 0:
+                thinking_tokens = current_output
+        if thinking_tokens is not None:
+            compact = f'{compact} <{self._format_token_count(thinking_tokens)}>'
+        self._set_status(compact, 'main')
 
     def _format_task_progress(self, event: dict) -> str:
         status = str(event.get('status') or 'running').strip().lower()
@@ -2127,28 +2627,6 @@ class ChatWindow:
             return ''
         return text if len(text) <= 240 else text[:237] + '...'
 
-    def _render_summary_status(self, text: str):
-        compact = self._task_progress_compact_text(text)
-        if not compact:
-            return
-        compact = self._compose_status_text(compact)
-        if compact == self._last_summary_status:
-            return
-        self._append_inline_status(compact)
-        self.status_var.set(compact)
-        self._last_summary_status = compact
-
-    def _render_thinking_status(self, output_tokens: int | None = None):
-        compact = '正在理解...'
-        thinking_tokens = output_tokens if isinstance(output_tokens, int) and output_tokens >= 0 else None
-        if thinking_tokens is None:
-            current_output = getattr(self, '_current_output_tokens', None)
-            if isinstance(current_output, int) and current_output > 0:
-                thinking_tokens = current_output
-        if thinking_tokens is not None:
-            compact = f'{compact} <{self._format_token_count(thinking_tokens)}>'
-        self._render_main_status(compact)
-
     def _compose_status_text(self, core_text: str, task_tokens: int | None = None) -> str:
         core = self._task_progress_compact_text(core_text)
         if not core:
@@ -2223,8 +2701,20 @@ class ChatWindow:
         if mode_change:
             old_mode = mode_change.group(1)
             new_mode = mode_change.group(2)
-            old_mode = {'plan': '计划', 'build': '构建'}.get(old_mode.lower(), old_mode)
-            new_mode = {'plan': '计划', 'build': '构建'}.get(new_mode.lower(), new_mode)
+            old_mode = {
+                'plan': '计划',
+                'build': '构建',
+                'default': '默认陪伴',
+                'acceptedits': '赐予更改权限',
+                'bypasspermissions': '赐予全部权限',
+            }.get(old_mode.lower(), old_mode)
+            new_mode = {
+                'plan': '计划',
+                'build': '构建',
+                'default': '默认陪伴',
+                'acceptedits': '赐予更改权限',
+                'bypasspermissions': '赐予全部权限',
+            }.get(new_mode.lower(), new_mode)
             detail = f'模式切换：{old_mode} -> {new_mode}'
             if 'no longer in read-only mode' in reminder.lower():
                 detail += '，已解除只读'
@@ -2233,6 +2723,19 @@ class ChatWindow:
             return detail
 
         return reminder
+
+    def _translate_permission_mode_error(self, text: str) -> str:
+        if not isinstance(text, str):
+            return ''
+        lowered = text.lower()
+        if 'cannot set permission mode to bypasspermissions' in lowered:
+            if 'disabled by settings or configuration' in lowered:
+                return '当前 Claude 配置禁用了“赐予全部权限”模式'
+            if '--dangerously-skip-permissions' in lowered:
+                return '当前会话未以“赐予全部权限”能力启动，无法切换到全权限模式'
+        if 'cannot set permission mode to auto' in lowered:
+            return '当前 Claude 配置不支持切换到 auto 模式'
+        return text
 
     def _format_tool_progress(self, event: dict) -> str:
         tool_name = self._task_progress_compact_text(event.get('tool_name')) or '工具'
@@ -2274,6 +2777,32 @@ class ChatWindow:
             return f'{tool_name} ({summary})'
         return tool_name
 
+    def _summarize_working_input(self, tool_name: str, input_payload: dict) -> str:
+        """从工具输入中提取一行关键信息用于卡片显示。"""
+        if not isinstance(input_payload, dict):
+            return ''
+        preferred_keys = {
+            'Read': ('file_path', 'path'),
+            'Grep': ('pattern', 'query'),
+            'Glob': ('pattern',),
+            'Bash': ('command',),
+            'PowerShell': ('command',),
+            'WebSearch': ('query',),
+            'WebFetch': ('url',),
+            'Task': ('description', 'prompt'),
+            'TaskCreate': ('description', 'prompt'),
+            'Agent': ('description', 'prompt'),
+            'Write': ('file_path', 'path'),
+            'Edit': ('file_path', 'path'),
+            'NotebookEdit': ('notebook_path', 'file_path'),
+        }
+        for key in preferred_keys.get(tool_name, ('file_path', 'path', 'pattern', 'query', 'command', 'url', 'description')):
+            value = input_payload.get(key)
+            if isinstance(value, str) and value.strip():
+                val = value.strip()
+                return val[:120] + ('...' if len(val) > 120 else '')
+        return ''
+
     def _handle_sdk_status(self, event: dict):
         permission_mode = event.get('permission_mode')
         if isinstance(permission_mode, str):
@@ -2282,14 +2811,12 @@ class ChatWindow:
         if status == 'compacting':
             self._render_main_status('正在压缩上下文...')
         elif isinstance(status, str) and status:
-            if status == 'thinking_tokens':
-                self._render_main_status('正在思考...')
-            else:
-                self._render_main_status(status)
+            self._render_main_status(status)
 
     def _handle_session_state(self, event: dict):
         state = self._task_progress_compact_text(event.get('state'))
         if state == 'running':
+            self.status_var.set(self._compose_status_text('会话运行中...'))
             return
         if state == 'idle':
             self._render_main_status('当前轮次已空闲')
@@ -2316,7 +2843,7 @@ class ChatWindow:
         if status_category or status_detail:
             parts.append(f'状态: {(status_category + " " + status_detail).strip()}')
         if parts:
-            self._append_message('warn', '\n'.join(parts))
+            self._render_summary_status(' | '.join(parts))
 
     def _get_assistant_avatar(self):
         if self._assistant_avatar is not None or self._avatar_source is None:
@@ -2373,7 +2900,7 @@ class ChatWindow:
             bubble_wrap.pack(anchor='e', fill=tk.X)
 
             text_width_chars = self._pixels_to_chars(520)
-            text_height = self._calc_text_display_lines(text, text_width_chars)
+            text_height = self._calc_text_display_lines(self._markdown_to_plain_text(text), text_width_chars)
             bubble = tk.Text(
                 bubble_wrap,
                 font=self.fonts['base'],
@@ -2393,9 +2920,12 @@ class ChatWindow:
                 spacing1=4,
                 spacing3=4,
             )
-            bubble.insert('1.0', text)
+            self._configure_markdown_tags(bubble)
+            self._insert_markdown_text(bubble, text)
             bubble.configure(state=tk.DISABLED)
             bubble.pack(anchor='e')
+            container._message_bubble = bubble
+            container._message_text = text
             self._bind_message_copy_events(bubble, text)
 
             meta = tk.Frame(content_col, bg=self.colors['panel'])
@@ -2430,7 +2960,7 @@ class ChatWindow:
             content_col.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
             text_width_chars = self._pixels_to_chars(520)
-            text_height = self._calc_text_display_lines(text, text_width_chars)
+            text_height = self._calc_text_display_lines(self._markdown_to_plain_text(text), text_width_chars)
             bubble = tk.Text(
                 content_col,
                 font=self.fonts['base'],
@@ -2450,9 +2980,12 @@ class ChatWindow:
                 spacing1=4,
                 spacing3=4,
             )
-            bubble.insert('1.0', text)
+            self._configure_markdown_tags(bubble)
+            self._insert_markdown_text(bubble, text)
             bubble.configure(state=tk.DISABLED)
             bubble.pack(anchor='w')
+            container._message_bubble = bubble
+            container._message_text = text
             self._bind_message_copy_events(bubble, text)
 
             meta = tk.Frame(content_col, bg=self.colors['panel'])
@@ -2483,6 +3016,12 @@ class ChatWindow:
         if reminder_text:
             self._render_main_status(reminder_text)
             return
+
+        # ── 终端风格事件：直接插入纯文本，不走卡片组件系统 ──
+        if role in ('thinking_inline', 'tool_use', 'tool_result', 'system_info'):
+            self._insert_terminal_event(role, text)
+            return
+
         self.text_area.config(state=tk.NORMAL)
         card = self._create_message_widget(role, text)
         self.text_area.insert(tk.END, '\n')
@@ -2495,7 +3034,345 @@ class ChatWindow:
             self._conversation_history.append({'role': role, 'text': text})
             self._conversation_history = self._conversation_history[-12:]
 
+    def _configure_markdown_tags(self, widget: tk.Text):
+        base_font = tkfont.Font(font=self.fonts['base'])
+        strong_font = tkfont.Font(font=self.fonts['base'])
+        strong_font.configure(weight='bold')
+        code_font = tkfont.Font(family='Consolas', size=max(9, int(base_font.cget('size')) - 1))
+        h1_font = tkfont.Font(font=self.fonts['base'])
+        h1_font.configure(weight='bold', size=max(int(base_font.cget('size')) + 5, 16))
+        h2_font = tkfont.Font(font=self.fonts['base'])
+        h2_font.configure(weight='bold', size=max(int(base_font.cget('size')) + 3, 14))
+        h3_font = tkfont.Font(font=self.fonts['base'])
+        h3_font.configure(weight='bold', size=max(int(base_font.cget('size')) + 1, 13))
+        widget._markdown_fonts = {
+            'strong': strong_font,
+            'code': code_font,
+            'h1': h1_font,
+            'h2': h2_font,
+            'h3': h3_font,
+        }
+        widget.tag_configure('md_h1', font=h1_font, spacing1=8, spacing3=4)
+        widget.tag_configure('md_h2', font=h2_font, spacing1=6, spacing3=4)
+        widget.tag_configure('md_h3', font=h3_font, spacing1=6, spacing3=3)
+        widget.tag_configure('md_bold', font=strong_font)
+        widget.tag_configure('md_inline_code', font=code_font, background='#F4EFE4', foreground='#7A5530')
+        widget.tag_configure('md_code_block', font=code_font, background='#F7F3EA', foreground='#5B4D3A', lmargin1=12, lmargin2=12)
+        widget.tag_configure('md_quote', foreground='#6B7C7E', lmargin1=12, lmargin2=12)
+        widget.tag_configure('md_list_marker', foreground='#68898C')
+
+    def _markdown_to_plain_text(self, text: str) -> str:
+        if not isinstance(text, str) or not text:
+            return ''
+        plain = re.sub(r'```[\w-]*\n?', '', text)
+        plain = re.sub(r'(?m)^\s{0,3}#{1,6}\s+', '', plain)
+        plain = re.sub(r'\*\*([^*\n]+)\*\*', r'\1', plain)
+        plain = re.sub(r'`([^`\n]+)`', r'\1', plain)
+        plain = re.sub(r'(?m)^\s*[-*]\s+', '• ', plain)
+        plain = re.sub(r'(?m)^\s*>\s?', '', plain)
+        return plain
+
+    def _insert_markdown_text(self, widget: tk.Text, text: str):
+        in_code_block = False
+        for line in (text or '').splitlines():
+            if re.match(r'^\s*```', line):
+                in_code_block = not in_code_block
+                if in_code_block:
+                    widget.insert(tk.END, '```\n', ('md_code_block',))
+                continue
+            if in_code_block:
+                widget.insert(tk.END, line + '\n', ('md_code_block',))
+                continue
+
+            heading = re.match(r'^\s*(#{1,6})\s+(.+?)\s*$', line)
+            if heading:
+                level = min(len(heading.group(1)), 3)
+                self._insert_markdown_inline(widget, heading.group(2), block_tag=f'md_h{level}')
+                widget.insert(tk.END, '\n')
+                continue
+
+            quote = re.match(r'^\s*>\s?(.*)$', line)
+            if quote:
+                widget.insert(tk.END, '│ ', ('md_quote',))
+                self._insert_markdown_inline(widget, quote.group(1), block_tag='md_quote')
+                widget.insert(tk.END, '\n')
+                continue
+
+            unordered = re.match(r'^(\s*)[-*]\s+(.+?)\s*$', line)
+            if unordered:
+                indent = unordered.group(1).replace('\t', '    ')
+                widget.insert(tk.END, indent + '• ', ('md_list_marker',))
+                self._insert_markdown_inline(widget, unordered.group(2))
+                widget.insert(tk.END, '\n')
+                continue
+
+            ordered = re.match(r'^(\s*)(\d+\.)\s+(.+?)\s*$', line)
+            if ordered:
+                indent = ordered.group(1).replace('\t', '    ')
+                widget.insert(tk.END, indent + ordered.group(2) + ' ', ('md_list_marker',))
+                self._insert_markdown_inline(widget, ordered.group(3))
+                widget.insert(tk.END, '\n')
+                continue
+
+            self._insert_markdown_inline(widget, line)
+            widget.insert(tk.END, '\n')
+
+    def _insert_markdown_inline(self, widget: tk.Text, text: str, *, block_tag: str | None = None):
+        tags = (block_tag,) if block_tag else ()
+        last_index = 0
+        for match in MARKDOWN_INLINE_PATTERN.finditer(text or ''):
+            if match.start() > last_index:
+                widget.insert(tk.END, text[last_index:match.start()], tags)
+            token = match.group(0)
+            if token.startswith('**') and token.endswith('**'):
+                token_tags = tuple(tag for tag in (block_tag, 'md_bold') if tag)
+                widget.insert(tk.END, token[2:-2], token_tags)
+            elif token.startswith('`') and token.endswith('`'):
+                token_tags = tuple(tag for tag in (block_tag, 'md_inline_code') if tag)
+                widget.insert(tk.END, token[1:-1], token_tags)
+            else:
+                widget.insert(tk.END, token, tags)
+            last_index = match.end()
+        if last_index < len(text or ''):
+            widget.insert(tk.END, text[last_index:], tags)
+
+    # ── 终端风格事件渲染 ─────────────────────────────────────────
+    # 将 thinking / tool_use / tool_result / system_info 事件渲染为
+    # 命令行风格的纯文本行，直接插入 Text 组件。
+    # thinking 支持流式更新（新事件替换旧块）和默认折叠。
+
+    _TOOL_ICONS = {
+        'read': '📖', 'grep': '🔍', 'glob': '📂',
+        'bash': '⚡', 'powershell': '⚡',
+        'write': '✏️', 'edit': '✏️', 'notebookedit': '✏️',
+        'websearch': '🌐', 'webfetch': '🌐',
+        'task': '🤖', 'agent': '🤖', 'taskcreate': '🤖',
+    }
+
+    def _pick_tool_icon(self, tool_header: str) -> str:
+        lowered = str(tool_header or '').split('|', 1)[0].strip().lower()
+        for key, icon in self._TOOL_ICONS.items():
+            if lowered.startswith(key):
+                return icon
+        return '🔧'
+
+    def _fmt_tok(self, value) -> str:
+        """格式化 token 数量为紧凑形式。"""
+        if not isinstance(value, int) or value <= 0:
+            return ''
+        if value >= 1_000_000:
+            return f'{value / 1_000_000:.1f}M tok'
+        if value >= 1_000:
+            return f'{value / 1_000:.1f}k tok'
+        return f'{value} tok'
+
+    def _current_tok_str(self) -> str:
+        """本轮当前的总 token 数（思考期间会随着模型输出持续增长）。"""
+        tok = self._fmt_tok(self._current_total_tokens)
+        return f'  {tok}' if tok else ''
+
+    def _seal_thinking_block(self):
+        """结束当前思考块流式更新——收拢为折叠态，但仍可点击展开。"""
+        if self._turn_thinking_range is None or not self._turn_thinking_expanded:
+            self._turn_thinking_user_closed = False
+            return
+        self._turn_thinking_expanded = False
+        try:
+            was_normal = self.text_area.cget('state') == tk.NORMAL
+            if not was_normal:
+                self.text_area.config(state=tk.NORMAL)
+            start, _end = self._turn_thinking_range
+            if self.text_area.compare(start, '<', tk.END):
+                self.text_area.delete(start, tk.END)
+            # ★ 关键：先置空范围再调 _render_thinking_terminal，
+            #   否则它会用旧范围再做一次 delete，造成索引混乱。
+            self._turn_thinking_range = None
+            if self._turn_thinking_text:
+                self._render_thinking_terminal(self._turn_thinking_text)
+            if not was_normal:
+                self.text_area.config(state=tk.DISABLED)
+            self.text_area.see(tk.END)
+        except Exception:
+            self._turn_thinking_range = None
+            self._turn_thinking_text = ''
+        self._turn_thinking_user_closed = False
+
+    def _reset_turn_state(self):
+        """重置本轮所有终端渲染状态（新轮次开始时调用）。
+        不清除文本区中的旧思考块（它属于上一轮的显示内容），
+        只重置跟踪状态让新事件从头开始。"""
+        self._turn_thinking_range = None
+        self._turn_thinking_text = ''
+        self._turn_thinking_expanded = True  # 新一轮默认展开
+        self._turn_thinking_user_closed = False
+
+    def _insert_terminal_event(self, role: str, text: str):
+        text = (text or '').strip()
+        if not text:
+            return
+
+        self.text_area.config(state=tk.NORMAL)
+
+        if role == 'thinking_inline':
+            self._render_thinking_terminal(text)
+        else:
+            # 非思考事件：先封存上一个思考块，再单独渲染
+            self._seal_thinking_block()
+            if role == 'tool_use':
+                self._render_tool_use_terminal(text)
+            elif role == 'tool_result':
+                self._render_tool_result_terminal(text)
+            elif role == 'system_info':
+                self._render_system_info_terminal(text)
+
+        self.text_area.config(state=tk.DISABLED)
+        self.text_area.see(tk.END)
+
+    # ── 思考块（流式更新 + 默认展开） ────────────────────────────
+    # 实现思路：
+    #   thinking 事件每次到达时，删除旧块并重新插入。新块始终在文本末尾，
+    #   通过 (start, end) 索引范围跟踪。token 计数随 _current_total_tokens
+    #   增长而实时更新。
+    #
+    #   关键规则：
+    #   1. 调用 _render_thinking_terminal 前，调用方必须负责清除旧范围，
+    #      否则内部会尝试 delete(old_range) 导致索引错乱。
+    #   2. _seal_thinking_block 和 _toggle_thinking 都是"重渲染"入口，
+    #      它们先置空 _turn_thinking_range 再调用 _render_thinking_terminal。
+
+    def _render_thinking_terminal(self, text: str):
+        token_str = self._current_tok_str()
+        was_normal = self.text_area.cget('state') == tk.NORMAL
+        if not was_normal:
+            self.text_area.config(state=tk.NORMAL)
+
+        # 移除旧块
+        if self._turn_thinking_range is not None:
+            try:
+                start, end = self._turn_thinking_range
+                if self.text_area.compare(start, '<', end):
+                    self.text_area.delete(start, end)
+            except Exception:
+                pass
+            self._turn_thinking_range = None
+
+        self._turn_thinking_text = text
+        block_start = self.text_area.index(tk.END)
+
+        if self._turn_thinking_expanded:
+            self.text_area.insert(
+                tk.END,
+                f'⏳ 思考中...{token_str}  ▾ 点击折叠\n',
+                ('term_thinking_header', 'thinking_toggle'),
+            )
+            display = text[:3000] + ('\n...（过长已截断）' if len(text) > 3000 else '')
+            for line in display.split('\n'):
+                self.text_area.insert(tk.END, '   ' + line + '\n', ('term_thinking',))
+        else:
+            first_line = text.split('\n')[0] if text else ''
+            if len(first_line) > 80:
+                first_line = first_line[:80] + '…'
+            self.text_area.insert(
+                tk.END,
+                f'⏳ 思考中...{token_str}  ▸ 点击展开\n',
+                ('term_thinking_header', 'thinking_toggle'),
+            )
+            if first_line:
+                self.text_area.insert(
+                    tk.END, f'   {first_line}\n', ('term_thinking',))
+
+        block_end = self.text_area.index(tk.END)
+        self._turn_thinking_range = (block_start, block_end)
+
+        if not was_normal:
+            self.text_area.config(state=tk.DISABLED)
+        self.text_area.see(tk.END)
+
+    def _toggle_thinking(self, _event=None):
+        """点击思考标题行切换折叠/展开。"""
+        self._turn_thinking_expanded = not self._turn_thinking_expanded
+        if not self._turn_thinking_expanded:
+            self._turn_thinking_user_closed = True
+        if self._turn_thinking_text:
+            # 先置空范围防止 _render_thinking_terminal 对已删区域重复 delete
+            self._turn_thinking_range = None
+            self._render_thinking_terminal(self._turn_thinking_text)
+        return 'break'
+
+    # ── 工具调用 / 结果 / 系统信息 ─────────────────────────────────
+
+    def _render_tool_use_terminal(self, text: str):
+        lines = text.strip().split('\n', 1)
+        tool_header = lines[0]
+        icon = self._pick_tool_icon(tool_header)
+        token_str = self._current_tok_str()
+        self.text_area.insert(tk.END, f'{icon} ', ('term_prefix',))
+        self.text_area.insert(
+            tk.END, tool_header + token_str + '\n',
+            ('term_tool',),
+        )
+        if len(lines) > 1 and lines[1].strip():
+            self.text_area.insert(
+                tk.END, '   ' + lines[1].strip() + '\n',
+                ('term_tool_detail',),
+            )
+
+    def _render_tool_result_terminal(self, text: str):
+        """工具结果——逐行 diff 着色。"""
+        has_diff = False
+        for line in text.split('\n'):
+            stripped = line.rstrip('\r')
+            if stripped.startswith('+') and not stripped.startswith('+++'):
+                self.text_area.insert(tk.END, '⎿ ' + stripped + '\n', ('diff_add',))
+                has_diff = True
+            elif stripped.startswith('-') and not stripped.startswith('---'):
+                self.text_area.insert(tk.END, '⎿ ' + stripped + '\n', ('diff_del',))
+                has_diff = True
+            elif stripped.startswith('@@'):
+                self.text_area.insert(tk.END, '⎿ ' + stripped + '\n', ('diff_hunk',))
+                has_diff = True
+            else:
+                self.text_area.insert(tk.END, '⎿ ' + stripped + '\n', ('term_result',))
+        # 如果没有 diff 行，给一个简洁摘要
+        if not has_diff and len(text) > 300:
+            first_line = text.split('\n')[0].strip()
+            if len(first_line) > 200:
+                first_line = first_line[:200] + '...'
+            # 已经作为普通行插入了，这里只做截断提示
+            if len(text.split('\n')) > 20:
+                self.text_area.insert(
+                    tk.END, '⎿ ...（输出过长，共 {} 行）\n'.format(len(text.split('\n'))),
+                    ('term_result',),
+                )
+
+    def _render_system_info_terminal(self, text: str):
+        compact = self._task_progress_compact_text(text)
+        if not compact:
+            return
+        # 根据内容自动选图标
+        if any(w in compact for w in ('压缩', 'compacting')):
+            prefix = '📦'
+        elif any(w in compact for w in ('计划', 'plan', 'Updated plan')):
+            prefix = '📋'
+        elif any(w in compact for w in ('模式', 'mode')):
+            prefix = '⚙️'
+        elif any(w in compact for w in ('连接', 'connect', '重连')):
+            prefix = '🔗'
+        elif any(w in compact for w in ('错误', 'error', '失败', '断开')):
+            prefix = '⚠️'
+        elif any(w in compact for w in ('完成', 'done', 'finish', '成功')):
+            prefix = '✅'
+        elif any(w in compact for w in ('hook', 'Hook', '🪝')):
+            prefix = '🪝'
+        elif any(w in compact for w in ('运行', 'running', '进行')):
+            prefix = '⏳'
+        else:
+            prefix = '•'
+        self.text_area.insert(tk.END, f'  {prefix} {compact}\n', ('term_system',))
+
     def _maybe_show_choice_buttons(self, text: str):
+        if not self._should_show_choice_buttons(text):
+            return
         options = self._extract_choice_options(text)
         if len(options) < 2:
             return
@@ -2543,6 +3420,20 @@ class ChatWindow:
 
         self._insert_inline_card(card)
 
+    def _should_show_choice_buttons(self, text: str) -> bool:
+        if not isinstance(text, str):
+            return False
+        compact = ' '.join(text.strip().split())
+        if not compact:
+            return False
+        lowered = compact.lower()
+        if '?' not in compact and '？' not in compact and not any(cue in compact for cue in CHOICE_PROMPT_CUES):
+            return False
+        if '快速选择' in compact:
+            return False
+        # 只有明确在向用户索取选择时才展示按钮，避免普通总结/列表误触发
+        return any(cue in compact for cue in CHOICE_PROMPT_CUES) or ('?' in compact or '？' in compact)
+
     def _handle_choice_selection(self, reply_text: str, card):
         self._destroy_widget(card)
         if self._busy:
@@ -2568,6 +3459,8 @@ class ChatWindow:
             label = (match.group(1) or '').strip().strip('`')
             detail = (match.group(2) or '').strip()
             if not label or label in seen:
+                continue
+            if len(label) > 40:
                 continue
             seen.add(label)
             options.append({'label': label, 'detail': detail})
@@ -2664,14 +3557,23 @@ class ChatWindow:
             menu.grab_release()
 
     def _bind_message_copy_events(self, widget, full_text: str):
-        """为消息 Text 组件绑定选择/复制相关事件。"""
+        """为消息组件（Text 或 Label）绑定选择/复制相关事件。"""
         # 右键菜单
         widget.bind(
             '<Button-3>',
             lambda e, t=full_text, w=widget: self._show_message_context_menu(e, t, w),
         )
-        # 允许通过点击获得焦点（用于 Ctrl+C 复制）
-        widget.bind('<Button-1>', lambda e: e.widget.focus_set(), add='+')
+        # 点击时尝试获取焦点，使 Ctrl+C 能正常工作
+        def _grab_focus(event):
+            try:
+                event.widget.focus_set()
+            except Exception:
+                try:
+                    if self.window is not None:
+                        self.window.focus_set()
+                except Exception:
+                    pass
+        widget.bind('<Button-1>', _grab_focus, add='+')
 
     def close(self):
         if self._connection_time_timer is not None:
@@ -2680,6 +3582,11 @@ class ChatWindow:
             except Exception:
                 pass
             self._connection_time_timer = None
+
+        if self._terminal_view is not None:
+            self._terminal_view.hide(notify=False)
+            self._terminal_view = None
+        self._terminal_view_visible = False
 
         try:
             self.session.close()

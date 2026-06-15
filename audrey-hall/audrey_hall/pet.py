@@ -140,7 +140,7 @@ class DesktopGif:
         # 捕获窗口的窗口名
         # 'AI 对话' 是桌宠自己的 AI 对话窗口标题（见 chat_window.py），
         # 加入后桌宠会像贴靠微信一样自动附着到对话窗口顶部。
-        self.snap_window_name = ["微信"]
+        self.snap_window_name = ["这是个占位符号"]
         self.snap_window_name_lower = {name.lower() for name in self.snap_window_name}
         # 窗口名非精确匹配
         self.snap_window_egg = ["鸣潮"]
@@ -295,6 +295,7 @@ class DesktopGif:
         self._bubble_image_id = None
         self._bubble_text_id = None
         self._bubble_text_width = 220
+        self._bubble_raw_text = ''
         self._init_bubble_surface()
 
         self.w = self.current_frames[0].width()
@@ -366,19 +367,22 @@ class DesktopGif:
         bubble_colors = self._bubble_theme['colors']
         bubble_font = self._bubble_theme['fonts']['small']
         bubble_asset = resource_path(os.path.join('audrey_hall', 'img', 'maopao.png'))
+        bubble_scale = max(0.65, min(1.1, self.scale * 0.85))
         try:
             bubble_image = Image.open(bubble_asset)
-            max_width = 360
-            if bubble_image.width > max_width:
-                scale = max_width / float(bubble_image.width)
-                bubble_image = bubble_image.resize(
-                    (max_width, max(1, int(bubble_image.height * scale))),
-                    Image.Resampling.LANCZOS,
-                )
+            max_width = max(220, int(320 * bubble_scale))
+            target_width = max(180, int(bubble_image.width * bubble_scale))
+            if target_width > max_width:
+                target_width = max_width
+            scale = target_width / float(bubble_image.width)
+            bubble_image = bubble_image.resize(
+                (target_width, max(1, int(bubble_image.height * scale))),
+                Image.Resampling.LANCZOS,
+            )
             self._bubble_bg_photo = ImageTk.PhotoImage(bubble_image)
             bubble_width = self._bubble_bg_photo.width()
             bubble_height = self._bubble_bg_photo.height()
-            self._bubble_text_width = max(170, int(bubble_width * 0.58))
+            self._bubble_text_width = max(140, int(bubble_width * 0.56))
             self._bubble_canvas.config(width=bubble_width, height=bubble_height)
             self._bubble_image_id = self._bubble_canvas.create_image(
                 0,
@@ -397,9 +401,9 @@ class DesktopGif:
                 anchor=tk.CENTER,
             )
         except Exception:
-            fallback_width = 260
-            fallback_height = 92
-            self._bubble_text_width = 200
+            fallback_width = max(180, int(220 * bubble_scale))
+            fallback_height = max(72, int(82 * bubble_scale))
+            self._bubble_text_width = max(140, int(fallback_width * 0.76))
             self._bubble_canvas.config(width=fallback_width, height=fallback_height)
             self._bubble_canvas.create_rectangle(
                 1,
@@ -420,6 +424,22 @@ class DesktopGif:
                 width=self._bubble_text_width,
                 anchor=tk.CENTER,
             )
+
+    def _sync_bubble_visibility(self):
+        try:
+            if not self.bubble_window.winfo_exists():
+                return
+            should_show = bool(self._bubble_raw_text) and not self._user_hidden and not self._hidden_by_fullscreen
+            if should_show:
+                self._reposition_bubble()
+                self.bubble_window.deiconify()
+            else:
+                self.bubble_window.withdraw()
+        except Exception:
+            pass
+
+    def _bubble_should_be_visible(self):
+        return bool(self._bubble_raw_text) and not self._user_hidden and not self._hidden_by_fullscreen
 
     def _bubble_text_color(self, status):
         bubble_colors = self._bubble_theme['colors']
@@ -536,6 +556,7 @@ class DesktopGif:
 
     def set_claude_bubble(self, text, status='working', auto_hide_ms=None):
         text = (text or '').strip()
+        self._bubble_raw_text = text
         self._bubble_state = status
         if self._bubble_hide_job is not None:
             try:
@@ -557,8 +578,7 @@ class DesktopGif:
                 text=text,
                 fill=self._bubble_text_color(status),
             )
-        self._reposition_bubble()
-        self.bubble_window.deiconify()
+        self._sync_bubble_visibility()
         if auto_hide_ms is not None and int(auto_hide_ms) > 0:
             self._bubble_hide_job = self.root.after(int(auto_hide_ms), self.hide_claude_bubble)
 
@@ -569,6 +589,7 @@ class DesktopGif:
             except Exception:
                 pass
             self._bubble_hide_job = None
+        self._bubble_raw_text = ''
         self._bubble_state = 'idle'
         if self.is_paused:
             self.paused()
@@ -598,6 +619,7 @@ class DesktopGif:
         if self._hidden_by_fullscreen:
             self.root.deiconify()
             self._hidden_by_fullscreen = False
+            self._sync_bubble_visibility()
         self.root.attributes("-topmost", True)
         ctypes.windll.user32.SetWindowPos(
             self.hwnd,
@@ -614,10 +636,12 @@ class DesktopGif:
             if not self._hidden_by_fullscreen:
                 self.root.withdraw()
                 self._hidden_by_fullscreen = True
+                self._sync_bubble_visibility()
             return
         if self._hidden_by_fullscreen:
             self.root.deiconify()
             self._hidden_by_fullscreen = False
+            self._sync_bubble_visibility()
         self._apply_topmost()
 
     def _apply_desktop_only(self):
@@ -625,6 +649,7 @@ class DesktopGif:
         if self._hidden_by_fullscreen:
             self.root.deiconify()
             self._hidden_by_fullscreen = False
+            self._sync_bubble_visibility()
 
         # 检查是否已经挂载到桌面（使用实例变量，避免重复挂载）
         if not self._attached_to_desktop:
@@ -825,6 +850,9 @@ class DesktopGif:
         config["scale_index"] = index
         save_config(config)
 
+        current_bubble_text = self._bubble_raw_text
+        current_bubble_status = self._bubble_state
+
         # 重新加载GIF (使用 resource_path 支持打包)
         move_path = resource_path(os.path.join(GIF_DIR, "move.gif"))
         result = load_gif_frames(move_path, self.scale)
@@ -866,6 +894,11 @@ class DesktopGif:
         )
 
         self._effect_cache = {}
+        self._bubble_canvas.delete('all')
+        self._bubble_bg_photo = None
+        self._bubble_image_id = None
+        self._bubble_text_id = None
+        self._init_bubble_surface()
 
         # 更新窗口大小
         if self.move_frames:
@@ -879,6 +912,10 @@ class DesktopGif:
             self.move_frames if self.moving_right else self.move_frames_left
         )
         self.current_delays = self.move_delays
+        if current_bubble_text:
+            self.set_claude_bubble(current_bubble_text, status=current_bubble_status)
+        else:
+            self._sync_bubble_visibility()
 
     def toggle_pause(self):
         """切换暂停/继续"""

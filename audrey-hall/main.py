@@ -134,6 +134,7 @@ def main():
             pet.set_display_priority(self.display_priority, persist=False)
             if not self._visible:
                 pet.root.withdraw()
+            pet._sync_bubble_visibility()
             # 应用语音设置
             if pet.voice_player:
                 pet.voice_player.set_enabled(self.voice_enabled)
@@ -192,12 +193,14 @@ def main():
             for pet in self.pets:
                 pet._user_hidden = True  # 标记为用户手动隐藏
                 pet.root.withdraw()
+                pet._sync_bubble_visibility()
 
         def show_all(self):
             self._visible = True
             for pet in self.pets:
                 pet._user_hidden = False  # 清除用户手动隐藏标记
                 pet.root.deiconify()
+                pet._sync_bubble_visibility()
 
         def is_visible(self):
             return self._visible
