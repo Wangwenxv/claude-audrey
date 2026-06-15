@@ -5,6 +5,15 @@ from .ui import create_button, create_card
 from .ui.animations import animate_toplevel_slide_in
 
 
+_TOOL_ICONS = {
+    'read': '📖', 'grep': '🔍', 'glob': '📂',
+    'bash': '⚡', 'powershell': '⚡',
+    'write': '✏️', 'edit': '✏️', 'notebookedit': '✏️',
+    'websearch': '🌐', 'webfetch': '🌐',
+    'task': '🤖', 'agent': '🤖', 'taskcreate': '🤖',
+}
+
+
 class TerminalViewWindow:
     def __init__(self, parent, theme, *, on_close=None):
         self.parent = parent
@@ -283,6 +292,8 @@ class TerminalViewWindow:
         if not text:
             return
         line_kind = str(event.get('line_kind') or 'info')
+        if line_kind == 'tool_use':
+            text = f'{self._pick_tool_icon(text)} {text}'
         if line_kind == 'thinking':
             tag = 'thinking'
         elif line_kind in {'tool_use', 'task_progress', 'hook_status', 'permission'}:
@@ -296,6 +307,13 @@ class TerminalViewWindow:
         else:
             tag = 'meta'
         self._append_prefixed_block(text, tag, event.get('ts'))
+
+    def _pick_tool_icon(self, tool_header: str) -> str:
+        lowered = str(tool_header or '').split('|', 1)[0].strip().lower()
+        for key, icon in _TOOL_ICONS.items():
+            if lowered.startswith(key):
+                return icon
+        return '🔧'
 
     def _append_prefixed_block(self, text: str, tag: str, ts):
         prefix = f'[{ts}] ' if isinstance(ts, str) and ts else ''

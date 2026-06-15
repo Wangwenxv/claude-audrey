@@ -35,6 +35,7 @@ CHOICE_LINE_PATTERNS = (
     re.compile(r'^\s*(?:[-*]|\d+\.)\s+\*\*(.+?)\*\*(?:\s*[—-]\s*(.+))?\s*$'),
     re.compile(r'^\s*(?:[-*]|\d+\.)\s+(.+?)\s*[—-]\s*(.+)\s*$'),
 )
+MARKDOWN_INLINE_PATTERN = re.compile(r'(\*\*[^*\n]+\*\*|`[^`\n]+`)')
 
 MAX_SIDE_CONTEXT_MESSAGES = 6
 MAX_SIDE_CONTEXT_CHARS = 2800
@@ -51,16 +52,32 @@ CONNECTION_TARGET_CHOICES = [
 MODE_CHOICES = [
     ('default', '默认陪伴'),
     ('acceptEdits', '赐予更改权限'),
-    ('auto', '赐予全部权限'),
+    ('bypassPermissions', '赐予全部权限'),
     ('plan', '还是先做个计划吧'),
 ]
 MODE_LABELS = {key: label for key, label in MODE_CHOICES}
 CONNECTION_OPTION_LABELS = {key: label for key, label in CONNECTION_TARGET_CHOICES}
 CLAUDE_PROJECTS_DIR = Path.home() / '.claude' / 'projects'
+PERMISSION_MODE_ALIASES = {
+    'default': 'default',
+    'acceptedits': 'acceptEdits',
+    'accept': 'acceptEdits',
+    'edits': 'acceptEdits',
+    'auto': 'bypassPermissions',
+    'bypasspermissions': 'bypassPermissions',
+    'plan': 'plan',
+}
 
 
 def _sanitize_project_path(path_text: str) -> str:
     return re.sub(r'[^a-zA-Z0-9]', '-', path_text or '')
+
+
+def _normalize_permission_mode(mode: str | None) -> str:
+    normalized = (mode or 'default').strip()
+    if not normalized:
+        return 'default'
+    return PERMISSION_MODE_ALIASES.get(normalized.lower(), normalized)
 
 
 class ChatWindow:
@@ -1466,7 +1483,7 @@ class ChatWindow:
         self._mode_var.set(self._format_mode_status())
 
     def _set_active_permission_mode(self, mode: str, *, announce: bool = False):
-        normalized = (mode or 'default').strip() or 'default'
+        normalized = _normalize_permission_mode(mode)
         if normalized not in MODE_LABELS:
             normalized = 'default'
         changed = normalized != self._active_permission_mode
@@ -1478,7 +1495,7 @@ class ChatWindow:
             self._append_inline_status(f'模式已切换：{label}')
 
     def _apply_permission_mode(self, mode: str):
-        normalized = (mode or '').strip()
+        normalized = _normalize_permission_mode(mode)
         if normalized not in MODE_LABELS:
             self._append_message('error', f'不支持的模式：{mode}')
             return
@@ -1510,15 +1527,7 @@ class ChatWindow:
             self._append_inline_status(self._format_mode_status())
             return
 
-        mode_aliases = {
-            'default': 'default',
-            'acceptedits': 'acceptEdits',
-            'accept': 'acceptEdits',
-            'edits': 'acceptEdits',
-            'auto': 'auto',
-            'plan': 'plan',
-        }
-        target_mode = mode_aliases.get(lowered)
+        target_mode = PERMISSION_MODE_ALIASES.get(lowered)
         if target_mode is None:
             self._append_message('warn', '不支持的模式。可用：default、acceptEdits、auto、plan。')
             return
@@ -2000,7 +2009,10 @@ class ChatWindow:
             else:
                 self.status_var.set(self._compose_status_text('Claude Code 发生错误'))
             self._clear_bubble_state()
-            self._append_message('error', event.get('text') or '未知错误')
+            error_text = event.get('text') or '未知错误'
+            if event.get('request_subtype') == 'set_permission_mode':
+                error_text = self._translate_permission_mode_error(error_text)
+            self._append_message('error', error_text)
 
     def _handle_permission_request(self, event: dict):
         tool_name = event.get('tool_name') or '未知工具'
@@ -2429,8 +2441,20 @@ class ChatWindow:
         if mode_change:
             old_mode = mode_change.group(1)
             new_mode = mode_change.group(2)
-            old_mode = {'plan': '计划', 'build': '构建'}.get(old_mode.lower(), old_mode)
-            new_mode = {'plan': '计划', 'build': '构建'}.get(new_mode.lower(), new_mode)
+            old_mode = {
+                'plan': '计划',
+                'build': '构建',
+                'default': '默认陪伴',
+                'acceptedits': '赐予更改权限',
+                'bypasspermissions': '赐予全部权限',
+            }.get(old_mode.lower(), old_mode)
+            new_mode = {
+                'plan': '计划',
+                'build': '构建',
+                'default': '默认陪伴',
+                'acceptedits': '赐予更改权限',
+                'bypasspermissions': '赐予全部权限',
+            }.get(new_mode.lower(), new_mode)
             detail = f'模式切换：{old_mode} -> {new_mode}'
             if 'no longer in read-only mode' in reminder.lower():
                 detail += '，已解除只读'
@@ -2439,6 +2463,19 @@ class ChatWindow:
             return detail
 
         return reminder
+
+    def _translate_permission_mode_error(self, text: str) -> str:
+        if not isinstance(text, str):
+            return ''
+        lowered = text.lower()
+        if 'cannot set permission mode to bypasspermissions' in lowered:
+            if 'disabled by settings or configuration' in lowered:
+                return '当前 Claude 配置禁用了“赐予全部权限”模式'
+            if '--dangerously-skip-permissions' in lowered:
+                return '当前会话未以“赐予全部权限”能力启动，无法切换到全权限模式'
+        if 'cannot set permission mode to auto' in lowered:
+            return '当前 Claude 配置不支持切换到 auto 模式'
+        return text
 
     def _format_tool_progress(self, event: dict) -> str:
         tool_name = self._task_progress_compact_text(event.get('tool_name')) or '工具'
@@ -2514,10 +2551,7 @@ class ChatWindow:
         if status == 'compacting':
             self._render_main_status('正在压缩上下文...')
         elif isinstance(status, str) and status:
-            if status == 'thinking_tokens':
-                self._render_main_status('正在思考...')
-            else:
-                self._render_main_status(status)
+            self._render_main_status(status)
 
     def _handle_session_state(self, event: dict):
         state = self._task_progress_compact_text(event.get('state'))
@@ -2606,7 +2640,7 @@ class ChatWindow:
             bubble_wrap.pack(anchor='e', fill=tk.X)
 
             text_width_chars = self._pixels_to_chars(520)
-            text_height = self._calc_text_display_lines(text, text_width_chars)
+            text_height = self._calc_text_display_lines(self._markdown_to_plain_text(text), text_width_chars)
             bubble = tk.Text(
                 bubble_wrap,
                 font=self.fonts['base'],
@@ -2626,7 +2660,8 @@ class ChatWindow:
                 spacing1=4,
                 spacing3=4,
             )
-            bubble.insert('1.0', text)
+            self._configure_markdown_tags(bubble)
+            self._insert_markdown_text(bubble, text)
             bubble.configure(state=tk.DISABLED)
             bubble.pack(anchor='e')
             self._bind_message_copy_events(bubble, text)
@@ -2663,7 +2698,7 @@ class ChatWindow:
             content_col.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
             text_width_chars = self._pixels_to_chars(520)
-            text_height = self._calc_text_display_lines(text, text_width_chars)
+            text_height = self._calc_text_display_lines(self._markdown_to_plain_text(text), text_width_chars)
             bubble = tk.Text(
                 content_col,
                 font=self.fonts['base'],
@@ -2683,7 +2718,8 @@ class ChatWindow:
                 spacing1=4,
                 spacing3=4,
             )
-            bubble.insert('1.0', text)
+            self._configure_markdown_tags(bubble)
+            self._insert_markdown_text(bubble, text)
             bubble.configure(state=tk.DISABLED)
             bubble.pack(anchor='w')
             self._bind_message_copy_events(bubble, text)
@@ -2734,6 +2770,108 @@ class ChatWindow:
             self._conversation_history.append({'role': role, 'text': text})
             self._conversation_history = self._conversation_history[-12:]
 
+    def _configure_markdown_tags(self, widget: tk.Text):
+        base_font = tkfont.Font(font=self.fonts['base'])
+        strong_font = tkfont.Font(font=self.fonts['base'])
+        strong_font.configure(weight='bold')
+        code_font = tkfont.Font(family='Consolas', size=max(9, int(base_font.cget('size')) - 1))
+        h1_font = tkfont.Font(font=self.fonts['base'])
+        h1_font.configure(weight='bold', size=max(int(base_font.cget('size')) + 5, 16))
+        h2_font = tkfont.Font(font=self.fonts['base'])
+        h2_font.configure(weight='bold', size=max(int(base_font.cget('size')) + 3, 14))
+        h3_font = tkfont.Font(font=self.fonts['base'])
+        h3_font.configure(weight='bold', size=max(int(base_font.cget('size')) + 1, 13))
+        widget._markdown_fonts = {
+            'strong': strong_font,
+            'code': code_font,
+            'h1': h1_font,
+            'h2': h2_font,
+            'h3': h3_font,
+        }
+        widget.tag_configure('md_h1', font=h1_font, spacing1=8, spacing3=4)
+        widget.tag_configure('md_h2', font=h2_font, spacing1=6, spacing3=4)
+        widget.tag_configure('md_h3', font=h3_font, spacing1=6, spacing3=3)
+        widget.tag_configure('md_bold', font=strong_font)
+        widget.tag_configure('md_inline_code', font=code_font, background='#F4EFE4', foreground='#7A5530')
+        widget.tag_configure('md_code_block', font=code_font, background='#F7F3EA', foreground='#5B4D3A', lmargin1=12, lmargin2=12)
+        widget.tag_configure('md_quote', foreground='#6B7C7E', lmargin1=12, lmargin2=12)
+        widget.tag_configure('md_list_marker', foreground='#68898C')
+
+    def _markdown_to_plain_text(self, text: str) -> str:
+        if not isinstance(text, str) or not text:
+            return ''
+        plain = re.sub(r'```[\w-]*\n?', '', text)
+        plain = re.sub(r'(?m)^\s{0,3}#{1,6}\s+', '', plain)
+        plain = re.sub(r'\*\*([^*\n]+)\*\*', r'\1', plain)
+        plain = re.sub(r'`([^`\n]+)`', r'\1', plain)
+        plain = re.sub(r'(?m)^\s*[-*]\s+', '• ', plain)
+        plain = re.sub(r'(?m)^\s*>\s?', '', plain)
+        return plain
+
+    def _insert_markdown_text(self, widget: tk.Text, text: str):
+        in_code_block = False
+        for line in (text or '').splitlines():
+            if re.match(r'^\s*```', line):
+                in_code_block = not in_code_block
+                if in_code_block:
+                    widget.insert(tk.END, '```\n', ('md_code_block',))
+                continue
+            if in_code_block:
+                widget.insert(tk.END, line + '\n', ('md_code_block',))
+                continue
+
+            heading = re.match(r'^\s*(#{1,6})\s+(.+?)\s*$', line)
+            if heading:
+                level = min(len(heading.group(1)), 3)
+                self._insert_markdown_inline(widget, heading.group(2), block_tag=f'md_h{level}')
+                widget.insert(tk.END, '\n')
+                continue
+
+            quote = re.match(r'^\s*>\s?(.*)$', line)
+            if quote:
+                widget.insert(tk.END, '│ ', ('md_quote',))
+                self._insert_markdown_inline(widget, quote.group(1), block_tag='md_quote')
+                widget.insert(tk.END, '\n')
+                continue
+
+            unordered = re.match(r'^(\s*)[-*]\s+(.+?)\s*$', line)
+            if unordered:
+                indent = unordered.group(1).replace('\t', '    ')
+                widget.insert(tk.END, indent + '• ', ('md_list_marker',))
+                self._insert_markdown_inline(widget, unordered.group(2))
+                widget.insert(tk.END, '\n')
+                continue
+
+            ordered = re.match(r'^(\s*)(\d+\.)\s+(.+?)\s*$', line)
+            if ordered:
+                indent = ordered.group(1).replace('\t', '    ')
+                widget.insert(tk.END, indent + ordered.group(2) + ' ', ('md_list_marker',))
+                self._insert_markdown_inline(widget, ordered.group(3))
+                widget.insert(tk.END, '\n')
+                continue
+
+            self._insert_markdown_inline(widget, line)
+            widget.insert(tk.END, '\n')
+
+    def _insert_markdown_inline(self, widget: tk.Text, text: str, *, block_tag: str | None = None):
+        tags = (block_tag,) if block_tag else ()
+        last_index = 0
+        for match in MARKDOWN_INLINE_PATTERN.finditer(text or ''):
+            if match.start() > last_index:
+                widget.insert(tk.END, text[last_index:match.start()], tags)
+            token = match.group(0)
+            if token.startswith('**') and token.endswith('**'):
+                token_tags = tuple(tag for tag in (block_tag, 'md_bold') if tag)
+                widget.insert(tk.END, token[2:-2], token_tags)
+            elif token.startswith('`') and token.endswith('`'):
+                token_tags = tuple(tag for tag in (block_tag, 'md_inline_code') if tag)
+                widget.insert(tk.END, token[1:-1], token_tags)
+            else:
+                widget.insert(tk.END, token, tags)
+            last_index = match.end()
+        if last_index < len(text or ''):
+            widget.insert(tk.END, text[last_index:], tags)
+
     # ── 终端风格事件渲染 ─────────────────────────────────────────
     # 将 thinking / tool_use / tool_result / system_info 事件渲染为
     # 命令行风格的纯文本行，直接插入 Text 组件。
@@ -2748,7 +2886,7 @@ class ChatWindow:
     }
 
     def _pick_tool_icon(self, tool_header: str) -> str:
-        lowered = tool_header.lower().strip()
+        lowered = str(tool_header or '').split('|', 1)[0].strip().lower()
         for key, icon in self._TOOL_ICONS.items():
             if lowered.startswith(key):
                 return icon

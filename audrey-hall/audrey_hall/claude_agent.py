@@ -318,8 +318,10 @@ class ClaudeCodeSession:
         'stdio',
     ]
 
-    def _build_cli_args(self) -> list[str]:
+    def _build_cli_args(self, *, allow_bypass_permissions: bool = False) -> list[str]:
         args = list(self._CLI_ARGS)
+        if allow_bypass_permissions:
+            args.append('--dangerously-skip-permissions')
         if self.resume_session_id:
             args.extend(['--resume', self.resume_session_id])
         return args
@@ -343,8 +345,8 @@ class ClaudeCodeSession:
             or shutil.which('claude.exe')
         )
         if claude_path:
-            return [claude_path, *self._build_cli_args()]
-        return ['claude', *self._build_cli_args()]
+            return [claude_path, *self._build_cli_args(allow_bypass_permissions=True)]
+        return ['claude', *self._build_cli_args(allow_bypass_permissions=True)]
 
     def _build_command(self):
         # 本项目：用 bun 跑本地 claude-code 项目（src/dev-entry.ts）。
@@ -671,7 +673,19 @@ class ClaudeCodeSession:
 
             # 抑制纯内部系统子类型——它们在 CLI 终端上也不显示，
             # 不应通过兜底分支泄漏到 UI。
-            if subtype in ('init', 'thinking_tokens', 'running'):
+            # thinking_tokens 例外：UI 需要它来显示思考 token 计数。
+            if subtype in ('init', 'running'):
+                return
+
+            if subtype == 'thinking_tokens':
+                self._emit(
+                    {
+                        'kind': 'sdk_status',
+                        'status': 'thinking_tokens',
+                        'estimated_tokens': message.get('estimated_tokens'),
+                        'session_id': self._session_id,
+                    }
+                )
                 return
 
             if subtype == 'task_started':
