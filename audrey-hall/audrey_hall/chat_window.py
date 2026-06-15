@@ -36,6 +36,11 @@ CHOICE_LINE_PATTERNS = (
     re.compile(r'^\s*(?:[-*]|\d+\.)\s+(.+?)\s*[—-]\s*(.+)\s*$'),
 )
 MARKDOWN_INLINE_PATTERN = re.compile(r'(\*\*[^*\n]+\*\*|`[^`\n]+`)')
+CHOICE_PROMPT_CUES = (
+    '请选择', '可以选择', '以下选项', '你想', '你希望', '你要',
+    '选一个', '选哪一个', '告诉我你的选择', '回复对应选项', '怎么选',
+)
+TASK_TOOL_PREFIXES = ('task',)
 
 MAX_SIDE_CONTEXT_MESSAGES = 6
 MAX_SIDE_CONTEXT_CHARS = 2800
@@ -107,6 +112,9 @@ class ChatWindow:
         self._message_widgets = []
         self._message_layout_job = None
         self._last_message_char_width = None
+        self._task_widgets = {}
+        self._task_widget_font = None
+        self._task_widget_done_font = None
         self.status_var = tk.StringVar(value='正在唤醒奥黛丽的助手...')
         self._event_queue = queue.Queue()
         self._busy = False
@@ -489,6 +497,13 @@ class ChatWindow:
             except Exception:
                 pass
         self._message_widgets = live_widgets
+        for item in list(self._task_widgets.values()):
+            try:
+                label = item.get('label')
+                if label is not None and label.winfo_exists():
+                    label.config(wraplength=max(240, self._transcript_width - 60))
+            except Exception:
+                pass
         self._last_message_char_width = msg_char_width
         if was_at_bottom:
             self.text_area.after(10, lambda: self.text_area.see(tk.END))
@@ -1324,6 +1339,7 @@ class ChatWindow:
         self._conversation_history = []
         self._pending_perm_frames = {}
         self._message_widgets = []
+        self._task_widgets = {}
         self._last_message_char_width = None
         self._last_status_texts.clear()
         self._last_thinking_tokens = None
@@ -1897,6 +1913,14 @@ class ChatWindow:
                     'input': input_payload,
                 },
             )
+            summary = event.get('summary') or self._summarize_working_input(tool_name, input_payload)
+            terminal_text = str(tool_name)
+            if summary:
+                terminal_text = f'{terminal_text} | {summary}'
+            if self._is_task_tool_name(tool_name):
+                self._render_task_tool_event(tool_name, terminal_text)
+            else:
+                self._append_message('tool_use', terminal_text, record_history=False)
             self.status_var.set(self._compose_status_text(f'🔧 {tool_name}'))
             return
 
@@ -1977,6 +2001,9 @@ class ChatWindow:
             return
 
         if kind == 'tool_use_summary':
+            summary = event.get('summary') or ''
+            if summary:
+                self._append_message('tool_result', summary, record_history=False)
             return
 
         if kind == 'tool_progress':
@@ -2289,7 +2316,96 @@ class ChatWindow:
         text = self._format_task_progress(event)
         if not text:
             return
+        if self._render_task_widget(event, text):
+            return
         self._set_status(text, 'task')
+
+    def _is_task_tool_name(self, tool_name: str) -> bool:
+        lowered = str(tool_name or '').strip().lower()
+        return lowered.startswith(TASK_TOOL_PREFIXES)
+
+    def _task_widget_key(self, event: dict) -> str:
+        task_id = str(event.get('task_id') or '').strip()
+        if task_id:
+            return task_id
+        description = self._task_progress_compact_text(event.get('description'))
+        summary = self._task_progress_compact_text(event.get('summary'))
+        return description or summary
+
+    def _render_task_tool_event(self, tool_name: str, text: str):
+        tool_key = 'tool:' + str(tool_name or '').strip().lower()
+        compact = self._task_progress_compact_text(text)
+        if compact:
+            self._upsert_task_widget(tool_key, compact, done=False)
+
+    def _render_task_widget(self, event: dict, text: str) -> bool:
+        task_key = self._task_widget_key(event)
+        if not task_key:
+            return False
+        status = str(event.get('status') or 'running').strip().lower()
+        done = status in {'completed', 'failed', 'stopped'}
+        final_text = text
+        if done:
+            final_text = f'{text} (已结束)'
+        self._upsert_task_widget(task_key, final_text, done=done)
+        return True
+
+    def _ensure_task_widget_fonts(self):
+        if self._task_widget_font is not None and self._task_widget_done_font is not None:
+            return
+        base_font = tkfont.Font(font=self.fonts['small'])
+        done_font = tkfont.Font(font=self.fonts['small'])
+        done_font.configure(overstrike=1)
+        self._task_widget_font = base_font
+        self._task_widget_done_font = done_font
+
+    def _upsert_task_widget(self, task_key: str, text: str, *, done: bool):
+        if self.text_area is None:
+            return
+        compact = self._task_progress_compact_text(text)
+        if not compact:
+            return
+        self._ensure_task_widget_fonts()
+        existing = self._task_widgets.get(task_key)
+        if existing is None:
+            card = create_card(
+                self.text_area,
+                self.theme,
+                bg='panel',
+                border='border',
+            )
+            label = tk.Label(
+                card,
+                text='',
+                font=self._task_widget_font,
+                bg=self.colors['panel'],
+                fg=self.colors['muted'],
+                justify='left',
+                anchor='w',
+                wraplength=max(240, self._transcript_width - 60),
+                padx=10,
+                pady=8,
+            )
+            label.pack(fill=tk.X)
+            self.text_area.config(state=tk.NORMAL)
+            self.text_area.insert(tk.END, '\n')
+            self.text_area.window_create(tk.END, window=card, padx=4, pady=2)
+            self.text_area.insert(tk.END, '\n')
+            self.text_area.config(state=tk.DISABLED)
+            existing = {'card': card, 'label': label}
+            self._task_widgets[task_key] = existing
+        label = existing['label']
+        label.config(
+            text=compact,
+            font=self._task_widget_done_font if done else self._task_widget_font,
+            fg=self.colors['subtext'] if done else self.colors['muted'],
+            wraplength=max(240, self._transcript_width - 60),
+        )
+        if done:
+            try:
+                self.text_area.see(tk.END)
+            except Exception:
+                pass
 
     def _render_summary_status(self, text: str):
         compact = self._task_progress_compact_text(text)
@@ -3183,6 +3299,8 @@ class ChatWindow:
         self.text_area.insert(tk.END, f'  {prefix} {compact}\n', ('term_system',))
 
     def _maybe_show_choice_buttons(self, text: str):
+        if not self._should_show_choice_buttons(text):
+            return
         options = self._extract_choice_options(text)
         if len(options) < 2:
             return
@@ -3230,6 +3348,20 @@ class ChatWindow:
 
         self._insert_inline_card(card)
 
+    def _should_show_choice_buttons(self, text: str) -> bool:
+        if not isinstance(text, str):
+            return False
+        compact = ' '.join(text.strip().split())
+        if not compact:
+            return False
+        lowered = compact.lower()
+        if '?' not in compact and '？' not in compact and not any(cue in compact for cue in CHOICE_PROMPT_CUES):
+            return False
+        if '快速选择' in compact:
+            return False
+        # 只有明确在向用户索取选择时才展示按钮，避免普通总结/列表误触发
+        return any(cue in compact for cue in CHOICE_PROMPT_CUES) or ('?' in compact or '？' in compact)
+
     def _handle_choice_selection(self, reply_text: str, card):
         self._destroy_widget(card)
         if self._busy:
@@ -3255,6 +3387,8 @@ class ChatWindow:
             label = (match.group(1) or '').strip().strip('`')
             detail = (match.group(2) or '').strip()
             if not label or label in seen:
+                continue
+            if len(label) > 40:
                 continue
             seen.add(label)
             options.append({'label': label, 'detail': detail})
