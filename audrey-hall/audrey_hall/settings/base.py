@@ -1,5 +1,6 @@
 """设置窗口模块 - 包含个性化与关于标签页"""
 
+import math
 import os
 import tkinter as tk
 import getpass
@@ -48,15 +49,39 @@ class SettingsWindow:
         self.theme = get_theme()
         self.colors = self.theme['colors']
         self.font_family = self.theme['fonts']['family']
+        self.ui_scale = self._resolve_ui_scale()
         self.fonts = {
-            'title': self.theme['fonts']['title'],
-            'subtitle': self.theme['fonts']['subtitle'],
-            'base': self.theme['fonts']['base'],
-            'small': self.theme['fonts']['small'],
-            'control': self.theme['fonts']['control'],
+            'title': self._scale_font(self.theme['fonts']['title']),
+            'subtitle': self._scale_font(self.theme['fonts']['subtitle']),
+            'base': self._scale_font(self.theme['fonts']['base']),
+            'small': self._scale_font(self.theme['fonts']['small']),
+            'control': self._scale_font(self.theme['fonts']['control']),
         }
         self.window_theme = self.theme['windows']['settings']
         self.settings_theme = self.theme['settings']
+
+    def _resolve_ui_scale(self):
+        try:
+            pets = getattr(self.app, 'pets', None) or []
+            if pets:
+                return max(0.8, float(getattr(pets[0], 'scale', 1.0)))
+        except Exception:
+            pass
+        return 1.0
+
+    def _scale_font(self, font_spec):
+        if not isinstance(font_spec, tuple) or len(font_spec) < 2:
+            return font_spec
+        family = font_spec[0]
+        size = font_spec[1]
+        rest = font_spec[2:]
+        scaled_size = max(8, int(round(size * self.ui_scale)))
+        return (family, scaled_size, *rest)
+
+    def _scale_padding(self, padding):
+        if isinstance(padding, tuple):
+            return tuple(max(1, int(round(value * self.ui_scale))) for value in padding)
+        return max(1, int(round(padding * self.ui_scale)))
 
     def _configure_theme(self):
         style = ttk.Style(self.window)
@@ -76,14 +101,14 @@ class SettingsWindow:
             "TNotebook.Tab",
             background=self.colors["tab_bg"],
             foreground=self.colors["text"],
-            padding=self.settings_theme['tab_padding'],
+            padding=self._scale_padding(self.settings_theme['tab_padding']),
             font=self.fonts["base"],
         )
         style.map(
             "TNotebook.Tab",
             background=[("selected", self.colors["tab_active"])],
             foreground=[("selected", self.colors["accent_dark"])],
-            padding=[("selected", self.settings_theme['tab_padding_selected'])],
+            padding=[("selected", self._scale_padding(self.settings_theme['tab_padding_selected']))],
             font=[("selected", self.fonts["subtitle"])],
         )
         style.configure("TSeparator", background=self.colors["border"])
@@ -106,16 +131,22 @@ class SettingsWindow:
         if parent_was_hidden:
             self.parent.withdraw()
         self.window.title("设置")
+        self.window.update_idletasks()
+        ui_scale = self.ui_scale
+        try:
+            ui_scale = max(0.8, float(self.ui_scale))
+        except Exception:
+            ui_scale = 1.0
         # 窗口尺寸: 1000x1000（自适应屏幕）
         self.window.update_idletasks()
         screen_w = self.window.winfo_screenwidth()
         screen_h = self.window.winfo_screenheight()
-        window_w = min(self.window_theme['base_width'], max(600, screen_w - 80))
-        window_h = min(self.window_theme['base_height'], max(600, screen_h - 80))
+        window_w = min(int(self.window_theme['base_width'] * ui_scale), max(600, screen_w - 80))
+        window_h = min(int(self.window_theme['base_height'] * ui_scale), max(600, screen_h - 80))
         self.window.geometry(f"{window_w}x{window_h}")
         self.window.minsize(
-            min(self.window_theme['min_width'], window_w),
-            min(self.window_theme['min_height'], window_h),
+            min(int(self.window_theme['min_width'] * ui_scale), window_w),
+            min(int(self.window_theme['min_height'] * ui_scale), window_h),
         )
         self.window.resizable(True, True)
         self.window.attributes("-topmost", True)
@@ -150,11 +181,13 @@ class SettingsWindow:
 
         # 创建主容器
         main_frame = tk.Frame(self.window, bg=self.colors["bg"])
+        outer_pad_x = max(16, int(math.ceil(self.window_theme['outer_pad_x'] * ui_scale)))
+        outer_pad_y = max(14, int(math.ceil(self.window_theme['outer_pad_y'] * ui_scale)))
         main_frame.pack(
             fill=tk.BOTH,
             expand=True,
-            padx=self.window_theme['outer_pad_x'],
-            pady=self.window_theme['outer_pad_y'],
+            padx=outer_pad_x,
+            pady=outer_pad_y,
         )
 
         # 创建标签页

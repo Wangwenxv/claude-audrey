@@ -15,6 +15,7 @@ from .claude_agent import (
     ClaudeCodeSession,
     normalize_connection_target,
 )
+from .terminal_view import TerminalViewWindow
 from .ui import create_button, create_card, create_dropdown, get_theme
 from .utils import resource_path
 
@@ -120,6 +121,9 @@ class ChatWindow:
         self._connection_start_time = None
         self._connection_time_var = tk.StringVar(value='')
         self._connection_time_timer = None
+        self._terminal_view = None
+        self._terminal_view_visible = False
+        self._terminal_button = None
 
         self.theme = get_theme()
         self.fonts = self.theme['fonts']
@@ -182,6 +186,8 @@ class ChatWindow:
         self._current_input_tokens = None
         self._current_output_tokens = None
         self._last_summary_status = ''
+        if self._terminal_view is not None:
+            self._terminal_view.load_buffer(self.session.terminal_events_snapshot())
         self._active_session_id = self._resume_session_id
         self._active_permission_mode = 'default'
         self._refresh_mode_buttons()
@@ -206,6 +212,56 @@ class ChatWindow:
             self._connection_time_var.set('')
             self.status_var.set('呼唤失败')
             self._append_message('error', f'呼唤助手失败：{exc}')
+
+    def _ensure_terminal_view(self):
+        if self._terminal_view is None:
+            host = self.window if self.window is not None else self.parent
+            self._terminal_view = TerminalViewWindow(host, self.theme, on_close=self._handle_terminal_view_closed)
+            self._terminal_view.set_show_raw(self._raw_mode)
+        return self._terminal_view
+
+    def _handle_terminal_view_closed(self):
+        self._terminal_view_visible = False
+        self._refresh_terminal_button()
+
+    def _refresh_terminal_button(self):
+        if self._terminal_button is None:
+            return
+        label = '隐藏过程视图' if self._terminal_view_visible else '打开过程视图'
+        self._terminal_button.config(text=label)
+
+    def _show_terminal_view(self):
+        if self.window is None:
+            return
+        terminal_view = self._ensure_terminal_view()
+        initial_events = None
+        if not terminal_view.is_open() and not getattr(terminal_view, '_events', None):
+            initial_events = self.session.terminal_events_snapshot()
+        terminal_view.show(initial_events=initial_events, host_window=self.window)
+        self._terminal_view_visible = True
+        self._refresh_terminal_button()
+
+    def _hide_terminal_view(self):
+        if self._terminal_view is not None:
+            self._terminal_view.hide(notify=False)
+        self._terminal_view_visible = False
+        self._refresh_terminal_button()
+
+    def _toggle_terminal_view(self):
+        if self._terminal_view_visible:
+            self._hide_terminal_view()
+        else:
+            self._show_terminal_view()
+
+    def _sync_terminal_view_position(self, *, animate=False):
+        if not self._terminal_view_visible or self._terminal_view is None or self.window is None:
+            return
+        self._terminal_view.sync_with_host(self.window, animate=animate)
+
+    def _handle_window_configure(self, event):
+        if self.window is None or event.widget is not self.window:
+            return
+        self._sync_terminal_view_position()
 
     def _update_connection_time(self):
         """每秒更新连接时长显示"""
@@ -363,6 +419,8 @@ class ChatWindow:
         if self.window is not None and self.window.winfo_exists():
             self.window.lift()
             self.window.focus_force()
+            if self._terminal_view_visible:
+                self._show_terminal_view()
             return
 
         self._create_window()
@@ -371,6 +429,7 @@ class ChatWindow:
         # 初次把窗口放到桌宠附近；之后由桌宠的 window_snap 逻辑自动附着到本窗口
         # 顶部（与贴靠微信的机制一致），无需窗口反向跟随桌宠。
         self._position_beside_pet(initial=True)
+        self._sync_terminal_view_position(animate=True)
 
     def _create_window(self):
         self.window = tk.Toplevel(self.parent)
@@ -403,6 +462,7 @@ class ChatWindow:
         self.window.bind('<Control-C>', self._handle_window_copy)
         self.window.configure(bg=self.colors['bg'])
         self.window.protocol('WM_DELETE_WINDOW', self.close)
+        self.window.bind('<Configure>', self._handle_window_configure, add='+')
 
         try:
             icon_path = resource_path('gifs/audrey-hall.ico')
@@ -517,6 +577,30 @@ class ChatWindow:
         )
         mode_dropdown.pack(side=tk.LEFT, anchor='w')
         self._refresh_mode_buttons()
+
+        terminal_row = tk.Frame(header, bg=self.colors['bg'])
+        terminal_row.pack(fill=tk.X, pady=(10, 0))
+        self._terminal_button = create_button(
+            terminal_row,
+            text='打开过程视图',
+            command=self._toggle_terminal_view,
+            theme=self.theme,
+            variant='secondary',
+            font=self.fonts['small'],
+            style_overrides=self._aurora_button_style(),
+            padx=8,
+            pady=5,
+        )
+        self._terminal_button.pack(side=tk.LEFT)
+        tk.Label(
+            terminal_row,
+            text='过程视图承载过程流与原始输出，主界面只保留对话。',
+            font=self.fonts['small'],
+            bg=self.colors['bg'],
+            fg=self.colors['muted'],
+            anchor='w',
+        ).pack(side=tk.LEFT, padx=(12, 0))
+        self._refresh_terminal_button()
 
         # 先把底部的输入区和按钮行用 side=BOTTOM 占住空间，再让会话区填充剩余
         # 区域。这样无论窗口被压到多小（高 DPI / 小屏），输入框都不会被会话区
@@ -1359,8 +1443,10 @@ class ChatWindow:
         if command == 'raw':
             self._append_message('user', text, record_history=False)
             self._raw_mode = not self._raw_mode
+            if self._terminal_view is not None:
+                self._terminal_view.set_show_raw(self._raw_mode)
             state = '开启' if self._raw_mode else '关闭'
-            self._append_inline_status(f'CLI 原始输出调试模式已{state}')
+            self._append_inline_status(f'过程视图原始输出模式已{state}')
             return True
 
         if command == 'cost':
@@ -1702,6 +1788,8 @@ class ChatWindow:
             except queue.Empty:
                 break
             self._handle_event(event)
+            if self._terminal_view is not None:
+                self._terminal_view.consume_event(event)
 
         # 连接看门狗：如果 _busy 且超过 120 秒没有任何事件，认为连接已静默断开
         if self._busy and self._last_busy_event_time is not None:
@@ -1718,17 +1806,8 @@ class ChatWindow:
         # 记录最后收到事件的时间（用于看门狗检测静默断开）
         self._last_busy_event_time = datetime.now()
 
-        # /raw 模式：将所有 CLI 原始事件以灰色小字插入对话区
-        if self._raw_mode and kind and self.text_area is not None:
-            try:
-                # 显示完整事件，不做字段过滤
-                raw_line = json.dumps(event, ensure_ascii=False, default=str)
-                self.text_area.config(state=tk.NORMAL)
-                self.text_area.insert(tk.END, f'[raw] {raw_line}\n', ('status',))
-                self.text_area.config(state=tk.DISABLED)
-                self.text_area.see(tk.END)
-            except Exception:
-                pass
+        if kind in {'terminal_line', 'stdout_raw_line', 'stderr_raw_line'}:
+            return
 
         if kind == 'assistant':
             text = event.get('text') or ''
@@ -1756,12 +1835,6 @@ class ChatWindow:
                     'input': input_payload,
                 },
             )
-            # 工具调用显示为内嵌卡片：工具名 + 关键参数
-            summary = self._summarize_working_input(tool_name, input_payload)
-            display = tool_name
-            if summary:
-                display = f'{tool_name}\n{summary}'
-            self._append_message('tool_use', display)
             self.status_var.set(self._compose_status_text(f'🔧 {tool_name}'))
             return
 
@@ -1771,11 +1844,8 @@ class ChatWindow:
             thinking_text = event.get('text') or ''
             reminder_text = self._translate_system_reminder(thinking_text)
             if reminder_text:
-                self._append_message('system_info', reminder_text)
+                self._render_main_status(reminder_text)
                 return
-            # 思考内容显示为可折叠卡片
-            if thinking_text:
-                self._append_message('thinking_inline', thinking_text)
             self.status_var.set(self._compose_status_text('奥黛丽 正在思考...'))
             return
 
@@ -1828,10 +1898,8 @@ class ChatWindow:
                     if raw_subtype in self._suppressed_statuses:
                         return
                 if source == 'system':
-                    # 来自未识别系统子类型的消息（如 "Updated plan"），但排除已知内部态
-                    raw_subtype = event.get('raw_subtype') or ''
                     display = f'[{raw_subtype}] {text}' if raw_subtype else text
-                    self._append_message('system_info', display)
+                    self._render_main_status(display)
                 else:
                     self._render_main_status(text)
                 connection_target = event.get('connection_target')
@@ -1847,21 +1915,12 @@ class ChatWindow:
             return
 
         if kind == 'tool_use_summary':
-            summary = event.get('summary') or ''
-            if summary:
-                self._append_message('tool_result', summary)
             return
 
         if kind == 'tool_progress':
-            text = self._format_tool_progress(event)
-            if text:
-                self._append_message('system_info', text)
             return
 
         if kind == 'hook_status':
-            text = self._format_hook_status(event)
-            if text:
-                self._append_message('system_info', text)
             return
 
         if kind == 'sdk_status':
@@ -1873,9 +1932,9 @@ class ChatWindow:
                 # 纯内部状态，不产生任何可见输出
                 return
             if status == 'compacting':
-                self._append_message('system_info', '正在压缩上下文...')
+                self._render_main_status('正在压缩上下文...')
             elif isinstance(status, str) and status:
-                self._append_message('system_info', status)
+                self._render_main_status(status)
             return
 
         if kind == 'session_state':
@@ -1898,8 +1957,6 @@ class ChatWindow:
                 reminder_text = self._translate_system_reminder(text)
                 if reminder_text:
                     self._render_main_status(reminder_text)
-                else:
-                    self._append_message('warn', text)
             return
 
         if kind == 'permission':
@@ -1915,7 +1972,6 @@ class ChatWindow:
 
         if kind == 'done':
             self._set_busy(False)
-            self._seal_thinking_block()
             self._update_total_tokens(event.get('total_tokens'))
             self._update_total_io_tokens(event.get('input_tokens'), event.get('output_tokens'))
             self._clear_inline_status()
@@ -1938,7 +1994,6 @@ class ChatWindow:
 
         if kind == 'error':
             self._set_busy(False)
-            self._seal_thinking_block()
             self._clear_inline_status()
             if event.get('request_subtype') == 'set_permission_mode':
                 self.status_var.set(self._compose_status_text('模式切换失败'))
@@ -2494,7 +2549,7 @@ class ChatWindow:
         if status_category or status_detail:
             parts.append(f'状态: {(status_category + " " + status_detail).strip()}')
         if parts:
-            self._append_message('warn', '\n'.join(parts))
+            self._render_summary_status(' | '.join(parts))
 
     def _get_assistant_avatar(self):
         if self._assistant_avatar is not None or self._avatar_source is None:
@@ -3107,6 +3162,11 @@ class ChatWindow:
             except Exception:
                 pass
             self._connection_time_timer = None
+
+        if self._terminal_view is not None:
+            self._terminal_view.hide(notify=False)
+            self._terminal_view = None
+        self._terminal_view_visible = False
 
         try:
             self.session.close()

@@ -4,6 +4,8 @@ import shutil
 import subprocess
 import threading
 import uuid
+from collections import deque
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Literal, Optional
 
@@ -23,6 +25,7 @@ CONNECTION_TARGET_LABELS = {
     'project': '思维链-本项目',
     'system': '思维链-官Claude',
 }
+TERMINAL_BUFFER_LIMIT = 800
 
 
 def normalize_connection_target(value: str | None) -> ConnectionTarget:
@@ -192,6 +195,10 @@ def _extract_string(value) -> str:
     return value.strip() if isinstance(value, str) else ''
 
 
+def _timestamp_text() -> str:
+    return datetime.now().strftime('%H:%M:%S')
+
+
 class ClaudeCodeSession:
     def __init__(
         self,
@@ -215,6 +222,7 @@ class ClaudeCodeSession:
         self._pending_control_requests = {}
         self._last_assistant_text = ''
         self._total_tokens = 0
+        self._terminal_events = deque(maxlen=TERMINAL_BUFFER_LIMIT)
         self.connection_target = normalize_connection_target(connection_target)
         self._connection_source = '未连接'
         self._session_id = ''
@@ -449,6 +457,29 @@ class ClaudeCodeSession:
             }
         )
 
+    def terminal_events_snapshot(self) -> list[dict]:
+        return [dict(event) for event in self._terminal_events]
+
+    def _record_terminal_event(self, event: dict):
+        payload = dict(event)
+        payload.setdefault('ts', _timestamp_text())
+        if self._session_id and not payload.get('session_id'):
+            payload['session_id'] = self._session_id
+        self._terminal_events.append(payload)
+        self._emit(payload)
+
+    def _emit_terminal_line(self, line_kind: str, text: str, **extra):
+        compact = text.strip() if isinstance(text, str) else ''
+        if not compact:
+            return
+        payload = {
+            'kind': 'terminal_line',
+            'line_kind': line_kind,
+            'text': compact,
+            **extra,
+        }
+        self._record_terminal_event(payload)
+
     def close(self):
         self._closed = True
         if self.process is None:
@@ -510,6 +541,13 @@ class ClaudeCodeSession:
                 try:
                     message = json.loads(line)
                 except json.JSONDecodeError:
+                    self._record_terminal_event(
+                        {
+                            'kind': 'stdout_raw_line',
+                            'raw_line': line,
+                            'parsed_type': 'invalid-json',
+                        }
+                    )
                     self._emit(
                         {
                             'kind': 'log',
@@ -518,9 +556,17 @@ class ClaudeCodeSession:
                         }
                     )
                     continue
+                self._record_terminal_event(
+                    {
+                        'kind': 'stdout_raw_line',
+                        'raw_line': line,
+                        'parsed_type': message.get('type') or 'unknown',
+                    }
+                )
                 self._handle_stdout_message(message)
         finally:
             if not self._closed:
+                self._emit_terminal_line('status', 'Claude Code 会话已结束')
                 self._emit(
                     {
                         'kind': 'status',
@@ -537,6 +583,13 @@ class ClaudeCodeSession:
             line = raw_line.rstrip()
             if not line:
                 continue
+            self._record_terminal_event(
+                {
+                    'kind': 'stderr_raw_line',
+                    'raw_line': line,
+                }
+            )
+            self._emit_terminal_line('stderr', line)
             self._emit(
                 {
                     'kind': 'stderr',
@@ -554,6 +607,7 @@ class ClaudeCodeSession:
             request_subtype = self._pending_control_requests.pop(request_id, None)
             if response.get('subtype') == 'success' and request_subtype == 'initialize' and not self._initialized:
                 self._initialized = True
+                self._emit_terminal_line('status', f'深红星辰已经建立连接： {self._connection_source}')
                 self._emit(
                     {
                         'kind': 'status',
@@ -591,11 +645,17 @@ class ClaudeCodeSession:
                 request_id = message.get('request_id')
                 if request_id:
                     self._pending_permissions[request_id] = request
+                    tool_name = request.get('tool_name') or '未知工具'
+                    summary = _summarize_tool_input(tool_name, request.get('input') or {})
+                    display = f'权限请求：{tool_name}'
+                    if summary:
+                        display = f'{display} | {summary}'
+                    self._emit_terminal_line('permission', display)
                     self._emit(
                         {
                             'kind': 'permission',
                             'request_id': request_id,
-                            'tool_name': request.get('tool_name') or '未知工具',
+                            'tool_name': tool_name,
                             'input': request.get('input') or {},
                             'tool_use_id': request.get('tool_use_id'),
                         }
@@ -620,15 +680,20 @@ class ClaudeCodeSession:
                 payload['summary'] = message.get('prompt') or payload['summary']
                 payload['task_type'] = message.get('task_type') or ''
                 payload['workflow_name'] = message.get('workflow_name') or ''
+                self._emit_terminal_line('task_progress', payload['summary'] or payload['description'] or '子任务已启动')
                 self._emit(payload)
                 return
 
             if subtype == 'task_progress':
-                self._emit(_task_progress_event(message))
+                payload = _task_progress_event(message)
+                self._emit_terminal_line('task_progress', payload.get('summary') or payload.get('description') or '子任务进行中')
+                self._emit(payload)
                 return
 
             if subtype == 'task_notification':
-                self._emit(_task_progress_event(message))
+                payload = _task_progress_event(message)
+                self._emit_terminal_line('task_progress', payload.get('summary') or payload.get('description') or '子任务通知')
+                self._emit(payload)
                 return
 
             if subtype == 'session_state_changed':
@@ -642,6 +707,9 @@ class ClaudeCodeSession:
                 return
 
             if subtype == 'status':
+                status_text = _extract_string(message.get('status'))
+                if status_text and status_text not in {'init', 'thinking_tokens', 'running'}:
+                    self._emit_terminal_line('status', status_text)
                 self._emit(
                     {
                         'kind': 'sdk_status',
@@ -679,11 +747,14 @@ class ClaudeCodeSession:
                 return
 
             if subtype == 'hook_started':
+                hook_name = _extract_string(message.get('hook_name'))
+                hook_event = _extract_string(message.get('hook_event'))
+                self._emit_terminal_line('hook_status', ' | '.join(part for part in (hook_name, hook_event, 'started') if part))
                 self._emit(
                     {
                         'kind': 'hook_status',
-                        'hook_name': _extract_string(message.get('hook_name')),
-                        'hook_event': _extract_string(message.get('hook_event')),
+                        'hook_name': hook_name,
+                        'hook_event': hook_event,
                         'phase': 'started',
                         'session_id': self._session_id,
                     }
@@ -691,31 +762,48 @@ class ClaudeCodeSession:
                 return
 
             if subtype == 'hook_progress':
+                hook_name = _extract_string(message.get('hook_name'))
+                hook_event = _extract_string(message.get('hook_event'))
+                output = _extract_string(message.get('output'))
+                stdout = _extract_string(message.get('stdout'))
+                stderr = _extract_string(message.get('stderr'))
+                detail = output or stdout or stderr
+                line = ' | '.join(part for part in (hook_name, hook_event, 'progress', detail) if part)
+                self._emit_terminal_line('hook_status', line)
                 self._emit(
                     {
                         'kind': 'hook_status',
-                        'hook_name': _extract_string(message.get('hook_name')),
-                        'hook_event': _extract_string(message.get('hook_event')),
+                        'hook_name': hook_name,
+                        'hook_event': hook_event,
                         'phase': 'progress',
-                        'output': _extract_string(message.get('output')),
-                        'stdout': _extract_string(message.get('stdout')),
-                        'stderr': _extract_string(message.get('stderr')),
+                        'output': output,
+                        'stdout': stdout,
+                        'stderr': stderr,
                         'session_id': self._session_id,
                     }
                 )
                 return
 
             if subtype == 'hook_response':
+                hook_name = _extract_string(message.get('hook_name'))
+                hook_event = _extract_string(message.get('hook_event'))
+                outcome = _extract_string(message.get('outcome'))
+                output = _extract_string(message.get('output'))
+                stdout = _extract_string(message.get('stdout'))
+                stderr = _extract_string(message.get('stderr'))
+                detail = output or stdout or stderr
+                line = ' | '.join(part for part in (hook_name, hook_event, outcome or 'response', detail) if part)
+                self._emit_terminal_line('hook_status', line)
                 self._emit(
                     {
                         'kind': 'hook_status',
-                        'hook_name': _extract_string(message.get('hook_name')),
-                        'hook_event': _extract_string(message.get('hook_event')),
+                        'hook_name': hook_name,
+                        'hook_event': hook_event,
                         'phase': 'response',
-                        'outcome': _extract_string(message.get('outcome')),
-                        'output': _extract_string(message.get('output')),
-                        'stdout': _extract_string(message.get('stdout')),
-                        'stderr': _extract_string(message.get('stderr')),
+                        'outcome': outcome,
+                        'output': output,
+                        'stdout': stdout,
+                        'stderr': stderr,
                         'session_id': self._session_id,
                     }
                 )
@@ -733,6 +821,7 @@ class ClaudeCodeSession:
                 or _extract_string(subtype)
                 or 'system'
             )
+            self._emit_terminal_line('status', f'[{subtype}] {content}' if subtype else content)
             self._emit(
                 {
                     'kind': 'status',
@@ -756,15 +845,20 @@ class ClaudeCodeSession:
                 self._total_tokens = total_tokens
             for tool_use in _extract_tool_use_blocks(content):
                 tool_name = tool_use.get('name') or tool_use.get('tool_name') or '未知工具'
+                summary_text = _summarize_tool_input(
+                    str(tool_name),
+                    tool_use.get('input') or {},
+                )
+                terminal_text = str(tool_name)
+                if summary_text:
+                    terminal_text = f'{terminal_text} | {summary_text}'
+                self._emit_terminal_line('tool_use', terminal_text)
                 self._emit(
                     {
                         'kind': 'working',
                         'tool_name': tool_name,
                         'input': tool_use.get('input') or {},
-                        'summary': _summarize_tool_input(
-                            str(tool_name),
-                            tool_use.get('input') or {},
-                        ),
+                        'summary': summary_text,
                         'total_tokens': self._total_tokens,
                         'input_tokens': input_tokens,
                         'output_tokens': output_tokens,
@@ -776,6 +870,10 @@ class ClaudeCodeSession:
             for tool_result in _extract_tool_result_blocks(content):
                 result_text = _safe_get_tool_result_text(tool_result)
                 if result_text:
+                    preview = result_text.splitlines()[0].strip() if result_text.splitlines() else result_text
+                    if len(preview) > 180:
+                        preview = preview[:180] + '...'
+                    self._emit_terminal_line('tool_result', preview or '工具返回结果')
                     self._emit(
                         {
                             'kind': 'tool_use_summary',
@@ -786,6 +884,10 @@ class ClaudeCodeSession:
 
             thinking_text = _safe_get_thinking_block(content)
             if thinking_text:
+                preview = thinking_text.splitlines()[0].strip() if thinking_text.splitlines() else thinking_text
+                if len(preview) > 180:
+                    preview = preview[:180] + '...'
+                self._emit_terminal_line('thinking', preview or '正在思考')
                 self._emit(
                     {
                         'kind': 'thinking',
@@ -813,10 +915,14 @@ class ClaudeCodeSession:
             return
 
         if msg_type == 'tool_progress':
+            tool_name = _extract_string(message.get('tool_name'))
+            elapsed = message.get('elapsed_time_seconds')
+            suffix = f' | {int(elapsed)}s' if isinstance(elapsed, (int, float)) and elapsed >= 0 else ''
+            self._emit_terminal_line('task_progress', f'{tool_name or "工具"} 运行中{suffix}')
             self._emit(
                 {
                     'kind': 'tool_progress',
-                    'tool_name': _extract_string(message.get('tool_name')),
+                    'tool_name': tool_name,
                     'elapsed_time_seconds': message.get('elapsed_time_seconds'),
                     'task_id': _extract_string(message.get('task_id')),
                     'session_id': self._session_id,
@@ -825,10 +931,16 @@ class ClaudeCodeSession:
             return
 
         if msg_type == 'tool_use_summary':
+            summary_text = _extract_string(message.get('summary'))
+            if summary_text:
+                preview = summary_text.splitlines()[0].strip() if summary_text.splitlines() else summary_text
+                if len(preview) > 180:
+                    preview = preview[:180] + '...'
+                self._emit_terminal_line('tool_result', preview)
             self._emit(
                 {
                     'kind': 'tool_use_summary',
-                    'summary': _extract_string(message.get('summary')),
+                    'summary': summary_text,
                     'session_id': self._session_id,
                 }
             )
@@ -866,6 +978,7 @@ class ClaudeCodeSession:
                 self._total_tokens = total_tokens
             if subtype == 'success':
                 result_text = message.get('result') or self._last_assistant_text or ''
+                self._emit_terminal_line('done', '本轮对话完成')
                 self._emit(
                     {
                         'kind': 'done',
@@ -882,6 +995,7 @@ class ClaudeCodeSession:
                 error_text = '\n'.join(str(item) for item in errors if item)
                 if not error_text:
                     error_text = subtype or 'Claude Code 执行失败'
+                self._emit_terminal_line('error', error_text)
                 self._emit(
                     {
                         'kind': 'done',
