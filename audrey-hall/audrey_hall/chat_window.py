@@ -94,6 +94,10 @@ class ChatWindow:
         self._input_bg_photo = None
         self._input_bg_image_id = None
         self._input_canvas = None
+        self._input_bg_cache = {}
+        self._input_bg_resize_job = None
+        self._pending_input_bg_size = None
+        self._current_input_bg_size = None
         self._avatar_source = None
         self._assistant_avatar = None
         self._user_avatar_source = None
@@ -101,6 +105,8 @@ class ChatWindow:
         self._transcript_container = None
         self._transcript_width = 700
         self._message_widgets = []
+        self._message_layout_job = None
+        self._last_message_char_width = None
         self.status_var = tk.StringVar(value='正在唤醒奥黛丽的助手...')
         self._event_queue = queue.Queue()
         self._busy = False
@@ -121,6 +127,7 @@ class ChatWindow:
         # 抑制列表：这些内部状态不显示在对话区
         self._suppressed_statuses = {'init', 'thinking_tokens', 'running'}
         self._last_busy_event_time = None  # 用于连接看门狗
+        self._last_thinking_tokens = None
         # ── 终端风格流式渲染状态 ──
         self._turn_thinking_range = None   # (start, end) thinking 块的 Text 索引
         self._turn_thinking_text = ''      # 当前思考全文（用于折叠/展开重绘）
@@ -199,6 +206,7 @@ class ChatWindow:
         self._set_busy(False)
         self._pending_perm_frames = {}
         self._last_status_texts.clear()
+        self._last_thinking_tokens = None
         self._current_total_tokens = None
         self._current_input_tokens = None
         self._current_output_tokens = None
@@ -387,15 +395,49 @@ class ChatWindow:
         if width <= 1 or height <= 1:
             return
 
+        target_size = (int(width), int(height))
+        if target_size == self._pending_input_bg_size and self._input_bg_resize_job is not None:
+            return
+        self._pending_input_bg_size = target_size
+        if self.window is None:
+            self._apply_input_background_update()
+            return
+        if self._input_bg_resize_job is not None:
+            try:
+                self.window.after_cancel(self._input_bg_resize_job)
+            except Exception:
+                pass
+        self._input_bg_resize_job = self.window.after(60, self._apply_input_background_update)
+
+    def _apply_input_background_update(self):
+        self._input_bg_resize_job = None
+        if self._input_canvas is None or self._input_bg_source is None:
+            return
+        size = self._pending_input_bg_size
+        if not size:
+            return
+        width, height = size
+        if width <= 1 or height <= 1:
+            return
+        if self._current_input_bg_size == size and self._input_bg_image_id is not None:
+            return
+
         source_width, source_height = self._input_bg_source.size
         scale = max(width / source_width, height / source_height)
         resized_width = max(1, int(source_width * scale))
         resized_height = max(1, int(source_height * scale))
-        resized = self._input_bg_source.resize((resized_width, resized_height), Image.Resampling.LANCZOS)
+        resized_key = (resized_width, resized_height)
+        resized = self._input_bg_cache.get(resized_key)
+        if resized is None:
+            resized = self._input_bg_source.resize((resized_width, resized_height), Image.Resampling.LANCZOS)
+            self._input_bg_cache[resized_key] = resized
+            if len(self._input_bg_cache) > 6:
+                self._input_bg_cache.pop(next(iter(self._input_bg_cache)))
 
         offset_x = (width - resized_width) // 2
         offset_y = (height - resized_height) // 2
         self._input_bg_photo = ImageTk.PhotoImage(resized)
+        self._current_input_bg_size = size
 
         if self._input_bg_image_id is None:
             self._input_bg_image_id = self._input_canvas.create_image(offset_x, offset_y, anchor='nw', image=self._input_bg_photo)
@@ -404,6 +446,52 @@ class ChatWindow:
             self._input_canvas.coords(self._input_bg_image_id, offset_x, offset_y)
 
         self._input_canvas.tag_lower(self._input_bg_image_id)
+
+    def _schedule_message_layout_refresh(self):
+        if self.text_area is None or self.window is None:
+            return
+        if self._message_layout_job is not None:
+            try:
+                self.window.after_cancel(self._message_layout_job)
+            except Exception:
+                pass
+        self._message_layout_job = self.window.after(50, self._refresh_message_layout)
+
+    def _refresh_message_layout(self):
+        self._message_layout_job = None
+        if not self._message_widgets or self.text_area is None:
+            return
+        was_at_bottom = False
+        try:
+            yview = self.text_area.yview()
+            was_at_bottom = yview[1] >= 0.99
+        except Exception:
+            pass
+        msg_char_width = self._pixels_to_chars(self._transcript_width - 60)
+        char_width_changed = msg_char_width != self._last_message_char_width
+        live_widgets = []
+        for widget in self._message_widgets:
+            try:
+                if not widget.winfo_exists():
+                    continue
+                widget.configure(width=self._transcript_width)
+                bubble = getattr(widget, '_message_bubble', None)
+                raw_text = getattr(widget, '_message_text', '')
+                if bubble is not None and bubble.winfo_exists() and char_width_changed:
+                    bubble.configure(
+                        width=msg_char_width,
+                        height=self._calc_text_display_lines(
+                            self._markdown_to_plain_text(raw_text),
+                            msg_char_width,
+                        ),
+                    )
+                live_widgets.append(widget)
+            except Exception:
+                pass
+        self._message_widgets = live_widgets
+        self._last_message_char_width = msg_char_width
+        if was_at_bottom:
+            self.text_area.after(10, lambda: self.text_area.see(tk.END))
 
     def _schedule_ui(self, callback):
         if self.window is None:
@@ -669,46 +757,9 @@ class ChatWindow:
             if new_width == self._transcript_width:
                 return
             self._transcript_width = new_width
-            self._refresh_message_layout()
+            self._schedule_message_layout_refresh()
 
         self.text_area.bind('<Configure>', sync_transcript_width, add='+')
-
-        def _refresh_message_layout():
-            """当窗口大小变化时，刷新所有消息组件的宽度，并保持滚动位置"""
-            if not self._message_widgets:
-                return
-            # 记住当前是否在底部
-            was_at_bottom = False
-            try:
-                yview = self.text_area.yview()
-                was_at_bottom = yview[1] >= 0.99
-            except Exception:
-                pass
-            msg_char_width = self._pixels_to_chars(self._transcript_width - 60)
-            for widget in self._message_widgets:
-                try:
-                    if widget.winfo_exists():
-                        widget.configure(width=self._transcript_width)
-                        for child in widget.winfo_children():
-                            try:
-                                if isinstance(child, tk.Text):
-                                    child.configure(width=msg_char_width)
-                                elif isinstance(child, (tk.Frame, tk.Label)):
-                                    child.configure(width=self._transcript_width)
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
-            # 清理已销毁的组件引用
-            self._message_widgets = [
-                w for w in self._message_widgets
-                if w.winfo_exists()
-            ]
-            # 如果之前在底部，延迟滚动回去（等 tk 完成内部重新布局）
-            if was_at_bottom:
-                self.text_area.after(10, lambda: self.text_area.see(tk.END))
-
-        self._refresh_message_layout = _refresh_message_layout
 
         self.text_area.tag_configure('status', foreground=self.colors['muted'])
         self.text_area.tag_configure('main_status', foreground=self.colors['muted'])
@@ -1273,7 +1324,9 @@ class ChatWindow:
         self._conversation_history = []
         self._pending_perm_frames = {}
         self._message_widgets = []
+        self._last_message_char_width = None
         self._last_status_texts.clear()
+        self._last_thinking_tokens = None
         self._reset_turn_state()
         self._last_summary_status = ''
         self._current_total_tokens = None
@@ -1937,6 +1990,11 @@ class ChatWindow:
             permission_mode = event.get('permission_mode')
             if isinstance(permission_mode, str):
                 self._set_active_permission_mode(permission_mode, announce=True)
+            if status == 'thinking_tokens':
+                estimated_tokens = event.get('estimated_tokens')
+                if isinstance(estimated_tokens, int):
+                    self._render_thinking_tokens_status(estimated_tokens)
+                return
             if status in self._suppressed_statuses:
                 # 纯内部状态，不产生任何可见输出
                 return
@@ -1983,6 +2041,7 @@ class ChatWindow:
             self._set_busy(False)
             self._update_total_tokens(event.get('total_tokens'))
             self._update_total_io_tokens(event.get('input_tokens'), event.get('output_tokens'))
+            self._clear_thinking_tokens_status()
             self._clear_inline_status()
             self._update_bubble_state('done', {'result': event.get('text') or ''})
             self._refresh_history_sidebar()
@@ -2003,6 +2062,7 @@ class ChatWindow:
 
         if kind == 'error':
             self._set_busy(False)
+            self._clear_thinking_tokens_status()
             self._clear_inline_status()
             if event.get('request_subtype') == 'set_permission_mode':
                 self.status_var.set(self._compose_status_text('模式切换失败'))
@@ -2236,6 +2296,18 @@ class ChatWindow:
         if not compact:
             return
         self._set_status(compact, 'summary')
+
+    def _render_thinking_tokens_status(self, estimated_tokens: int):
+        if not isinstance(estimated_tokens, int) or estimated_tokens < 0:
+            return
+        if self._last_thinking_tokens == estimated_tokens:
+            return
+        self._last_thinking_tokens = estimated_tokens
+        self._set_status(f'奥黛丽思考中...<{self._format_token_count(estimated_tokens)}>', 'thinking')
+
+    def _clear_thinking_tokens_status(self):
+        self._last_thinking_tokens = None
+        self._last_status_texts.pop('thinking', None)
 
     def _render_thinking_status(self, output_tokens: int | None = None):
         compact = '正在理解...'
@@ -2664,6 +2736,8 @@ class ChatWindow:
             self._insert_markdown_text(bubble, text)
             bubble.configure(state=tk.DISABLED)
             bubble.pack(anchor='e')
+            container._message_bubble = bubble
+            container._message_text = text
             self._bind_message_copy_events(bubble, text)
 
             meta = tk.Frame(content_col, bg=self.colors['panel'])
@@ -2722,6 +2796,8 @@ class ChatWindow:
             self._insert_markdown_text(bubble, text)
             bubble.configure(state=tk.DISABLED)
             bubble.pack(anchor='w')
+            container._message_bubble = bubble
+            container._message_text = text
             self._bind_message_copy_events(bubble, text)
 
             meta = tk.Frame(content_col, bg=self.colors['panel'])
