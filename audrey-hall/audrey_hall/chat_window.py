@@ -115,6 +115,8 @@ class ChatWindow:
         self._task_widgets = {}
         self._task_widget_font = None
         self._task_widget_done_font = None
+        self._tool_status_widget = None
+        self._tool_status_font = None
         self.status_var = tk.StringVar(value='正在唤醒奥黛丽的助手...')
         self._event_queue = queue.Queue()
         self._busy = False
@@ -504,6 +506,13 @@ class ChatWindow:
                     label.config(wraplength=max(240, self._transcript_width - 60))
             except Exception:
                 pass
+        try:
+            if self._tool_status_widget is not None:
+                label = self._tool_status_widget.get('label')
+                if label is not None and label.winfo_exists():
+                    label.config(wraplength=max(240, self._transcript_width - 60))
+        except Exception:
+            pass
         self._last_message_char_width = msg_char_width
         if was_at_bottom:
             self.text_area.after(10, lambda: self.text_area.see(tk.END))
@@ -1340,6 +1349,7 @@ class ChatWindow:
         self._pending_perm_frames = {}
         self._message_widgets = []
         self._task_widgets = {}
+        self._tool_status_widget = None
         self._last_message_char_width = None
         self._last_status_texts.clear()
         self._last_thinking_tokens = None
@@ -1920,7 +1930,7 @@ class ChatWindow:
             if self._is_task_tool_name(tool_name):
                 self._render_task_tool_event(tool_name, terminal_text)
             else:
-                self._append_message('tool_use', terminal_text, record_history=False)
+                self._render_tool_status_widget(terminal_text)
             self.status_var.set(self._compose_status_text(f'🔧 {tool_name}'))
             return
 
@@ -2069,6 +2079,7 @@ class ChatWindow:
             self._update_total_tokens(event.get('total_tokens'))
             self._update_total_io_tokens(event.get('input_tokens'), event.get('output_tokens'))
             self._clear_thinking_tokens_status()
+            self._clear_tool_status_widget()
             self._clear_inline_status()
             self._update_bubble_state('done', {'result': event.get('text') or ''})
             self._refresh_history_sidebar()
@@ -2090,6 +2101,7 @@ class ChatWindow:
         if kind == 'error':
             self._set_busy(False)
             self._clear_thinking_tokens_status()
+            self._clear_tool_status_widget()
             self._clear_inline_status()
             if event.get('request_subtype') == 'set_permission_mode':
                 self.status_var.set(self._compose_status_text('模式切换失败'))
@@ -2337,6 +2349,66 @@ class ChatWindow:
         compact = self._task_progress_compact_text(text)
         if compact:
             self._upsert_task_widget(tool_key, compact, done=False)
+
+    def _ensure_tool_status_font(self):
+        if self._tool_status_font is None:
+            self._tool_status_font = tkfont.Font(family='Consolas', size=9)
+
+    def _render_tool_status_widget(self, text: str):
+        if self.text_area is None:
+            return
+        compact = self._task_progress_compact_text(text)
+        if not compact:
+            return
+        self._ensure_tool_status_font()
+        existing = self._tool_status_widget
+        if existing is None:
+            card = create_card(
+                self.text_area,
+                self.theme,
+                bg='panel',
+                border='border',
+            )
+            label = tk.Label(
+                card,
+                text='',
+                font=self._tool_status_font,
+                bg=self.colors['panel'],
+                fg='#3D8884',
+                justify='left',
+                anchor='w',
+                wraplength=max(240, self._transcript_width - 60),
+                padx=10,
+                pady=8,
+            )
+            label.pack(fill=tk.X)
+            self.text_area.config(state=tk.NORMAL)
+            self.text_area.insert(tk.END, '\n')
+            self.text_area.window_create(tk.END, window=card, padx=4, pady=2)
+            self.text_area.insert(tk.END, '\n')
+            self.text_area.config(state=tk.DISABLED)
+            existing = {'card': card, 'label': label}
+            self._tool_status_widget = existing
+        existing['label'].config(
+            text=f'{self._pick_tool_icon(compact)} {compact}',
+            wraplength=max(240, self._transcript_width - 60),
+        )
+        try:
+            self.text_area.see(tk.END)
+        except Exception:
+            pass
+
+    def _clear_tool_status_widget(self):
+        widget = self._tool_status_widget
+        self._tool_status_widget = None
+        if not widget:
+            return
+        card = widget.get('card')
+        if card is not None:
+            try:
+                card.destroy()
+            except Exception:
+                pass
 
     def _render_task_widget(self, event: dict, text: str) -> bool:
         task_key = self._task_widget_key(event)
