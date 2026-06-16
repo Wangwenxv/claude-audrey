@@ -3,6 +3,7 @@ import os
 import queue
 import re
 import threading
+import time
 import tkinter as tk
 import tkinter.font as tkfont
 from datetime import datetime
@@ -49,6 +50,8 @@ MIN_STATUS_CORE_WIDTH_PX = 180
 MAX_HISTORY_SESSIONS = 18
 MAX_HISTORY_LABEL_CHARS = 7
 EVENT_POLL_INTERVAL_MS = 100
+EVENT_DRAIN_BUDGET_MS = 12
+EVENT_BATCH_LIMIT = 80
 CONNECTION_TARGET_CHOICES = [
     ('auto', '自动抉择'),
     ('project', '奥黛丽agent'),
@@ -271,7 +274,7 @@ class ChatWindow:
             return
         terminal_view = self._ensure_terminal_view()
         initial_events = None
-        if not terminal_view.is_open() and not getattr(terminal_view, '_events', None):
+        if not terminal_view.is_open():
             initial_events = self.session.terminal_events_snapshot()
         terminal_view.show(initial_events=initial_events, host_window=self.window)
         self._terminal_view_visible = True
@@ -1907,20 +1910,30 @@ class ChatWindow:
             self._append_message('error', f'停止失败：{exc}')
 
     def _enqueue_event(self, event: dict):
+        kind = event.get('kind')
+        if kind in {'terminal_line', 'stdout_raw_line', 'stderr_raw_line'}:
+            if not self._terminal_view_visible or self._terminal_view is None or not self._terminal_view.is_open():
+                return
         self._event_queue.put(event)
 
     def _drain_events(self):
         if self.window is None or not self.window.winfo_exists():
             return
 
+        started_at = time.perf_counter()
+        processed = 0
         while True:
+            elapsed_ms = (time.perf_counter() - started_at) * 1000
+            if processed >= EVENT_BATCH_LIMIT or elapsed_ms >= EVENT_DRAIN_BUDGET_MS:
+                break
             try:
                 event = self._event_queue.get_nowait()
             except queue.Empty:
                 break
             self._handle_event(event)
-            if self._terminal_view is not None:
+            if self._terminal_view_visible and self._terminal_view is not None:
                 self._terminal_view.consume_event(event)
+            processed += 1
 
         # 连接看门狗：如果 _busy 且超过 120 秒没有任何事件，认为连接已静默断开
         if self._busy and self._last_busy_event_time is not None:
@@ -1930,7 +1943,8 @@ class ChatWindow:
                 self._set_busy(False)
                 self._last_busy_event_time = None
 
-        self.window.after(EVENT_POLL_INTERVAL_MS, self._drain_events)
+        next_poll_ms = 10 if not self._event_queue.empty() else EVENT_POLL_INTERVAL_MS
+        self.window.after(next_poll_ms, self._drain_events)
 
     def _handle_event(self, event: dict):
         kind = event.get('kind')
