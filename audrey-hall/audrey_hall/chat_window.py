@@ -52,6 +52,7 @@ MAX_HISTORY_LABEL_CHARS = 7
 EVENT_POLL_INTERVAL_MS = 100
 EVENT_DRAIN_BUDGET_MS = 12
 EVENT_BATCH_LIMIT = 80
+INLINE_STATUS_DEBOUNCE_MS = 120
 CONNECTION_TARGET_CHOICES = [
     ('auto', '自动抉择'),
     ('project', '奥黛丽agent'),
@@ -162,6 +163,11 @@ class ChatWindow:
         self._terminal_view = None
         self._terminal_view_visible = False
         self._terminal_button = None
+        self._inline_status_job = None
+        self._pending_inline_status_text = None
+        self._last_status_var_text = ''
+        self._status_measure_font = None
+        self._status_text_px_cache = {}
 
         self.theme = get_theme()
         self.fonts = self.theme['fonts']
@@ -2323,11 +2329,53 @@ class ChatWindow:
         if self.text_area is None:
             compact = self._task_progress_compact_text(text)
             if compact:
-                self.status_var.set(compact)
+                self._set_status_var_text(compact)
             return
         self._capture_transcript_follow_state()
         self.text_area.config(state=tk.NORMAL)
         self.text_area.insert(tk.END, f'[状态] {text}\n\n', ('status',))
+        self.text_area.config(state=tk.DISABLED)
+        self._maybe_follow_transcript_end()
+
+    def _set_status_var_text(self, text: str):
+        if text == self._last_status_var_text:
+            return
+        self._last_status_var_text = text
+        self.status_var.set(text)
+
+    def _cancel_inline_status_job(self):
+        if self.window is None or self._inline_status_job is None:
+            self._inline_status_job = None
+            return
+        try:
+            self.window.after_cancel(self._inline_status_job)
+        except Exception:
+            pass
+        self._inline_status_job = None
+
+    def _schedule_inline_status_render(self, text: str):
+        self._pending_inline_status_text = text
+        if self.text_area is None or self.window is None:
+            return
+        if self._inline_status_job is not None:
+            return
+        self._inline_status_job = self.window.after(
+            INLINE_STATUS_DEBOUNCE_MS,
+            self._flush_inline_status_render,
+        )
+
+    def _flush_inline_status_render(self):
+        self._inline_status_job = None
+        if self.text_area is None:
+            return
+        compact = self._pending_inline_status_text
+        if not compact:
+            return
+        ranges = self.text_area.tag_ranges('inline_status')
+        self.text_area.config(state=tk.NORMAL)
+        if len(ranges) >= 2:
+            self.text_area.delete(ranges[0], ranges[-1])
+        self.text_area.insert(tk.END, f'[状态] {compact}\n\n', ('status', 'inline_status'))
         self.text_area.config(state=tk.DISABLED)
         self._maybe_follow_transcript_end()
 
@@ -2345,26 +2393,20 @@ class ChatWindow:
         last = self._last_status_texts.get(tag)
         if last == compact:
             # 文本未变，但确保状态栏同步
-            self.status_var.set(compact)
+            self._set_status_var_text(compact)
             return
         self._last_status_texts[tag] = compact
 
-        self.status_var.set(compact)
+        self._set_status_var_text(compact)
         if self.text_area is None:
             return
-
-        # 清除上一条内嵌状态行（统一标签，始终只保留一条）
-        ranges = self.text_area.tag_ranges('inline_status')
-        self.text_area.config(state=tk.NORMAL)
-        if len(ranges) >= 2:
-            self.text_area.delete(ranges[0], ranges[-1])
-        self.text_area.insert(tk.END, f'[状态] {compact}\n\n', ('status', 'inline_status'))
-        self.text_area.config(state=tk.DISABLED)
-        self._maybe_follow_transcript_end()
+        self._schedule_inline_status_render(compact)
 
     def _clear_inline_status(self):
         """清除文本区中的内嵌状态行并重置去重缓存。"""
         self._last_status_texts.clear()
+        self._pending_inline_status_text = None
+        self._cancel_inline_status_job()
         if self.text_area is None:
             return
         ranges = self.text_area.tag_ranges('inline_status')
@@ -2707,11 +2749,19 @@ class ChatWindow:
     def _measure_status_text_px(self, text: str) -> int:
         if not text:
             return 0
+        cached = self._status_text_px_cache.get(text)
+        if cached is not None:
+            return cached
         try:
-            font = tkfont.Font(font=self.fonts['base'])
-            return int(font.measure(text))
+            if self._status_measure_font is None:
+                self._status_measure_font = tkfont.Font(font=self.fonts['base'])
+            measured = int(self._status_measure_font.measure(text))
         except Exception:
-            return len(text) * 8
+            measured = len(text) * 8
+        self._status_text_px_cache[text] = measured
+        if len(self._status_text_px_cache) > 256:
+            self._status_text_px_cache.pop(next(iter(self._status_text_px_cache)))
+        return measured
 
     def _truncate_text_to_px(self, text: str, max_px: int) -> str:
         if not text or max_px <= 0:
