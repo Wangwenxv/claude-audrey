@@ -1,3 +1,5 @@
+import base64
+import io
 import json
 import os
 import queue
@@ -6,10 +8,16 @@ import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
+from tkinter import filedialog
 from datetime import datetime
 from pathlib import Path
 
 from PIL import Image, ImageTk
+
+try:
+    from PIL import ImageGrab
+except Exception:
+    ImageGrab = None
 
 from .claude_agent import (
     CONNECTION_TARGET_LABELS,
@@ -42,6 +50,20 @@ CHOICE_PROMPT_CUES = (
     '选一个', '选哪一个', '告诉我你的选择', '回复对应选项', '怎么选',
 )
 TASK_TOOL_PREFIXES = ('task',)
+LOCAL_ONLY_COMMANDS = {'model', 'mode', 'btw', 'raw'}
+SUPPORTED_IMAGE_FORMATS = {
+    'PNG': 'image/png',
+    'JPEG': 'image/jpeg',
+    'JPG': 'image/jpeg',
+    'GIF': 'image/gif',
+    'WEBP': 'image/webp',
+}
+WELCOME_MESSAGE = (
+    '不属于这个时代的愚者...\n\n'
+    '灰雾之上的神秘主宰...\n\n'
+    '执掌好运的黄黑之王...\n\n \n\n'
+    '按 Ctrl+Enter 发送，Ctrl+V 可粘贴图片，也可以点“上传图片”。'
+)
 
 MAX_SIDE_CONTEXT_MESSAGES = 6
 MAX_SIDE_CONTEXT_CHARS = 2800
@@ -168,6 +190,8 @@ class ChatWindow:
         self._last_status_var_text = ''
         self._status_measure_font = None
         self._status_text_px_cache = {}
+        self._pending_image_attachments = []
+        self._attachment_preview_frame = None
 
         self.theme = get_theme()
         self.fonts = self.theme['fonts']
@@ -783,6 +807,9 @@ class ChatWindow:
         composer = tk.Frame(content_frame, bg=self.colors['bg'])
         composer.pack(side=tk.BOTTOM, fill=tk.X, pady=(self.window_theme['composer_gap'], 0))
 
+        self._attachment_preview_frame = tk.Frame(composer, bg=self.colors['bg'])
+        self._attachment_preview_frame.pack(fill=tk.X, pady=(0, 6))
+
         input_shell = tk.Canvas(
             composer,
             height=max(96, self.window_theme['input_height'] * 24 + self.chat_theme['input_pad_y'] * 2),
@@ -935,6 +962,9 @@ class ChatWindow:
             add='+',
         )
         self.input_box.bind('<Control-Return>', self._handle_send_shortcut)
+        self.input_box.bind('<Control-v>', self._handle_input_paste, add='+')
+        self.input_box.bind('<Control-V>', self._handle_input_paste, add='+')
+        self.input_box.bind('<<Paste>>', self._handle_input_paste, add='+')
 
         tk.Label(
             button_row,
@@ -955,6 +985,18 @@ class ChatWindow:
             style_overrides=self._aurora_button_style(),
         )
         self.stop_button.pack(side=tk.RIGHT, padx=(8, 0))
+
+        upload_button = create_button(
+            button_row,
+            text='上传图片',
+            command=self._handle_image_upload,
+            theme=self.theme,
+            variant='secondary',
+            width=10,
+            font=self.fonts['control'],
+            style_overrides=self._aurora_button_style(),
+        )
+        upload_button.pack(side=tk.RIGHT, padx=(8, 0))
 
         self.send_button = create_button(
             button_row,
@@ -985,7 +1027,7 @@ class ChatWindow:
 
         self._append_message(
             'assistant',
-            '不属于这个时代的愚者...\n\n灰雾之上的神秘主宰...\n\n执掌好运的黄黑之王...\n\n \n\n按 Ctrl+Enter 发送。',
+            WELCOME_MESSAGE,
         )
 
     def _build_history_sidebar(self, parent):
@@ -1347,9 +1389,10 @@ class ChatWindow:
             self._reset_transcript_view()
             self._append_message(
                 'assistant',
-                '不属于这个时代的愚者...\n\n灰雾之上的神秘主宰...\n\n执掌好运的黄黑之王...\n\n \n\n按 Ctrl+Enter 发送。',
+                WELCOME_MESSAGE,
             )
             self._append_inline_status('已删除当前会话，准备开启新对话。')
+            self._clear_pending_image_attachments()
             self._reconnect_session(announce=True)
 
         self._delete_session_file(sid)
@@ -1368,9 +1411,10 @@ class ChatWindow:
         self._reset_transcript_view()
         self._append_message(
             'assistant',
-            '不属于这个时代的愚者...\n\n灰雾之上的神秘主宰...\n\n执掌好运的黄黑之王...\n\n \n\n按 Ctrl+Enter 发送。',
+            WELCOME_MESSAGE,
         )
         self._append_inline_status('已清除当前对话，准备开启新会话。')
+        self._clear_pending_image_attachments()
         self._reconnect_session(announce=True)
 
         # 同时删除旧的会话文件，这样侧边栏也会随之更新
@@ -1389,9 +1433,10 @@ class ChatWindow:
         self._reset_transcript_view()
         self._append_message(
             'assistant',
-            '不属于这个时代的愚者...\n\n灰雾之上的神秘主宰...\n\n执掌好运的黄黑之王...\n\n \n\n按 Ctrl+Enter 发送。',
+            WELCOME_MESSAGE,
         )
         self._append_inline_status('已创建新会话。')
+        self._clear_pending_image_attachments()
         self._reconnect_session(announce=True)
         self._refresh_history_sidebar()
 
@@ -1409,6 +1454,7 @@ class ChatWindow:
         self._current_total_tokens = None
         self._current_input_tokens = None
         self._current_output_tokens = None
+        self._clear_pending_image_attachments()
         if self.text_area is not None:
             self.text_area.config(state=tk.NORMAL)
             self.text_area.delete('1.0', tk.END)
@@ -1468,6 +1514,8 @@ class ChatWindow:
                 value = block.get('text')
                 if isinstance(value, str) and value.strip():
                     parts.append(value.strip())
+            elif block_type == 'image':
+                parts.append('[图片]')
             elif block_type == 'thinking':
                 continue
         text = '\n\n'.join(parts).strip()
@@ -1513,25 +1561,264 @@ class ChatWindow:
         self._on_send()
         return 'break'
 
-    def _on_send(self):
-        text = self.input_box.get('1.0', tk.END).strip()
-        if not text:
+    def _handle_input_paste(self, _event=None):
+        added_count = self._add_images_from_clipboard()
+        if added_count > 0:
+            return 'break'
+        return None
+
+    def _is_local_only_command(self, text: str) -> bool:
+        stripped = (text or '').strip()
+        if not stripped.startswith('/'):
+            return False
+        command = stripped[1:].split(None, 1)[0].lower()
+        return command in LOCAL_ONLY_COMMANDS
+
+    def _build_user_message_content(self, text: str):
+        trimmed = (text or '').strip()
+        attachments = list(self._pending_image_attachments)
+        if not attachments:
+            return trimmed
+
+        content = []
+        if trimmed:
+            content.append({'type': 'text', 'text': trimmed})
+        for item in attachments:
+            content.append(
+                {
+                    'type': 'image',
+                    'source': {
+                        'type': 'base64',
+                        'media_type': item['media_type'],
+                        'data': item['data'],
+                    },
+                }
+            )
+        return content
+
+    def _build_user_display_text(self, text: str) -> str:
+        trimmed = (text or '').strip()
+        attachments = list(self._pending_image_attachments)
+        if not attachments:
+            return trimmed
+
+        image_lines = [
+            f"[图片] {item.get('filename') or '未命名图片'}"
+            for item in attachments
+        ]
+        if trimmed:
+            return trimmed + '\n\n' + '\n'.join(image_lines)
+        return '\n'.join(image_lines)
+
+    def _build_prompt_status_text(self, text: str) -> str:
+        trimmed = (text or '').strip()
+        if trimmed:
+            return trimmed
+        count = len(self._pending_image_attachments)
+        return f'发送了 {count} 张图片' if count > 1 else '发送了一张图片'
+
+    def _handle_image_upload(self):
+        paths = filedialog.askopenfilenames(
+            parent=self.window,
+            title='选择要发送的图片',
+            filetypes=[
+                ('图片文件', '*.png *.jpg *.jpeg *.gif *.webp *.bmp'),
+                ('所有文件', '*.*'),
+            ],
+        )
+        if not paths:
             return
 
-        if self._handle_local_command(text):
+        added_count = 0
+        for raw_path in paths:
+            attachment = self._load_image_attachment_from_path(raw_path)
+            if attachment is None:
+                continue
+            self._pending_image_attachments.append(attachment)
+            added_count += 1
+
+        if added_count == 0:
+            self._append_inline_status('没有成功读取可发送的图片。')
+            return
+
+        self._refresh_attachment_preview()
+        self.status_var.set(f'已添加 {added_count} 张图片，等待发送。')
+        if self.input_box is not None:
+            self.input_box.focus_set()
+
+    def _load_image_attachment_from_path(self, raw_path: str):
+        path = Path(raw_path)
+        if not path.exists() or not path.is_file():
+            return None
+        try:
+            with Image.open(path) as image:
+                width, height = image.size
+                detected_format = (image.format or '').upper()
+                if detected_format in SUPPORTED_IMAGE_FORMATS:
+                    media_type = SUPPORTED_IMAGE_FORMATS[detected_format]
+                    data = base64.b64encode(path.read_bytes()).decode('ascii')
+                else:
+                    media_type, data = self._encode_pil_image(image)
+        except Exception as exc:
+            self._append_message('error', f'读取图片失败：{path.name}：{exc}')
+            return None
+
+        return {
+            'filename': path.name,
+            'media_type': media_type,
+            'data': data,
+            'dimensions': (width, height),
+        }
+
+    def _encode_pil_image(self, image: Image.Image) -> tuple[str, str]:
+        normalized = image.copy()
+        if normalized.mode not in ('RGB', 'RGBA'):
+            normalized = normalized.convert('RGBA')
+
+        buffer = io.BytesIO()
+        normalized.save(buffer, format='PNG')
+        return 'image/png', base64.b64encode(buffer.getvalue()).decode('ascii')
+
+    def _add_images_from_clipboard(self) -> int:
+        if ImageGrab is None:
+            return 0
+        try:
+            clipboard_data = ImageGrab.grabclipboard()
+        except Exception:
+            return 0
+
+        added_count = 0
+        if isinstance(clipboard_data, Image.Image):
+            media_type, data = self._encode_pil_image(clipboard_data)
+            self._pending_image_attachments.append(
+                {
+                    'filename': 'clipboard.png',
+                    'media_type': media_type,
+                    'data': data,
+                    'dimensions': clipboard_data.size,
+                }
+            )
+            added_count = 1
+        elif isinstance(clipboard_data, list):
+            for item in clipboard_data:
+                attachment = self._load_image_attachment_from_path(str(item))
+                if attachment is None:
+                    continue
+                self._pending_image_attachments.append(attachment)
+                added_count += 1
+
+        if added_count > 0:
+            self._refresh_attachment_preview()
+            self.status_var.set(f'已从剪贴板添加 {added_count} 张图片。')
+            if self.input_box is not None:
+                self.input_box.focus_set()
+        return added_count
+
+    def _refresh_attachment_preview(self):
+        frame = self._attachment_preview_frame
+        if frame is None:
+            return
+        for child in list(frame.winfo_children()):
+            child.destroy()
+
+        if not self._pending_image_attachments:
+            return
+
+        tk.Label(
+            frame,
+            text=f'待发送图片 {len(self._pending_image_attachments)} 张',
+            font=self.fonts['small'],
+            bg=self.colors['bg'],
+            fg=self.colors['muted'],
+            anchor='w',
+        ).pack(fill=tk.X, pady=(0, 4))
+
+        chips = tk.Frame(frame, bg=self.colors['bg'])
+        chips.pack(fill=tk.X)
+        for index, item in enumerate(self._pending_image_attachments):
+            chip = tk.Frame(chips, bg='#EEF5F2', highlightbackground='#D6E5E0', highlightthickness=1)
+            chip.pack(side=tk.LEFT, padx=(0, 6), pady=(0, 2))
+            dims = item.get('dimensions') or ()
+            size_text = ''
+            if len(dims) == 2:
+                size_text = f' ({dims[0]}x{dims[1]})'
+            tk.Label(
+                chip,
+                text=(item.get('filename') or '图片') + size_text,
+                font=self.fonts['small'],
+                bg='#EEF5F2',
+                fg=self.colors['text'],
+                padx=8,
+                pady=4,
+            ).pack(side=tk.LEFT)
+            remove_button = tk.Label(
+                chip,
+                text='✕',
+                font=self.fonts['small'],
+                bg='#EEF5F2',
+                fg='#B06A6A',
+                cursor='hand2',
+                padx=6,
+            )
+            remove_button.pack(side=tk.LEFT)
+            remove_button.bind(
+                '<Button-1>',
+                lambda _event, idx=index: self._remove_pending_image_attachment(idx),
+                add='+',
+            )
+
+    def _remove_pending_image_attachment(self, index: int):
+        if index < 0 or index >= len(self._pending_image_attachments):
+            return
+        self._pending_image_attachments.pop(index)
+        self._refresh_attachment_preview()
+        if self._pending_image_attachments:
+            self.status_var.set(f'还剩 {len(self._pending_image_attachments)} 张待发送图片。')
+        else:
+            self.status_var.set('图片附件已清空。')
+
+    def _clear_pending_image_attachments(self):
+        if not self._pending_image_attachments:
+            return
+        self._pending_image_attachments = []
+        self._refresh_attachment_preview()
+
+    def _on_send(self):
+        text = self.input_box.get('1.0', tk.END).strip()
+        has_attachments = bool(self._pending_image_attachments)
+        if not text and not has_attachments:
+            return
+
+        if has_attachments and self._is_local_only_command(text):
+            self._append_inline_status('图片附件暂不支持 /model、/mode、/btw、/raw 这类本地命令。')
+            return
+
+        if text and self._handle_local_command(text):
             self.input_box.delete('1.0', tk.END)
             return
 
         if self._busy:
             return
 
-        self.input_box.delete('1.0', tk.END)
-        self._submit_prompt(text)
+        display_text = self._build_user_display_text(text)
+        message_content = self._build_user_message_content(text)
+        if self._submit_prompt(message_content, display_text=display_text):
+            self.input_box.delete('1.0', tk.END)
+            self._clear_pending_image_attachments()
 
-    def _submit_prompt(self, text: str, display_text: str | None = None):
-        text = (text or '').strip()
-        if not text:
-            return
+    def _submit_prompt(self, message_content: str | list[dict], display_text: str | None = None):
+        if isinstance(message_content, str):
+            prompt_text = message_content.strip()
+            if not prompt_text:
+                return False
+        else:
+            prompt_text = self._build_prompt_status_text('')
+            if not message_content:
+                return False
+
+        visible_text = (display_text or '').strip() or prompt_text
+        if not visible_text:
+            return False
 
         # 新轮次开始前彻底清理上一轮的状态缓存，防止去重逻辑复用旧值
         self._last_status_texts.clear()
@@ -1546,19 +1833,21 @@ class ChatWindow:
             except Exception:
                 pass
 
-        self._append_message('user', display_text or text)
+        self._append_message('user', visible_text)
         self.status_var.set('奥黛丽 正在思考...')
         self._set_busy(True)
         self._last_busy_event_time = datetime.now()
-        self._update_bubble_state('thinking', {'prompt': text})
+        self._update_bubble_state('thinking', {'prompt': visible_text})
 
         try:
-            self.session.send_user_message(text)
+            self.session.send_user_message(message_content)
         except Exception as exc:
             self._set_busy(False)
             self.status_var.set('发送失败')
             self._clear_bubble_state()
             self._append_message('error', f'发送失败：{exc}')
+            return False
+        return True
 
     def _handle_local_command(self, text: str) -> bool:
         if not text.startswith('/'):

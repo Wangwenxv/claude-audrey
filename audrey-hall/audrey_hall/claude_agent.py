@@ -374,8 +374,14 @@ class ClaudeCodeSession:
         self._connection_source = CONNECTION_TARGET_LABELS['system']
         return self._get_system_command()
 
-    def send_user_message(self, text: str):
-        if not text.strip():
+    def send_user_message(self, content: str | list[dict]):
+        if isinstance(content, str):
+            if not content.strip():
+                return
+        elif isinstance(content, list):
+            if not content:
+                return
+        else:
             return
         self._ensure_started()
         self._write_json(
@@ -383,7 +389,7 @@ class ClaudeCodeSession:
                 'type': 'user',
                 'message': {
                     'role': 'user',
-                    'content': text,
+                    'content': content,
                 },
                 'parent_tool_use_id': None,
                 'session_id': self._session_id,
