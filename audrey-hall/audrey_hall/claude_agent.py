@@ -242,6 +242,7 @@ class ClaudeCodeSession:
         if isinstance(subtype, str) and subtype:
             self._pending_control_requests[request_id] = subtype
         self._write_json(payload)
+        return request_id
 
     def start(self):
         if self.process is not None:
@@ -465,6 +466,17 @@ class ClaudeCodeSession:
             }
         )
 
+    def send_side_question(self, question: str) -> str | None:
+        normalized = question.strip() if isinstance(question, str) else ''
+        if not normalized:
+            return None
+        return self._send_control_request(
+            {
+                'subtype': 'side_question',
+                'question': normalized,
+            }
+        )
+
     def terminal_events_snapshot(self) -> list[dict]:
         return [dict(event) for event in self._terminal_events]
 
@@ -632,6 +644,27 @@ class ClaudeCodeSession:
                     {
                         'kind': 'permission_mode',
                         'mode': payload.get('mode'),
+                        'request_id': request_id,
+                        'session_id': self._session_id,
+                    }
+                )
+            elif response.get('subtype') == 'success' and request_subtype == 'side_question':
+                payload = response.get('response') or {}
+                self._emit(
+                    {
+                        'kind': 'side_question',
+                        'ok': True,
+                        'text': _extract_string(payload.get('response')),
+                        'request_id': request_id,
+                        'session_id': self._session_id,
+                    }
+                )
+            elif response.get('subtype') == 'error' and request_subtype == 'side_question':
+                self._emit(
+                    {
+                        'kind': 'side_question',
+                        'ok': False,
+                        'text': response.get('error') or '旁路问题执行失败',
                         'request_id': request_id,
                         'session_id': self._session_id,
                     }

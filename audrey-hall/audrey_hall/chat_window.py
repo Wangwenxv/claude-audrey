@@ -65,8 +65,6 @@ WELCOME_MESSAGE = (
     '按 Ctrl+Enter 发送，Ctrl+V 可粘贴图片，也可以点“上传图片”。'
 )
 
-MAX_SIDE_CONTEXT_MESSAGES = 6
-MAX_SIDE_CONTEXT_CHARS = 2800
 MAX_STATUS_WIDTH_PX = 600
 MIN_STATUS_CORE_WIDTH_PX = 180
 MAX_HISTORY_SESSIONS = 18
@@ -75,6 +73,9 @@ EVENT_POLL_INTERVAL_MS = 100
 EVENT_DRAIN_BUDGET_MS = 12
 EVENT_BATCH_LIMIT = 80
 INLINE_STATUS_DEBOUNCE_MS = 120
+MAX_COLLAPSED_MESSAGE_LINES = 12
+MAX_INLINE_TOOL_RESULT_CHARS = 12000
+MAX_INLINE_TOOL_RESULT_LINES = 120
 CONNECTION_TARGET_CHOICES = [
     ('auto', '自动抉择'),
     ('project', '奥黛丽agent'),
@@ -149,6 +150,7 @@ class ChatWindow:
         self._busy = False
         self._auto_allow_tools = set()  # 用户选择“总是允许”的工具名
         self._pending_perm_frames = {}  # request_id -> 内嵌权限卡片 frame
+        self._pending_side_question_labels = {}
         self._conversation_history = []
         self._active_model = 'default'
         self._active_permission_mode = 'default'
@@ -185,11 +187,13 @@ class ChatWindow:
         self._terminal_view = None
         self._terminal_view_visible = False
         self._terminal_button = None
+        self._terminal_sync_job = None
         self._inline_status_job = None
         self._pending_inline_status_text = None
         self._last_status_var_text = ''
         self._status_measure_font = None
         self._status_text_px_cache = {}
+        self._markdown_fonts = None
         self._pending_image_attachments = []
         self._attachment_preview_frame = None
 
@@ -249,6 +253,7 @@ class ChatWindow:
         self._busy = False
         self._set_busy(False)
         self._pending_perm_frames = {}
+        self._pending_side_question_labels = {}
         self._last_status_texts.clear()
         self._last_thinking_tokens = None
         self._current_total_tokens = None
@@ -330,6 +335,17 @@ class ChatWindow:
     def _handle_window_configure(self, event):
         if self.window is None or event.widget is not self.window:
             return
+        if not self._terminal_view_visible:
+            return
+        if self._terminal_sync_job is not None:
+            try:
+                self.window.after_cancel(self._terminal_sync_job)
+            except Exception:
+                pass
+        self._terminal_sync_job = self.window.after(80, self._flush_terminal_view_sync)
+
+    def _flush_terminal_view_sync(self):
+        self._terminal_sync_job = None
         self._sync_terminal_view_position()
 
     def _update_connection_time(self):
@@ -522,12 +538,20 @@ class ChatWindow:
                 bubble = getattr(widget, '_message_bubble', None)
                 raw_text = getattr(widget, '_message_text', '')
                 if bubble is not None and bubble.winfo_exists() and char_width_changed:
+                    plain_text = getattr(widget, '_message_plain_text', self._markdown_to_plain_text(raw_text))
+                    is_expanded = bool(getattr(widget, '_message_is_expanded', True))
                     bubble.configure(
                         width=msg_char_width,
                         height=self._calc_text_display_lines(
-                            self._markdown_to_plain_text(raw_text),
+                            plain_text,
                             msg_char_width,
+                            max_lines=40 if is_expanded else MAX_COLLAPSED_MESSAGE_LINES,
                         ),
+                    )
+                    widget._message_full_line_count = self._calc_text_display_lines(
+                        plain_text,
+                        msg_char_width,
+                        max_lines=999,
                     )
                 live_widgets.append(widget)
             except Exception:
@@ -803,6 +827,16 @@ class ChatWindow:
         # 挤出窗口——之前正是这个问题导致"只有会话、看不到输入框"。
         button_row = tk.Frame(content_frame, bg=self.colors['bg'])
         button_row.pack(side=tk.BOTTOM, fill=tk.X, pady=(self.window_theme['button_gap'], 0))
+        status_row = tk.Frame(button_row, bg=self.colors['bg'])
+        status_row.pack(fill=tk.X)
+        action_row_primary = tk.Frame(button_row, bg=self.colors['bg'])
+        action_row_primary.pack(fill=tk.X, pady=(8, 0))
+        action_row_secondary = tk.Frame(button_row, bg=self.colors['bg'])
+        action_row_secondary.pack(fill=tk.X, pady=(8, 0))
+        action_group_primary = tk.Frame(action_row_primary, bg=self.colors['bg'])
+        action_group_primary.pack(side=tk.RIGHT)
+        action_group_secondary = tk.Frame(action_row_secondary, bg=self.colors['bg'])
+        action_group_secondary.pack(side=tk.RIGHT)
 
         composer = tk.Frame(content_frame, bg=self.colors['bg'])
         composer.pack(side=tk.BOTTOM, fill=tk.X, pady=(self.window_theme['composer_gap'], 0))
@@ -967,7 +1001,7 @@ class ChatWindow:
         self.input_box.bind('<<Paste>>', self._handle_input_paste, add='+')
 
         tk.Label(
-            button_row,
+            status_row,
             textvariable=self.status_var,
             font=self.fonts['small'],
             bg=self.colors['bg'],
@@ -975,52 +1009,52 @@ class ChatWindow:
         ).pack(side=tk.LEFT)
 
         self.stop_button = create_button(
-            button_row,
+            action_group_primary,
             text='中止对话',
             command=self._on_stop,
             theme=self.theme,
             variant='secondary',
-            width=10,
+            width=14,
             font=self.fonts['control'],
             style_overrides=self._aurora_button_style(),
         )
-        self.stop_button.pack(side=tk.RIGHT, padx=(8, 0))
+        self.stop_button.pack(side=tk.LEFT, padx=(0, 8))
 
         upload_button = create_button(
-            button_row,
+            action_group_secondary,
             text='上传图片',
             command=self._handle_image_upload,
             theme=self.theme,
             variant='secondary',
-            width=10,
+            width=14,
             font=self.fonts['control'],
             style_overrides=self._aurora_button_style(),
         )
-        upload_button.pack(side=tk.RIGHT, padx=(8, 0))
+        upload_button.pack(side=tk.LEFT, padx=(0, 8))
 
         self.send_button = create_button(
-            button_row,
+            action_group_primary,
             text='发送',
             command=self._on_send,
             theme=self.theme,
             variant='secondary',
-            width=10,
+            width=14,
             font=self.fonts['control'],
             style_overrides=self._aurora_button_style(),
         )
-        self.send_button.pack(side=tk.RIGHT)
+        self.send_button.pack(side=tk.LEFT, padx=(0, 8))
 
         clear_button = create_button(
-            button_row,
+            action_group_secondary,
             text='清除对话',
             command=self._clear_conversation,
             theme=self.theme,
             variant='secondary',
-            width=10,
+            width=14,
             font=self.fonts['control'],
             style_overrides=self._aurora_button_style(),
         )
-        clear_button.pack(side=tk.RIGHT, padx=(8, 0))
+        clear_button.pack(side=tk.LEFT, padx=(0, 8))
 
         self._build_history_sidebar(side_panel)
         self._refresh_history_sidebar()
@@ -1798,6 +1832,12 @@ class ChatWindow:
             return
 
         if self._busy:
+            if has_attachments:
+                self._append_inline_status('当前正在对话中；图片附件暂不支持旁路插话。')
+                return
+            self._append_inline_status(f'旁路提问：{text}')
+            self._handle_btw_command(text)
+            self.input_box.delete('1.0', tk.END)
             return
 
         display_text = self._build_user_display_text(text)
@@ -2089,87 +2129,17 @@ class ChatWindow:
         ).pack(side=tk.LEFT)
 
         self._insert_inline_card(card)
-
-        worker = threading.Thread(
-            target=self._run_side_question,
-            args=(question, status_label),
-            daemon=True,
-        )
-        worker.start()
-
-    def _run_side_question(self, question: str, status_label):
-        ready_event = threading.Event()
-        done_event = threading.Event()
-        state = {'answer': '', 'error': ''}
-
-        def on_event(event: dict):
-            kind = event.get('kind')
-            if kind == 'status' and event.get('status') == 'ready':
-                ready_event.set()
-                return
-            if kind == 'assistant':
-                text = (event.get('text') or '').strip()
-                if text:
-                    state['answer'] = text
-                return
-            if kind == 'done':
-                if event.get('ok'):
-                    if not state['answer']:
-                        state['answer'] = (event.get('text') or '').strip()
-                else:
-                    state['error'] = (event.get('text') or '旁路问题执行失败').strip()
-                done_event.set()
-                return
-            if kind == 'error':
-                state['error'] = (event.get('text') or '旁路问题执行失败').strip()
-                done_event.set()
-
-        side_session = ClaudeCodeSession(
-            on_event,
-            working_dir=getattr(self.session, 'working_dir', None),
-            connection_target=self._connection_target,
-        )
-
         try:
-            side_session.start()
-            if not ready_event.wait(20):
-                state['error'] = '旁路问题会话初始化超时'
-            else:
-                side_session.send_user_message(self._build_side_question_prompt(question))
-                if not done_event.wait(120):
-                    state['error'] = '旁路问题等待超时'
+            request_id = self.session.send_side_question(question)
         except Exception as exc:
-            state['error'] = f'旁路问题失败：{exc}'
-        finally:
-            try:
-                side_session.close()
-            except Exception:
-                pass
+            self._update_side_question_result(status_label, f'旁路问题失败：{exc}', True)
+            return
 
-        final_text = state['error'] or state['answer'] or '未收到结果'
-        self._schedule_ui(lambda: self._update_side_question_result(status_label, final_text, bool(state['error'])))
+        if not request_id:
+            self._update_side_question_result(status_label, '旁路问题发送失败', True)
+            return
 
-    def _build_side_question_prompt(self, question: str) -> str:
-        recent = self._conversation_history[-MAX_SIDE_CONTEXT_MESSAGES:]
-        excerpt_parts = []
-        total_chars = 0
-        for item in reversed(recent):
-            entry = f"{'用户' if item['role'] == 'user' else '助手'}: {item['text'].strip()}"
-            if not item['text'].strip():
-                continue
-            if excerpt_parts and total_chars + len(entry) > MAX_SIDE_CONTEXT_CHARS:
-                break
-            excerpt_parts.append(entry)
-            total_chars += len(entry)
-
-        excerpt = '\n\n'.join(reversed(excerpt_parts)).strip() or '无最近主对话上下文。'
-        return (
-            '你是 Claude Code 的旁路问答助手。下面是当前主对话最近的上下文，仅供回答侧边问题参考。'
-            '不要继续执行主任务，也不要假设你能修改主会话状态。\n\n'
-            f'主对话摘录：\n{excerpt}\n\n'
-            f'侧边问题：{question}\n\n'
-            '请直接、简洁地回答这个侧边问题。'
-        )
+        self._pending_side_question_labels[request_id] = status_label
 
     def _update_side_question_result(self, status_label, text: str, is_error: bool):
         if status_label is None:
@@ -2426,6 +2396,13 @@ class ChatWindow:
             self._handle_permission_request(event)
             return
 
+        if kind == 'side_question':
+            request_id = event.get('request_id') or ''
+            status_label = self._pending_side_question_labels.pop(request_id, None)
+            text = (event.get('text') or '').strip() or '未收到结果'
+            self._update_side_question_result(status_label, text, not bool(event.get('ok')))
+            return
+
         if kind == 'done':
             self._set_busy(False)
             self._update_total_tokens(event.get('total_tokens'))
@@ -2612,7 +2589,12 @@ class ChatWindow:
     def _set_busy(self, busy: bool):
         self._busy = busy
         if self.send_button is not None:
-            self.send_button.config(state=tk.DISABLED if busy else tk.NORMAL)
+            # Keep send available so local commands like /btw can still be sent
+            # during an active turn. Busy-time sends are rerouted to /btw.
+            self.send_button.config(
+                state=tk.NORMAL,
+                text='我插个话...' if busy else '发送',
+            )
 
     def _append_inline_status(self, text: str):
         if self.text_area is None:
@@ -3251,6 +3233,17 @@ class ChatWindow:
         self._user_avatar = ImageTk.PhotoImage(avatar)
         return self._user_avatar
 
+    def _build_message_layout(self, text: str, text_width_chars: int) -> tuple[str, int, bool]:
+        plain_text = self._markdown_to_plain_text(text)
+        full_line_count = self._calc_text_display_lines(plain_text, text_width_chars, max_lines=999)
+        is_collapsible = full_line_count > MAX_COLLAPSED_MESSAGE_LINES
+        visible_lines = self._calc_text_display_lines(
+            plain_text,
+            text_width_chars,
+            max_lines=MAX_COLLAPSED_MESSAGE_LINES if is_collapsible else 40,
+        )
+        return plain_text, visible_lines, is_collapsible
+
     def _create_message_widget(self, role: str, text: str):
         container = tk.Frame(self.text_area, bg=self.colors['panel'], width=self._transcript_width)
         is_user = role == 'user'
@@ -3290,7 +3283,7 @@ class ChatWindow:
             bubble_wrap.pack(anchor='e', fill=tk.X)
 
             text_width_chars = self._pixels_to_chars(520)
-            text_height = self._calc_text_display_lines(self._markdown_to_plain_text(text), text_width_chars)
+            plain_text, text_height, is_collapsible = self._build_message_layout(text, text_width_chars)
             bubble = tk.Text(
                 bubble_wrap,
                 font=self.fonts['base'],
@@ -3316,7 +3309,22 @@ class ChatWindow:
             bubble.pack(anchor='e')
             container._message_bubble = bubble
             container._message_text = text
+            container._message_plain_text = plain_text
+            container._message_is_expanded = not is_collapsible
             self._bind_message_copy_events(bubble, text)
+
+            if is_collapsible:
+                toggle = tk.Label(
+                    content_col,
+                    text='展开全文',
+                    font=self.fonts['small'],
+                    bg=self.colors['panel'],
+                    fg=self.colors['accent'],
+                    cursor='hand2',
+                )
+                toggle.pack(anchor='e', pady=(6, 0))
+                container._message_toggle = toggle
+                toggle.bind('<Button-1>', lambda _event, item=container: self._toggle_message_expand(item), add='+')
 
             meta = tk.Frame(content_col, bg=self.colors['panel'])
             meta.pack(anchor='e', pady=(6, 0))
@@ -3350,7 +3358,7 @@ class ChatWindow:
             content_col.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
             text_width_chars = self._pixels_to_chars(520)
-            text_height = self._calc_text_display_lines(self._markdown_to_plain_text(text), text_width_chars)
+            plain_text, text_height, is_collapsible = self._build_message_layout(text, text_width_chars)
             bubble = tk.Text(
                 content_col,
                 font=self.fonts['base'],
@@ -3376,7 +3384,22 @@ class ChatWindow:
             bubble.pack(anchor='w')
             container._message_bubble = bubble
             container._message_text = text
+            container._message_plain_text = plain_text
+            container._message_is_expanded = not is_collapsible
             self._bind_message_copy_events(bubble, text)
+
+            if is_collapsible:
+                toggle = tk.Label(
+                    content_col,
+                    text='展开全文',
+                    font=self.fonts['small'],
+                    bg=self.colors['panel'],
+                    fg=self.colors['accent'],
+                    cursor='hand2',
+                )
+                toggle.pack(anchor='w', pady=(6, 0))
+                container._message_toggle = toggle
+                toggle.bind('<Button-1>', lambda _event, item=container: self._toggle_message_expand(item), add='+')
 
             meta = tk.Frame(content_col, bg=self.colors['panel'])
             meta.pack(anchor='w', pady=(6, 0))
@@ -3395,11 +3418,38 @@ class ChatWindow:
                 fg=self.colors['subtext'],
             ).pack(side=tk.LEFT, padx=(10, 0))
 
-        container.update_idletasks()
+        row.update_idletasks()
         container.configure(width=self._transcript_width, height=row.winfo_reqheight())
         container.pack_propagate(False)
         self._message_widgets.append(container)
         return container
+
+    def _toggle_message_expand(self, container):
+        bubble = getattr(container, '_message_bubble', None)
+        plain_text = getattr(container, '_message_plain_text', '')
+        toggle = getattr(container, '_message_toggle', None)
+        if bubble is None or not bubble.winfo_exists():
+            return 'break'
+
+        expanded = bool(getattr(container, '_message_is_expanded', False))
+        container._message_is_expanded = not expanded
+        char_width = int(bubble.cget('width')) if str(bubble.cget('width')).isdigit() else self._pixels_to_chars(self._transcript_width - 60)
+        bubble.configure(
+            height=self._calc_text_display_lines(
+                plain_text,
+                char_width,
+                max_lines=MAX_COLLAPSED_MESSAGE_LINES if expanded else 40,
+            )
+        )
+        if toggle is not None and toggle.winfo_exists():
+            toggle.config(text='展开全文' if expanded else '收起')
+        try:
+            container.update_idletasks()
+            container.configure(height=container.winfo_reqheight())
+        except Exception:
+            pass
+        self._maybe_follow_transcript_end()
+        return 'break'
 
     def _append_message(self, role: str, text: str, *, record_history: bool = True):
         reminder_text = self._translate_system_reminder(text)
@@ -3426,23 +3476,30 @@ class ChatWindow:
             self._conversation_history = self._conversation_history[-12:]
 
     def _configure_markdown_tags(self, widget: tk.Text):
-        base_font = tkfont.Font(font=self.fonts['base'])
-        strong_font = tkfont.Font(font=self.fonts['base'])
-        strong_font.configure(weight='bold')
-        code_font = tkfont.Font(family='Consolas', size=max(9, int(base_font.cget('size')) - 1))
-        h1_font = tkfont.Font(font=self.fonts['base'])
-        h1_font.configure(weight='bold', size=max(int(base_font.cget('size')) + 5, 16))
-        h2_font = tkfont.Font(font=self.fonts['base'])
-        h2_font.configure(weight='bold', size=max(int(base_font.cget('size')) + 3, 14))
-        h3_font = tkfont.Font(font=self.fonts['base'])
-        h3_font.configure(weight='bold', size=max(int(base_font.cget('size')) + 1, 13))
-        widget._markdown_fonts = {
-            'strong': strong_font,
-            'code': code_font,
-            'h1': h1_font,
-            'h2': h2_font,
-            'h3': h3_font,
-        }
+        if self._markdown_fonts is None:
+            base_font = tkfont.Font(font=self.fonts['base'])
+            strong_font = tkfont.Font(font=self.fonts['base'])
+            strong_font.configure(weight='bold')
+            code_font = tkfont.Font(family='Consolas', size=max(9, int(base_font.cget('size')) - 1))
+            h1_font = tkfont.Font(font=self.fonts['base'])
+            h1_font.configure(weight='bold', size=max(int(base_font.cget('size')) + 5, 16))
+            h2_font = tkfont.Font(font=self.fonts['base'])
+            h2_font.configure(weight='bold', size=max(int(base_font.cget('size')) + 3, 14))
+            h3_font = tkfont.Font(font=self.fonts['base'])
+            h3_font.configure(weight='bold', size=max(int(base_font.cget('size')) + 1, 13))
+            self._markdown_fonts = {
+                'strong': strong_font,
+                'code': code_font,
+                'h1': h1_font,
+                'h2': h2_font,
+                'h3': h3_font,
+            }
+        strong_font = self._markdown_fonts['strong']
+        code_font = self._markdown_fonts['code']
+        h1_font = self._markdown_fonts['h1']
+        h2_font = self._markdown_fonts['h2']
+        h3_font = self._markdown_fonts['h3']
+        widget._markdown_fonts = self._markdown_fonts
         widget.tag_configure('md_h1', font=h1_font, spacing1=8, spacing3=4)
         widget.tag_configure('md_h2', font=h2_font, spacing1=6, spacing3=4)
         widget.tag_configure('md_h3', font=h3_font, spacing1=6, spacing3=3)
@@ -3712,7 +3769,14 @@ class ChatWindow:
     def _render_tool_result_terminal(self, text: str):
         """工具结果——逐行 diff 着色。"""
         has_diff = False
-        for line in text.split('\n'):
+        raw_text = text or ''
+        truncated_by_chars = len(raw_text) > MAX_INLINE_TOOL_RESULT_CHARS
+        display_text = raw_text[:MAX_INLINE_TOOL_RESULT_CHARS] if truncated_by_chars else raw_text
+        lines = display_text.split('\n')
+        truncated_by_lines = len(lines) > MAX_INLINE_TOOL_RESULT_LINES
+        visible_lines = lines[:MAX_INLINE_TOOL_RESULT_LINES]
+
+        for line in visible_lines:
             stripped = line.rstrip('\r')
             if stripped.startswith('+') and not stripped.startswith('+++'):
                 self.text_area.insert(tk.END, '⎿ ' + stripped + '\n', ('diff_add',))
@@ -3725,17 +3789,17 @@ class ChatWindow:
                 has_diff = True
             else:
                 self.text_area.insert(tk.END, '⎿ ' + stripped + '\n', ('term_result',))
-        # 如果没有 diff 行，给一个简洁摘要
-        if not has_diff and len(text) > 300:
-            first_line = text.split('\n')[0].strip()
-            if len(first_line) > 200:
-                first_line = first_line[:200] + '...'
-            # 已经作为普通行插入了，这里只做截断提示
-            if len(text.split('\n')) > 20:
-                self.text_area.insert(
-                    tk.END, '⎿ ...（输出过长，共 {} 行）\n'.format(len(text.split('\n'))),
-                    ('term_result',),
-                )
+        if truncated_by_chars or truncated_by_lines:
+            total_lines = raw_text.count('\n') + (1 if raw_text else 0)
+            self.text_area.insert(
+                tk.END,
+                '⎿ ...（输出过长，已显示前 {} 行 / {} 字符，共约 {} 行）\n'.format(
+                    len(visible_lines),
+                    min(len(raw_text), MAX_INLINE_TOOL_RESULT_CHARS),
+                    total_lines,
+                ),
+                ('term_result',),
+            )
 
     def _render_system_info_terminal(self, text: str):
         compact = self._task_progress_compact_text(text)
@@ -3875,14 +3939,14 @@ class ChatWindow:
         except Exception:
             return 50
 
-    def _calc_text_display_lines(self, text: str, char_width: int) -> int:
+    def _calc_text_display_lines(self, text: str, char_width: int, *, max_lines: int = 40) -> int:
         """估算文本在给定字符宽度下所需的显示行数。"""
         lines = text.count('\n') + 1
         # 为每行中超出宽度的部分增加额外的换行估算
         for line in text.split('\n'):
             if len(line) > char_width:
                 lines += len(line) // char_width
-        return max(1, min(lines, 40))
+        return max(1, min(lines, max_lines))
 
     def _copy_to_clipboard(self, text: str):
         """将文本复制到系统剪贴板。"""
@@ -3974,6 +4038,13 @@ class ChatWindow:
             except Exception:
                 pass
             self._connection_time_timer = None
+
+        if self._terminal_sync_job is not None:
+            try:
+                self.window.after_cancel(self._terminal_sync_job)
+            except Exception:
+                pass
+            self._terminal_sync_job = None
 
         if self._terminal_view is not None:
             self._terminal_view.hide(notify=False)
