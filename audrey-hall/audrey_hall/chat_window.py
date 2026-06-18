@@ -50,6 +50,7 @@ CHOICE_PROMPT_CUES = (
     '选一个', '选哪一个', '告诉我你的选择', '回复对应选项', '怎么选',
 )
 TASK_TOOL_PREFIXES = ('task',)
+ASK_USER_QUESTION_TOOL_NAME = 'AskUserQuestion'
 LOCAL_ONLY_COMMANDS = {'model', 'mode', 'btw', 'raw'}
 SUPPORTED_IMAGE_FORMATS = {
     'PNG': 'image/png',
@@ -150,6 +151,7 @@ class ChatWindow:
         self._busy = False
         self._auto_allow_tools = set()  # 用户选择“总是允许”的工具名
         self._pending_perm_frames = {}  # request_id -> 内嵌权限卡片 frame
+        self._pending_question_cards = {}
         self._pending_side_question_labels = {}
         self._conversation_history = []
         self._active_model = 'default'
@@ -253,6 +255,7 @@ class ChatWindow:
         self._busy = False
         self._set_busy(False)
         self._pending_perm_frames = {}
+        self._pending_question_cards = {}
         self._pending_side_question_labels = {}
         self._last_status_texts.clear()
         self._last_thinking_tokens = None
@@ -2445,6 +2448,11 @@ class ChatWindow:
     def _handle_permission_request(self, event: dict):
         tool_name = event.get('tool_name') or '未知工具'
         request_id = event.get('request_id')
+        input_payload = event.get('input') or {}
+
+        if self._is_ask_user_question_request(tool_name, input_payload):
+            self._show_ask_user_question_card(request_id, input_payload)
+            return
 
         # 该工具已被“总是允许” -> 直接放行，不再打扰
         if tool_name in self._auto_allow_tools:
@@ -2454,12 +2462,212 @@ class ChatWindow:
                 'working',
                 {
                     'tool_name': tool_name,
-                    'input': event.get('input') or {},
+                    'input': input_payload,
                 },
             )
             return
 
-        self._show_permission_card(request_id, tool_name, event.get('input') or {})
+        self._show_permission_card(request_id, tool_name, input_payload)
+
+    def _is_ask_user_question_request(self, tool_name: str, input_payload) -> bool:
+        if str(tool_name or '').strip() != ASK_USER_QUESTION_TOOL_NAME:
+            return False
+        return isinstance(input_payload, dict) and isinstance(input_payload.get('questions'), list)
+
+    def _show_ask_user_question_card(self, request_id, input_payload):
+        questions = input_payload.get('questions') if isinstance(input_payload, dict) else None
+        if not request_id or not isinstance(questions, list) or not questions:
+            self._show_permission_card(request_id, ASK_USER_QUESTION_TOOL_NAME, input_payload or {})
+            return
+
+        card = create_card(
+            self.text_area,
+            self.theme,
+            bg='assistant',
+            border='accent',
+        )
+        tk.Label(
+            card,
+            text='奥黛丽想问你',
+            font=self.fonts['control'],
+            bg=self.colors['assistant'],
+            fg=self.colors['text'],
+            anchor='w',
+        ).pack(fill=tk.X, padx=10, pady=(8, 4))
+        tk.Label(
+            card,
+            text='这不是权限请求，请直接选择答案。',
+            font=self.fonts['small'],
+            bg=self.colors['assistant'],
+            fg=self.colors['muted'],
+            anchor='w',
+        ).pack(fill=tk.X, padx=10, pady=(0, 8))
+
+        selected_answers = {}
+        question_vars = []
+
+        for index, question in enumerate(questions):
+            if not isinstance(question, dict):
+                continue
+            question_text = str(question.get('question') or '').strip()
+            header = str(question.get('header') or '').strip()
+            options = question.get('options') if isinstance(question.get('options'), list) else []
+            multi_select = bool(question.get('multiSelect'))
+            if not question_text or len(options) < 2:
+                continue
+
+            section = tk.Frame(card, bg=self.colors['assistant'])
+            section.pack(fill=tk.X, padx=10, pady=(0, 10))
+            title = header or f'问题 {index + 1}'
+            tk.Label(
+                section,
+                text=title,
+                font=self.fonts['small'],
+                bg=self.colors['assistant'],
+                fg=self.colors['gold'],
+                anchor='w',
+            ).pack(fill=tk.X)
+            tk.Label(
+                section,
+                text=question_text,
+                font=self.fonts['base'],
+                bg=self.colors['assistant'],
+                fg=self.colors['text'],
+                justify='left',
+                anchor='w',
+                wraplength=self.chat_theme['permission_wraplength'],
+            ).pack(fill=tk.X, pady=(2, 6))
+
+            if multi_select:
+                option_state = []
+                for option in options:
+                    if not isinstance(option, dict):
+                        continue
+                    label = str(option.get('label') or '').strip()
+                    description = str(option.get('description') or '').strip()
+                    if not label:
+                        continue
+                    var = tk.BooleanVar(value=False)
+                    option_state.append((label, var))
+                    row = tk.Frame(section, bg=self.colors['assistant'])
+                    row.pack(fill=tk.X, pady=(0, 4))
+                    tk.Checkbutton(
+                        row,
+                        text=label,
+                        variable=var,
+                        bg=self.colors['assistant'],
+                        fg=self.colors['text'],
+                        activebackground=self.colors['assistant'],
+                        activeforeground=self.colors['text'],
+                        selectcolor=self.colors['panel'],
+                        anchor='w',
+                        justify='left',
+                        font=self.fonts['control'],
+                        highlightthickness=0,
+                        bd=0,
+                    ).pack(anchor='w')
+                    if description:
+                        tk.Label(
+                            row,
+                            text=description,
+                            font=self.fonts['small'],
+                            bg=self.colors['assistant'],
+                            fg=self.colors['muted'],
+                            justify='left',
+                            anchor='w',
+                            wraplength=self.chat_theme['permission_wraplength'],
+                        ).pack(fill=tk.X, padx=(24, 0))
+                question_vars.append(('multi', question_text, option_state))
+            else:
+                var = tk.StringVar(value='')
+                question_vars.append(('single', question_text, var))
+                for option in options:
+                    if not isinstance(option, dict):
+                        continue
+                    label = str(option.get('label') or '').strip()
+                    description = str(option.get('description') or '').strip()
+                    if not label:
+                        continue
+                    button_text = label if not description else f'{label}\n{description}'
+                    create_button(
+                        section,
+                        text=button_text,
+                        command=lambda selected=label, var_ref=var: var_ref.set(selected),
+                        theme=self.theme,
+                        variant='secondary',
+                        font=self.fonts['control'],
+                        padx=12,
+                        pady=6,
+                        justify='left',
+                        anchor='w',
+                        wraplength=self.chat_theme['permission_wraplength'],
+                    ).pack(fill=tk.X, pady=(0, 6))
+
+        status_label = tk.Label(
+            card,
+            text='请选择答案后再提交。',
+            font=self.fonts['small'],
+            bg=self.colors['assistant'],
+            fg=self.colors['muted'],
+            justify='left',
+            anchor='w',
+            wraplength=self.chat_theme['permission_wraplength'],
+        )
+        status_label.pack(fill=tk.X, padx=10, pady=(0, 8))
+
+        def submit_answers():
+            answers = {}
+            for kind, question_text, state in question_vars:
+                if kind == 'single':
+                    selected = state.get().strip()
+                    if not selected:
+                        status_label.config(text='还有问题没选答案。', fg=self.colors['accent_dark'])
+                        return
+                    answers[question_text] = selected
+                else:
+                    selected = [label for label, var in state if var.get()]
+                    if not selected:
+                        status_label.config(text='还有多选题未选择。', fg=self.colors['accent_dark'])
+                        return
+                    answers[question_text] = ', '.join(selected)
+
+            updated_input = dict(input_payload)
+            updated_input['answers'] = answers
+            self.session.respond_permission(request_id, True, updated_input=updated_input)
+            self._pending_question_cards.pop(request_id, None)
+            status_label.config(text='已提交答案，奥黛丽继续处理中...', fg=self.colors['muted'])
+            self._append_inline_status('已回答奥黛丽的问题')
+
+        def decline_answers():
+            self.session.respond_permission(request_id, False)
+            self._pending_question_cards.pop(request_id, None)
+            self._destroy_widget(card)
+
+        action_row = tk.Frame(card, bg=self.colors['assistant'])
+        action_row.pack(fill=tk.X, padx=10, pady=(0, 10))
+        create_button(
+            action_row,
+            text='提交答案',
+            command=submit_answers,
+            theme=self.theme,
+            variant='primary',
+            font=self.fonts['control'],
+            padx=12,
+            pady=7,
+        ).pack(side=tk.LEFT)
+        create_button(
+            action_row,
+            text='拒绝回答',
+            command=decline_answers,
+            theme=self.theme,
+            variant='secondary',
+            font=self.fonts['control'],
+            padx=12,
+            pady=7,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+
+        self._insert_inline_card(card)
+        self._pending_question_cards[request_id] = card
 
     def _show_permission_card(self, request_id, tool_name, input_payload):
         """在对话流中内嵌一张权限确认卡片，不再弹出抢焦点的模态窗。"""

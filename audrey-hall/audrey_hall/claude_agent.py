@@ -398,7 +398,7 @@ class ClaudeCodeSession:
             }
         )
 
-    def respond_permission(self, request_id: str, allow: bool):
+    def respond_permission(self, request_id: str, allow: bool, updated_input: dict | None = None):
         request = self._pending_permissions.pop(request_id, None)
         if request is None:
             return
@@ -412,9 +412,10 @@ class ClaudeCodeSession:
         # updatedInput 传 {} 表示“沿用工具原始参数”。
         tool_use_id = request.get('tool_use_id')
         if allow:
+            normalized_input = updated_input if isinstance(updated_input, dict) else {}
             decision = {
                 'behavior': 'allow',
-                'updatedInput': {},
+                'updatedInput': normalized_input,
             }
         else:
             decision = {
