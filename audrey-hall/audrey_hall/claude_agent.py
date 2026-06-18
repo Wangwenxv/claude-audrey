@@ -242,6 +242,7 @@ class ClaudeCodeSession:
         if isinstance(subtype, str) and subtype:
             self._pending_control_requests[request_id] = subtype
         self._write_json(payload)
+        return request_id
 
     def start(self):
         if self.process is not None:
@@ -374,8 +375,14 @@ class ClaudeCodeSession:
         self._connection_source = CONNECTION_TARGET_LABELS['system']
         return self._get_system_command()
 
-    def send_user_message(self, text: str):
-        if not text.strip():
+    def send_user_message(self, content: str | list[dict]):
+        if isinstance(content, str):
+            if not content.strip():
+                return
+        elif isinstance(content, list):
+            if not content:
+                return
+        else:
             return
         self._ensure_started()
         self._write_json(
@@ -383,7 +390,7 @@ class ClaudeCodeSession:
                 'type': 'user',
                 'message': {
                     'role': 'user',
-                    'content': text,
+                    'content': content,
                 },
                 'parent_tool_use_id': None,
                 'session_id': self._session_id,
@@ -391,7 +398,7 @@ class ClaudeCodeSession:
             }
         )
 
-    def respond_permission(self, request_id: str, allow: bool):
+    def respond_permission(self, request_id: str, allow: bool, updated_input: dict | None = None):
         request = self._pending_permissions.pop(request_id, None)
         if request is None:
             return
@@ -405,9 +412,10 @@ class ClaudeCodeSession:
         # updatedInput 传 {} 表示“沿用工具原始参数”。
         tool_use_id = request.get('tool_use_id')
         if allow:
+            normalized_input = updated_input if isinstance(updated_input, dict) else {}
             decision = {
                 'behavior': 'allow',
-                'updatedInput': {},
+                'updatedInput': normalized_input,
             }
         else:
             decision = {
@@ -456,6 +464,17 @@ class ClaudeCodeSession:
             {
                 'subtype': 'set_permission_mode',
                 'mode': mode,
+            }
+        )
+
+    def send_side_question(self, question: str) -> str | None:
+        normalized = question.strip() if isinstance(question, str) else ''
+        if not normalized:
+            return None
+        return self._send_control_request(
+            {
+                'subtype': 'side_question',
+                'question': normalized,
             }
         )
 
@@ -626,6 +645,27 @@ class ClaudeCodeSession:
                     {
                         'kind': 'permission_mode',
                         'mode': payload.get('mode'),
+                        'request_id': request_id,
+                        'session_id': self._session_id,
+                    }
+                )
+            elif response.get('subtype') == 'success' and request_subtype == 'side_question':
+                payload = response.get('response') or {}
+                self._emit(
+                    {
+                        'kind': 'side_question',
+                        'ok': True,
+                        'text': _extract_string(payload.get('response')),
+                        'request_id': request_id,
+                        'session_id': self._session_id,
+                    }
+                )
+            elif response.get('subtype') == 'error' and request_subtype == 'side_question':
+                self._emit(
+                    {
+                        'kind': 'side_question',
+                        'ok': False,
+                        'text': response.get('error') or '旁路问题执行失败',
                         'request_id': request_id,
                         'session_id': self._session_id,
                     }

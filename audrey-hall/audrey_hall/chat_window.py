@@ -1,14 +1,23 @@
+import base64
+import io
 import json
 import os
 import queue
 import re
 import threading
+import time
 import tkinter as tk
 import tkinter.font as tkfont
+from tkinter import filedialog
 from datetime import datetime
 from pathlib import Path
 
 from PIL import Image, ImageTk
+
+try:
+    from PIL import ImageGrab
+except Exception:
+    ImageGrab = None
 
 from .claude_agent import (
     CONNECTION_TARGET_LABELS,
@@ -41,14 +50,33 @@ CHOICE_PROMPT_CUES = (
     '选一个', '选哪一个', '告诉我你的选择', '回复对应选项', '怎么选',
 )
 TASK_TOOL_PREFIXES = ('task',)
+ASK_USER_QUESTION_TOOL_NAME = 'AskUserQuestion'
+LOCAL_ONLY_COMMANDS = {'model', 'mode', 'btw', 'raw'}
+SUPPORTED_IMAGE_FORMATS = {
+    'PNG': 'image/png',
+    'JPEG': 'image/jpeg',
+    'JPG': 'image/jpeg',
+    'GIF': 'image/gif',
+    'WEBP': 'image/webp',
+}
+WELCOME_MESSAGE = (
+    '不属于这个时代的愚者...\n\n'
+    '灰雾之上的神秘主宰...\n\n'
+    '执掌好运的黄黑之王...\n\n \n\n'
+    '按 Ctrl+Enter 发送，Ctrl+V 可粘贴图片，也可以点“上传图片”。'
+)
 
-MAX_SIDE_CONTEXT_MESSAGES = 6
-MAX_SIDE_CONTEXT_CHARS = 2800
 MAX_STATUS_WIDTH_PX = 600
 MIN_STATUS_CORE_WIDTH_PX = 180
 MAX_HISTORY_SESSIONS = 18
 MAX_HISTORY_LABEL_CHARS = 7
 EVENT_POLL_INTERVAL_MS = 100
+EVENT_DRAIN_BUDGET_MS = 12
+EVENT_BATCH_LIMIT = 80
+INLINE_STATUS_DEBOUNCE_MS = 120
+MAX_COLLAPSED_MESSAGE_LINES = 12
+MAX_INLINE_TOOL_RESULT_CHARS = 12000
+MAX_INLINE_TOOL_RESULT_LINES = 120
 CONNECTION_TARGET_CHOICES = [
     ('auto', '自动抉择'),
     ('project', '奥黛丽agent'),
@@ -117,11 +145,14 @@ class ChatWindow:
         self._task_widget_done_font = None
         self._tool_status_widget = None
         self._tool_status_font = None
+        self._auto_follow_transcript = True
         self.status_var = tk.StringVar(value='正在唤醒奥黛丽的助手...')
         self._event_queue = queue.Queue()
         self._busy = False
         self._auto_allow_tools = set()  # 用户选择“总是允许”的工具名
         self._pending_perm_frames = {}  # request_id -> 内嵌权限卡片 frame
+        self._pending_question_cards = {}
+        self._pending_side_question_labels = {}
         self._conversation_history = []
         self._active_model = 'default'
         self._active_permission_mode = 'default'
@@ -158,6 +189,15 @@ class ChatWindow:
         self._terminal_view = None
         self._terminal_view_visible = False
         self._terminal_button = None
+        self._terminal_sync_job = None
+        self._inline_status_job = None
+        self._pending_inline_status_text = None
+        self._last_status_var_text = ''
+        self._status_measure_font = None
+        self._status_text_px_cache = {}
+        self._markdown_fonts = None
+        self._pending_image_attachments = []
+        self._attachment_preview_frame = None
 
         self.theme = get_theme()
         self.fonts = self.theme['fonts']
@@ -215,6 +255,8 @@ class ChatWindow:
         self._busy = False
         self._set_busy(False)
         self._pending_perm_frames = {}
+        self._pending_question_cards = {}
+        self._pending_side_question_labels = {}
         self._last_status_texts.clear()
         self._last_thinking_tokens = None
         self._current_total_tokens = None
@@ -270,7 +312,7 @@ class ChatWindow:
             return
         terminal_view = self._ensure_terminal_view()
         initial_events = None
-        if not terminal_view.is_open() and not getattr(terminal_view, '_events', None):
+        if not terminal_view.is_open():
             initial_events = self.session.terminal_events_snapshot()
         terminal_view.show(initial_events=initial_events, host_window=self.window)
         self._terminal_view_visible = True
@@ -296,6 +338,17 @@ class ChatWindow:
     def _handle_window_configure(self, event):
         if self.window is None or event.widget is not self.window:
             return
+        if not self._terminal_view_visible:
+            return
+        if self._terminal_sync_job is not None:
+            try:
+                self.window.after_cancel(self._terminal_sync_job)
+            except Exception:
+                pass
+        self._terminal_sync_job = self.window.after(80, self._flush_terminal_view_sync)
+
+    def _flush_terminal_view_sync(self):
+        self._terminal_sync_job = None
         self._sync_terminal_view_position()
 
     def _update_connection_time(self):
@@ -488,12 +541,20 @@ class ChatWindow:
                 bubble = getattr(widget, '_message_bubble', None)
                 raw_text = getattr(widget, '_message_text', '')
                 if bubble is not None and bubble.winfo_exists() and char_width_changed:
+                    plain_text = getattr(widget, '_message_plain_text', self._markdown_to_plain_text(raw_text))
+                    is_expanded = bool(getattr(widget, '_message_is_expanded', True))
                     bubble.configure(
                         width=msg_char_width,
                         height=self._calc_text_display_lines(
-                            self._markdown_to_plain_text(raw_text),
+                            plain_text,
                             msg_char_width,
+                            max_lines=40 if is_expanded else MAX_COLLAPSED_MESSAGE_LINES,
                         ),
+                    )
+                    widget._message_full_line_count = self._calc_text_display_lines(
+                        plain_text,
+                        msg_char_width,
+                        max_lines=999,
                     )
                 live_widgets.append(widget)
             except Exception:
@@ -515,7 +576,40 @@ class ChatWindow:
             pass
         self._last_message_char_width = msg_char_width
         if was_at_bottom:
-            self.text_area.after(10, lambda: self.text_area.see(tk.END))
+            self.text_area.after(10, self._maybe_follow_transcript_end)
+
+    def _capture_transcript_follow_state(self):
+        if self.text_area is None:
+            self._auto_follow_transcript = True
+            return self._auto_follow_transcript
+        try:
+            yview = self.text_area.yview()
+            self._auto_follow_transcript = yview[1] >= 0.98
+        except Exception:
+            self._auto_follow_transcript = True
+        return self._auto_follow_transcript
+
+    def _maybe_follow_transcript_end(self):
+        if self.text_area is None or not self._auto_follow_transcript:
+            return
+        try:
+            self.text_area.see(tk.END)
+        except Exception:
+            pass
+
+    def _handle_transcript_scroll_activity(self, _event=None):
+        self._capture_transcript_follow_state()
+
+    def _handle_transcript_yscroll(self, first, last):
+        if self.text_area is None:
+            return
+        try:
+            self._auto_follow_transcript = float(last) >= 0.98
+        except Exception:
+            pass
+        scrollbar = getattr(self, '_transcript_scrollbar', None)
+        if scrollbar is not None:
+            scrollbar.set(first, last)
 
     def _schedule_ui(self, callback):
         if self.window is None:
@@ -736,9 +830,22 @@ class ChatWindow:
         # 挤出窗口——之前正是这个问题导致"只有会话、看不到输入框"。
         button_row = tk.Frame(content_frame, bg=self.colors['bg'])
         button_row.pack(side=tk.BOTTOM, fill=tk.X, pady=(self.window_theme['button_gap'], 0))
+        status_row = tk.Frame(button_row, bg=self.colors['bg'])
+        status_row.pack(fill=tk.X)
+        action_row_primary = tk.Frame(button_row, bg=self.colors['bg'])
+        action_row_primary.pack(fill=tk.X, pady=(8, 0))
+        action_row_secondary = tk.Frame(button_row, bg=self.colors['bg'])
+        action_row_secondary.pack(fill=tk.X, pady=(8, 0))
+        action_group_primary = tk.Frame(action_row_primary, bg=self.colors['bg'])
+        action_group_primary.pack(side=tk.RIGHT)
+        action_group_secondary = tk.Frame(action_row_secondary, bg=self.colors['bg'])
+        action_group_secondary.pack(side=tk.RIGHT)
 
         composer = tk.Frame(content_frame, bg=self.colors['bg'])
         composer.pack(side=tk.BOTTOM, fill=tk.X, pady=(self.window_theme['composer_gap'], 0))
+
+        self._attachment_preview_frame = tk.Frame(composer, bg=self.colors['bg'])
+        self._attachment_preview_frame.pack(fill=tk.X, pady=(0, 6))
 
         input_shell = tk.Canvas(
             composer,
@@ -759,6 +866,7 @@ class ChatWindow:
 
         scrollbar = tk.Scrollbar(transcript_frame)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self._transcript_scrollbar = scrollbar
 
         self.text_area = tk.Text(
             transcript_frame,
@@ -769,12 +877,19 @@ class ChatWindow:
             bd=0,
             padx=self.chat_theme['transcript_pad_x'],
             pady=self.chat_theme['transcript_pad_y'],
-            yscrollcommand=scrollbar.set,
+            yscrollcommand=self._handle_transcript_yscroll,
             state=tk.DISABLED,
         )
         self.text_area.pack(fill=tk.BOTH, expand=True)
         self._transcript_container = transcript_frame
         scrollbar.config(command=self.text_area.yview)
+        self.text_area.bind('<MouseWheel>', self._handle_transcript_scroll_activity, add='+')
+        self.text_area.bind('<Button-4>', self._handle_transcript_scroll_activity, add='+')
+        self.text_area.bind('<Button-5>', self._handle_transcript_scroll_activity, add='+')
+        self.text_area.bind('<Prior>', self._handle_transcript_scroll_activity, add='+')
+        self.text_area.bind('<Next>', self._handle_transcript_scroll_activity, add='+')
+        scrollbar.bind('<ButtonPress-1>', self._handle_transcript_scroll_activity, add='+')
+        scrollbar.bind('<B1-Motion>', self._handle_transcript_scroll_activity, add='+')
 
         def sync_transcript_width(event):
             new_width = max(320, event.width - self.chat_theme['transcript_pad_x'] * 2 - 24)
@@ -884,9 +999,12 @@ class ChatWindow:
             add='+',
         )
         self.input_box.bind('<Control-Return>', self._handle_send_shortcut)
+        self.input_box.bind('<Control-v>', self._handle_input_paste, add='+')
+        self.input_box.bind('<Control-V>', self._handle_input_paste, add='+')
+        self.input_box.bind('<<Paste>>', self._handle_input_paste, add='+')
 
         tk.Label(
-            button_row,
+            status_row,
             textvariable=self.status_var,
             font=self.fonts['small'],
             bg=self.colors['bg'],
@@ -894,47 +1012,59 @@ class ChatWindow:
         ).pack(side=tk.LEFT)
 
         self.stop_button = create_button(
-            button_row,
+            action_group_primary,
             text='中止对话',
             command=self._on_stop,
             theme=self.theme,
             variant='secondary',
-            width=10,
+            width=14,
             font=self.fonts['control'],
             style_overrides=self._aurora_button_style(),
         )
-        self.stop_button.pack(side=tk.RIGHT, padx=(8, 0))
+        self.stop_button.pack(side=tk.LEFT, padx=(0, 8))
+
+        upload_button = create_button(
+            action_group_secondary,
+            text='上传图片',
+            command=self._handle_image_upload,
+            theme=self.theme,
+            variant='secondary',
+            width=14,
+            font=self.fonts['control'],
+            style_overrides=self._aurora_button_style(),
+        )
+        upload_button.pack(side=tk.LEFT, padx=(0, 8))
 
         self.send_button = create_button(
-            button_row,
+            action_group_primary,
             text='发送',
             command=self._on_send,
             theme=self.theme,
             variant='secondary',
-            width=10,
+            width=14,
             font=self.fonts['control'],
             style_overrides=self._aurora_button_style(),
         )
-        self.send_button.pack(side=tk.RIGHT)
+        self.send_button.pack(side=tk.LEFT, padx=(0, 8))
 
         clear_button = create_button(
-            button_row,
+            action_group_secondary,
             text='清除对话',
             command=self._clear_conversation,
             theme=self.theme,
             variant='secondary',
-            width=10,
+            width=14,
             font=self.fonts['control'],
             style_overrides=self._aurora_button_style(),
         )
-        clear_button.pack(side=tk.RIGHT, padx=(8, 0))
+        clear_button.pack(side=tk.LEFT, padx=(0, 8))
 
         self._build_history_sidebar(side_panel)
         self._refresh_history_sidebar()
 
         self._append_message(
             'assistant',
-            '不属于这个时代的愚者...\n\n灰雾之上的神秘主宰...\n\n执掌好运的黄黑之王...\n\n \n\n按 Ctrl+Enter 发送。',
+            WELCOME_MESSAGE,
         )
 
     def _build_history_sidebar(self, parent):
@@ -1296,9 +1426,10 @@ class ChatWindow:
             self._reset_transcript_view()
             self._append_message(
                 'assistant',
-                '不属于这个时代的愚者...\n\n灰雾之上的神秘主宰...\n\n执掌好运的黄黑之王...\n\n \n\n按 Ctrl+Enter 发送。',
+                WELCOME_MESSAGE,
             )
             self._append_inline_status('已删除当前会话，准备开启新对话。')
+            self._clear_pending_image_attachments()
             self._reconnect_session(announce=True)
 
         self._delete_session_file(sid)
@@ -1317,9 +1448,10 @@ class ChatWindow:
         self._reset_transcript_view()
         self._append_message(
             'assistant',
-            '不属于这个时代的愚者...\n\n灰雾之上的神秘主宰...\n\n执掌好运的黄黑之王...\n\n \n\n按 Ctrl+Enter 发送。',
+            WELCOME_MESSAGE,
         )
         self._append_inline_status('已清除当前对话，准备开启新会话。')
+        self._clear_pending_image_attachments()
         self._reconnect_session(announce=True)
 
         # 同时删除旧的会话文件，这样侧边栏也会随之更新
@@ -1338,9 +1470,10 @@ class ChatWindow:
         self._reset_transcript_view()
         self._append_message(
             'assistant',
-            '不属于这个时代的愚者...\n\n灰雾之上的神秘主宰...\n\n执掌好运的黄黑之王...\n\n \n\n按 Ctrl+Enter 发送。',
+            WELCOME_MESSAGE,
         )
         self._append_inline_status('已创建新会话。')
+        self._clear_pending_image_attachments()
         self._reconnect_session(announce=True)
         self._refresh_history_sidebar()
 
@@ -1358,6 +1491,7 @@ class ChatWindow:
         self._current_total_tokens = None
         self._current_input_tokens = None
         self._current_output_tokens = None
+        self._clear_pending_image_attachments()
         if self.text_area is not None:
             self.text_area.config(state=tk.NORMAL)
             self.text_area.delete('1.0', tk.END)
@@ -1417,6 +1551,8 @@ class ChatWindow:
                 value = block.get('text')
                 if isinstance(value, str) and value.strip():
                     parts.append(value.strip())
+            elif block_type == 'image':
+                parts.append('[图片]')
             elif block_type == 'thinking':
                 continue
         text = '\n\n'.join(parts).strip()
@@ -1462,25 +1598,270 @@ class ChatWindow:
         self._on_send()
         return 'break'
 
-    def _on_send(self):
-        text = self.input_box.get('1.0', tk.END).strip()
-        if not text:
+    def _handle_input_paste(self, _event=None):
+        added_count = self._add_images_from_clipboard()
+        if added_count > 0:
+            return 'break'
+        return None
+
+    def _is_local_only_command(self, text: str) -> bool:
+        stripped = (text or '').strip()
+        if not stripped.startswith('/'):
+            return False
+        command = stripped[1:].split(None, 1)[0].lower()
+        return command in LOCAL_ONLY_COMMANDS
+
+    def _build_user_message_content(self, text: str):
+        trimmed = (text or '').strip()
+        attachments = list(self._pending_image_attachments)
+        if not attachments:
+            return trimmed
+
+        content = []
+        if trimmed:
+            content.append({'type': 'text', 'text': trimmed})
+        for item in attachments:
+            content.append(
+                {
+                    'type': 'image',
+                    'source': {
+                        'type': 'base64',
+                        'media_type': item['media_type'],
+                        'data': item['data'],
+                    },
+                }
+            )
+        return content
+
+    def _build_user_display_text(self, text: str) -> str:
+        trimmed = (text or '').strip()
+        attachments = list(self._pending_image_attachments)
+        if not attachments:
+            return trimmed
+
+        image_lines = [
+            f"[图片] {item.get('filename') or '未命名图片'}"
+            for item in attachments
+        ]
+        if trimmed:
+            return trimmed + '\n\n' + '\n'.join(image_lines)
+        return '\n'.join(image_lines)
+
+    def _build_prompt_status_text(self, text: str) -> str:
+        trimmed = (text or '').strip()
+        if trimmed:
+            return trimmed
+        count = len(self._pending_image_attachments)
+        return f'发送了 {count} 张图片' if count > 1 else '发送了一张图片'
+
+    def _handle_image_upload(self):
+        paths = filedialog.askopenfilenames(
+            parent=self.window,
+            title='选择要发送的图片',
+            filetypes=[
+                ('图片文件', '*.png *.jpg *.jpeg *.gif *.webp *.bmp'),
+                ('所有文件', '*.*'),
+            ],
+        )
+        if not paths:
             return
 
-        if self._handle_local_command(text):
+        added_count = 0
+        for raw_path in paths:
+            attachment = self._load_image_attachment_from_path(raw_path)
+            if attachment is None:
+                continue
+            self._pending_image_attachments.append(attachment)
+            added_count += 1
+
+        if added_count == 0:
+            self._append_inline_status('没有成功读取可发送的图片。')
+            return
+
+        self._refresh_attachment_preview()
+        self.status_var.set(f'已添加 {added_count} 张图片，等待发送。')
+        if self.input_box is not None:
+            self.input_box.focus_set()
+
+    def _load_image_attachment_from_path(self, raw_path: str):
+        path = Path(raw_path)
+        if not path.exists() or not path.is_file():
+            return None
+        try:
+            with Image.open(path) as image:
+                width, height = image.size
+                detected_format = (image.format or '').upper()
+                if detected_format in SUPPORTED_IMAGE_FORMATS:
+                    media_type = SUPPORTED_IMAGE_FORMATS[detected_format]
+                    data = base64.b64encode(path.read_bytes()).decode('ascii')
+                else:
+                    media_type, data = self._encode_pil_image(image)
+        except Exception as exc:
+            self._append_message('error', f'读取图片失败：{path.name}：{exc}')
+            return None
+
+        return {
+            'filename': path.name,
+            'media_type': media_type,
+            'data': data,
+            'dimensions': (width, height),
+        }
+
+    def _encode_pil_image(self, image: Image.Image) -> tuple[str, str]:
+        normalized = image.copy()
+        if normalized.mode not in ('RGB', 'RGBA'):
+            normalized = normalized.convert('RGBA')
+
+        buffer = io.BytesIO()
+        normalized.save(buffer, format='PNG')
+        return 'image/png', base64.b64encode(buffer.getvalue()).decode('ascii')
+
+    def _add_images_from_clipboard(self) -> int:
+        if ImageGrab is None:
+            return 0
+        try:
+            clipboard_data = ImageGrab.grabclipboard()
+        except Exception:
+            return 0
+
+        added_count = 0
+        if isinstance(clipboard_data, Image.Image):
+            media_type, data = self._encode_pil_image(clipboard_data)
+            self._pending_image_attachments.append(
+                {
+                    'filename': 'clipboard.png',
+                    'media_type': media_type,
+                    'data': data,
+                    'dimensions': clipboard_data.size,
+                }
+            )
+            added_count = 1
+        elif isinstance(clipboard_data, list):
+            for item in clipboard_data:
+                attachment = self._load_image_attachment_from_path(str(item))
+                if attachment is None:
+                    continue
+                self._pending_image_attachments.append(attachment)
+                added_count += 1
+
+        if added_count > 0:
+            self._refresh_attachment_preview()
+            self.status_var.set(f'已从剪贴板添加 {added_count} 张图片。')
+            if self.input_box is not None:
+                self.input_box.focus_set()
+        return added_count
+
+    def _refresh_attachment_preview(self):
+        frame = self._attachment_preview_frame
+        if frame is None:
+            return
+        for child in list(frame.winfo_children()):
+            child.destroy()
+
+        if not self._pending_image_attachments:
+            return
+
+        tk.Label(
+            frame,
+            text=f'待发送图片 {len(self._pending_image_attachments)} 张',
+            font=self.fonts['small'],
+            bg=self.colors['bg'],
+            fg=self.colors['muted'],
+            anchor='w',
+        ).pack(fill=tk.X, pady=(0, 4))
+
+        chips = tk.Frame(frame, bg=self.colors['bg'])
+        chips.pack(fill=tk.X)
+        for index, item in enumerate(self._pending_image_attachments):
+            chip = tk.Frame(chips, bg='#EEF5F2', highlightbackground='#D6E5E0', highlightthickness=1)
+            chip.pack(side=tk.LEFT, padx=(0, 6), pady=(0, 2))
+            dims = item.get('dimensions') or ()
+            size_text = ''
+            if len(dims) == 2:
+                size_text = f' ({dims[0]}x{dims[1]})'
+            tk.Label(
+                chip,
+                text=(item.get('filename') or '图片') + size_text,
+                font=self.fonts['small'],
+                bg='#EEF5F2',
+                fg=self.colors['text'],
+                padx=8,
+                pady=4,
+            ).pack(side=tk.LEFT)
+            remove_button = tk.Label(
+                chip,
+                text='✕',
+                font=self.fonts['small'],
+                bg='#EEF5F2',
+                fg='#B06A6A',
+                cursor='hand2',
+                padx=6,
+            )
+            remove_button.pack(side=tk.LEFT)
+            remove_button.bind(
+                '<Button-1>',
+                lambda _event, idx=index: self._remove_pending_image_attachment(idx),
+                add='+',
+            )
+
+    def _remove_pending_image_attachment(self, index: int):
+        if index < 0 or index >= len(self._pending_image_attachments):
+            return
+        self._pending_image_attachments.pop(index)
+        self._refresh_attachment_preview()
+        if self._pending_image_attachments:
+            self.status_var.set(f'还剩 {len(self._pending_image_attachments)} 张待发送图片。')
+        else:
+            self.status_var.set('图片附件已清空。')
+
+    def _clear_pending_image_attachments(self):
+        if not self._pending_image_attachments:
+            return
+        self._pending_image_attachments = []
+        self._refresh_attachment_preview()
+
+    def _on_send(self):
+        text = self.input_box.get('1.0', tk.END).strip()
+        has_attachments = bool(self._pending_image_attachments)
+        if not text and not has_attachments:
+            return
+
+        if has_attachments and self._is_local_only_command(text):
+            self._append_inline_status('图片附件暂不支持 /model、/mode、/btw、/raw 这类本地命令。')
+            return
+
+        if text and self._handle_local_command(text):
             self.input_box.delete('1.0', tk.END)
             return
 
         if self._busy:
+            if has_attachments:
+                self._append_inline_status('当前正在对话中；图片附件暂不支持旁路插话。')
+                return
+            self._append_inline_status(f'旁路提问：{text}')
+            self._handle_btw_command(text)
+            self.input_box.delete('1.0', tk.END)
             return
 
-        self.input_box.delete('1.0', tk.END)
-        self._submit_prompt(text)
+        display_text = self._build_user_display_text(text)
+        message_content = self._build_user_message_content(text)
+        if self._submit_prompt(message_content, display_text=display_text):
+            self.input_box.delete('1.0', tk.END)
+            self._clear_pending_image_attachments()
 
-    def _submit_prompt(self, text: str, display_text: str | None = None):
-        text = (text or '').strip()
-        if not text:
-            return
+    def _submit_prompt(self, message_content: str | list[dict], display_text: str | None = None):
+        if isinstance(message_content, str):
+            prompt_text = message_content.strip()
+            if not prompt_text:
+                return False
+        else:
+            prompt_text = self._build_prompt_status_text('')
+            if not message_content:
+                return False
+
+        visible_text = (display_text or '').strip() or prompt_text
+        if not visible_text:
+            return False
 
         # 新轮次开始前彻底清理上一轮的状态缓存，防止去重逻辑复用旧值
         self._last_status_texts.clear()
@@ -1495,19 +1876,21 @@ class ChatWindow:
             except Exception:
                 pass
 
-        self._append_message('user', display_text or text)
+        self._append_message('user', visible_text)
         self.status_var.set('奥黛丽 正在思考...')
         self._set_busy(True)
         self._last_busy_event_time = datetime.now()
-        self._update_bubble_state('thinking', {'prompt': text})
+        self._update_bubble_state('thinking', {'prompt': visible_text})
 
         try:
-            self.session.send_user_message(text)
+            self.session.send_user_message(message_content)
         except Exception as exc:
             self._set_busy(False)
             self.status_var.set('发送失败')
             self._clear_bubble_state()
             self._append_message('error', f'发送失败：{exc}')
+            return False
+        return True
 
     def _handle_local_command(self, text: str) -> bool:
         if not text.startswith('/'):
@@ -1749,87 +2132,17 @@ class ChatWindow:
         ).pack(side=tk.LEFT)
 
         self._insert_inline_card(card)
-
-        worker = threading.Thread(
-            target=self._run_side_question,
-            args=(question, status_label),
-            daemon=True,
-        )
-        worker.start()
-
-    def _run_side_question(self, question: str, status_label):
-        ready_event = threading.Event()
-        done_event = threading.Event()
-        state = {'answer': '', 'error': ''}
-
-        def on_event(event: dict):
-            kind = event.get('kind')
-            if kind == 'status' and event.get('status') == 'ready':
-                ready_event.set()
-                return
-            if kind == 'assistant':
-                text = (event.get('text') or '').strip()
-                if text:
-                    state['answer'] = text
-                return
-            if kind == 'done':
-                if event.get('ok'):
-                    if not state['answer']:
-                        state['answer'] = (event.get('text') or '').strip()
-                else:
-                    state['error'] = (event.get('text') or '旁路问题执行失败').strip()
-                done_event.set()
-                return
-            if kind == 'error':
-                state['error'] = (event.get('text') or '旁路问题执行失败').strip()
-                done_event.set()
-
-        side_session = ClaudeCodeSession(
-            on_event,
-            working_dir=getattr(self.session, 'working_dir', None),
-            connection_target=self._connection_target,
-        )
-
         try:
-            side_session.start()
-            if not ready_event.wait(20):
-                state['error'] = '旁路问题会话初始化超时'
-            else:
-                side_session.send_user_message(self._build_side_question_prompt(question))
-                if not done_event.wait(120):
-                    state['error'] = '旁路问题等待超时'
+            request_id = self.session.send_side_question(question)
         except Exception as exc:
-            state['error'] = f'旁路问题失败：{exc}'
-        finally:
-            try:
-                side_session.close()
-            except Exception:
-                pass
+            self._update_side_question_result(status_label, f'旁路问题失败：{exc}', True)
+            return
 
-        final_text = state['error'] or state['answer'] or '未收到结果'
-        self._schedule_ui(lambda: self._update_side_question_result(status_label, final_text, bool(state['error'])))
+        if not request_id:
+            self._update_side_question_result(status_label, '旁路问题发送失败', True)
+            return
 
-    def _build_side_question_prompt(self, question: str) -> str:
-        recent = self._conversation_history[-MAX_SIDE_CONTEXT_MESSAGES:]
-        excerpt_parts = []
-        total_chars = 0
-        for item in reversed(recent):
-            entry = f"{'用户' if item['role'] == 'user' else '助手'}: {item['text'].strip()}"
-            if not item['text'].strip():
-                continue
-            if excerpt_parts and total_chars + len(entry) > MAX_SIDE_CONTEXT_CHARS:
-                break
-            excerpt_parts.append(entry)
-            total_chars += len(entry)
-
-        excerpt = '\n\n'.join(reversed(excerpt_parts)).strip() or '无最近主对话上下文。'
-        return (
-            '你是 Claude Code 的旁路问答助手。下面是当前主对话最近的上下文，仅供回答侧边问题参考。'
-            '不要继续执行主任务，也不要假设你能修改主会话状态。\n\n'
-            f'主对话摘录：\n{excerpt}\n\n'
-            f'侧边问题：{question}\n\n'
-            '请直接、简洁地回答这个侧边问题。'
-        )
+        self._pending_side_question_labels[request_id] = status_label
 
     def _update_side_question_result(self, status_label, text: str, is_error: bool):
         if status_label is None:
@@ -1849,12 +2162,13 @@ class ChatWindow:
             pass
 
     def _insert_inline_card(self, card):
+        self._capture_transcript_follow_state()
         self.text_area.config(state=tk.NORMAL)
         self.text_area.insert(tk.END, '\n')
         self.text_area.window_create(tk.END, window=card, padx=6, pady=4)
         self.text_area.insert(tk.END, '\n\n')
         self.text_area.config(state=tk.DISABLED)
-        self.text_area.see(tk.END)
+        self._maybe_follow_transcript_end()
 
     def _on_stop(self):
         try:
@@ -1864,20 +2178,30 @@ class ChatWindow:
             self._append_message('error', f'停止失败：{exc}')
 
     def _enqueue_event(self, event: dict):
+        kind = event.get('kind')
+        if kind in {'terminal_line', 'stdout_raw_line', 'stderr_raw_line'}:
+            if not self._terminal_view_visible or self._terminal_view is None or not self._terminal_view.is_open():
+                return
         self._event_queue.put(event)
 
     def _drain_events(self):
         if self.window is None or not self.window.winfo_exists():
             return
 
+        started_at = time.perf_counter()
+        processed = 0
         while True:
+            elapsed_ms = (time.perf_counter() - started_at) * 1000
+            if processed >= EVENT_BATCH_LIMIT or elapsed_ms >= EVENT_DRAIN_BUDGET_MS:
+                break
             try:
                 event = self._event_queue.get_nowait()
             except queue.Empty:
                 break
             self._handle_event(event)
-            if self._terminal_view is not None:
+            if self._terminal_view_visible and self._terminal_view is not None:
                 self._terminal_view.consume_event(event)
+            processed += 1
 
         # 连接看门狗：如果 _busy 且超过 120 秒没有任何事件，认为连接已静默断开
         if self._busy and self._last_busy_event_time is not None:
@@ -1887,7 +2211,8 @@ class ChatWindow:
                 self._set_busy(False)
                 self._last_busy_event_time = None
 
-        self.window.after(EVENT_POLL_INTERVAL_MS, self._drain_events)
+        next_poll_ms = 10 if not self._event_queue.empty() else EVENT_POLL_INTERVAL_MS
+        self.window.after(next_poll_ms, self._drain_events)
 
     def _handle_event(self, event: dict):
         kind = event.get('kind')
@@ -2074,6 +2399,13 @@ class ChatWindow:
             self._handle_permission_request(event)
             return
 
+        if kind == 'side_question':
+            request_id = event.get('request_id') or ''
+            status_label = self._pending_side_question_labels.pop(request_id, None)
+            text = (event.get('text') or '').strip() or '未收到结果'
+            self._update_side_question_result(status_label, text, not bool(event.get('ok')))
+            return
+
         if kind == 'done':
             self._set_busy(False)
             self._update_total_tokens(event.get('total_tokens'))
@@ -2116,6 +2448,11 @@ class ChatWindow:
     def _handle_permission_request(self, event: dict):
         tool_name = event.get('tool_name') or '未知工具'
         request_id = event.get('request_id')
+        input_payload = event.get('input') or {}
+
+        if self._is_ask_user_question_request(tool_name, input_payload):
+            self._show_ask_user_question_card(request_id, input_payload)
+            return
 
         # 该工具已被“总是允许” -> 直接放行，不再打扰
         if tool_name in self._auto_allow_tools:
@@ -2125,12 +2462,212 @@ class ChatWindow:
                 'working',
                 {
                     'tool_name': tool_name,
-                    'input': event.get('input') or {},
+                    'input': input_payload,
                 },
             )
             return
 
-        self._show_permission_card(request_id, tool_name, event.get('input') or {})
+        self._show_permission_card(request_id, tool_name, input_payload)
+
+    def _is_ask_user_question_request(self, tool_name: str, input_payload) -> bool:
+        if str(tool_name or '').strip() != ASK_USER_QUESTION_TOOL_NAME:
+            return False
+        return isinstance(input_payload, dict) and isinstance(input_payload.get('questions'), list)
+
+    def _show_ask_user_question_card(self, request_id, input_payload):
+        questions = input_payload.get('questions') if isinstance(input_payload, dict) else None
+        if not request_id or not isinstance(questions, list) or not questions:
+            self._show_permission_card(request_id, ASK_USER_QUESTION_TOOL_NAME, input_payload or {})
+            return
+
+        card = create_card(
+            self.text_area,
+            self.theme,
+            bg='assistant',
+            border='accent',
+        )
+        tk.Label(
+            card,
+            text='奥黛丽想问你',
+            font=self.fonts['control'],
+            bg=self.colors['assistant'],
+            fg=self.colors['text'],
+            anchor='w',
+        ).pack(fill=tk.X, padx=10, pady=(8, 4))
+        tk.Label(
+            card,
+            text='这不是权限请求，请直接选择答案。',
+            font=self.fonts['small'],
+            bg=self.colors['assistant'],
+            fg=self.colors['muted'],
+            anchor='w',
+        ).pack(fill=tk.X, padx=10, pady=(0, 8))
+
+        selected_answers = {}
+        question_vars = []
+
+        for index, question in enumerate(questions):
+            if not isinstance(question, dict):
+                continue
+            question_text = str(question.get('question') or '').strip()
+            header = str(question.get('header') or '').strip()
+            options = question.get('options') if isinstance(question.get('options'), list) else []
+            multi_select = bool(question.get('multiSelect'))
+            if not question_text or len(options) < 2:
+                continue
+
+            section = tk.Frame(card, bg=self.colors['assistant'])
+            section.pack(fill=tk.X, padx=10, pady=(0, 10))
+            title = header or f'问题 {index + 1}'
+            tk.Label(
+                section,
+                text=title,
+                font=self.fonts['small'],
+                bg=self.colors['assistant'],
+                fg=self.colors['gold'],
+                anchor='w',
+            ).pack(fill=tk.X)
+            tk.Label(
+                section,
+                text=question_text,
+                font=self.fonts['base'],
+                bg=self.colors['assistant'],
+                fg=self.colors['text'],
+                justify='left',
+                anchor='w',
+                wraplength=self.chat_theme['permission_wraplength'],
+            ).pack(fill=tk.X, pady=(2, 6))
+
+            if multi_select:
+                option_state = []
+                for option in options:
+                    if not isinstance(option, dict):
+                        continue
+                    label = str(option.get('label') or '').strip()
+                    description = str(option.get('description') or '').strip()
+                    if not label:
+                        continue
+                    var = tk.BooleanVar(value=False)
+                    option_state.append((label, var))
+                    row = tk.Frame(section, bg=self.colors['assistant'])
+                    row.pack(fill=tk.X, pady=(0, 4))
+                    tk.Checkbutton(
+                        row,
+                        text=label,
+                        variable=var,
+                        bg=self.colors['assistant'],
+                        fg=self.colors['text'],
+                        activebackground=self.colors['assistant'],
+                        activeforeground=self.colors['text'],
+                        selectcolor=self.colors['panel'],
+                        anchor='w',
+                        justify='left',
+                        font=self.fonts['control'],
+                        highlightthickness=0,
+                        bd=0,
+                    ).pack(anchor='w')
+                    if description:
+                        tk.Label(
+                            row,
+                            text=description,
+                            font=self.fonts['small'],
+                            bg=self.colors['assistant'],
+                            fg=self.colors['muted'],
+                            justify='left',
+                            anchor='w',
+                            wraplength=self.chat_theme['permission_wraplength'],
+                        ).pack(fill=tk.X, padx=(24, 0))
+                question_vars.append(('multi', question_text, option_state))
+            else:
+                var = tk.StringVar(value='')
+                question_vars.append(('single', question_text, var))
+                for option in options:
+                    if not isinstance(option, dict):
+                        continue
+                    label = str(option.get('label') or '').strip()
+                    description = str(option.get('description') or '').strip()
+                    if not label:
+                        continue
+                    button_text = label if not description else f'{label}\n{description}'
+                    create_button(
+                        section,
+                        text=button_text,
+                        command=lambda selected=label, var_ref=var: var_ref.set(selected),
+                        theme=self.theme,
+                        variant='secondary',
+                        font=self.fonts['control'],
+                        padx=12,
+                        pady=6,
+                        justify='left',
+                        anchor='w',
+                        wraplength=self.chat_theme['permission_wraplength'],
+                    ).pack(fill=tk.X, pady=(0, 6))
+
+        status_label = tk.Label(
+            card,
+            text='请选择答案后再提交。',
+            font=self.fonts['small'],
+            bg=self.colors['assistant'],
+            fg=self.colors['muted'],
+            justify='left',
+            anchor='w',
+            wraplength=self.chat_theme['permission_wraplength'],
+        )
+        status_label.pack(fill=tk.X, padx=10, pady=(0, 8))
+
+        def submit_answers():
+            answers = {}
+            for kind, question_text, state in question_vars:
+                if kind == 'single':
+                    selected = state.get().strip()
+                    if not selected:
+                        status_label.config(text='还有问题没选答案。', fg=self.colors['accent_dark'])
+                        return
+                    answers[question_text] = selected
+                else:
+                    selected = [label for label, var in state if var.get()]
+                    if not selected:
+                        status_label.config(text='还有多选题未选择。', fg=self.colors['accent_dark'])
+                        return
+                    answers[question_text] = ', '.join(selected)
+
+            updated_input = dict(input_payload)
+            updated_input['answers'] = answers
+            self.session.respond_permission(request_id, True, updated_input=updated_input)
+            self._pending_question_cards.pop(request_id, None)
+            status_label.config(text='已提交答案，奥黛丽继续处理中...', fg=self.colors['muted'])
+            self._append_inline_status('已回答奥黛丽的问题')
+
+        def decline_answers():
+            self.session.respond_permission(request_id, False)
+            self._pending_question_cards.pop(request_id, None)
+            self._destroy_widget(card)
+
+        action_row = tk.Frame(card, bg=self.colors['assistant'])
+        action_row.pack(fill=tk.X, padx=10, pady=(0, 10))
+        create_button(
+            action_row,
+            text='提交答案',
+            command=submit_answers,
+            theme=self.theme,
+            variant='primary',
+            font=self.fonts['control'],
+            padx=12,
+            pady=7,
+        ).pack(side=tk.LEFT)
+        create_button(
+            action_row,
+            text='拒绝回答',
+            command=decline_answers,
+            theme=self.theme,
+            variant='secondary',
+            font=self.fonts['control'],
+            padx=12,
+            pady=7,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+
+        self._insert_inline_card(card)
+        self._pending_question_cards[request_id] = card
 
     def _show_permission_card(self, request_id, tool_name, input_payload):
         """在对话流中内嵌一张权限确认卡片，不再弹出抢焦点的模态窗。"""
@@ -2254,24 +2791,72 @@ class ChatWindow:
         self.text_area.window_create(tk.END, window=card, padx=6, pady=4)
         self.text_area.insert(tk.END, '\n\n')
         self.text_area.config(state=tk.DISABLED)
-        self.text_area.see(tk.END)
+        self._maybe_follow_transcript_end()
         self._pending_perm_frames[request_id] = card
 
     def _set_busy(self, busy: bool):
         self._busy = busy
         if self.send_button is not None:
-            self.send_button.config(state=tk.DISABLED if busy else tk.NORMAL)
+            # Keep send available so local commands like /btw can still be sent
+            # during an active turn. Busy-time sends are rerouted to /btw.
+            self.send_button.config(
+                state=tk.NORMAL,
+                text='我插个话...' if busy else '发送',
+            )
 
     def _append_inline_status(self, text: str):
         if self.text_area is None:
             compact = self._task_progress_compact_text(text)
             if compact:
-                self.status_var.set(compact)
+                self._set_status_var_text(compact)
             return
+        self._capture_transcript_follow_state()
         self.text_area.config(state=tk.NORMAL)
         self.text_area.insert(tk.END, f'[状态] {text}\n\n', ('status',))
         self.text_area.config(state=tk.DISABLED)
-        self.text_area.see(tk.END)
+        self._maybe_follow_transcript_end()
+
+    def _set_status_var_text(self, text: str):
+        if text == self._last_status_var_text:
+            return
+        self._last_status_var_text = text
+        self.status_var.set(text)
+
+    def _cancel_inline_status_job(self):
+        if self.window is None or self._inline_status_job is None:
+            self._inline_status_job = None
+            return
+        try:
+            self.window.after_cancel(self._inline_status_job)
+        except Exception:
+            pass
+        self._inline_status_job = None
+
+    def _schedule_inline_status_render(self, text: str):
+        self._pending_inline_status_text = text
+        if self.text_area is None or self.window is None:
+            return
+        if self._inline_status_job is not None:
+            return
+        self._inline_status_job = self.window.after(
+            INLINE_STATUS_DEBOUNCE_MS,
+            self._flush_inline_status_render,
+        )
+
+    def _flush_inline_status_render(self):
+        self._inline_status_job = None
+        if self.text_area is None:
+            return
+        compact = self._pending_inline_status_text
+        if not compact:
+            return
+        ranges = self.text_area.tag_ranges('inline_status')
+        self.text_area.config(state=tk.NORMAL)
+        if len(ranges) >= 2:
+            self.text_area.delete(ranges[0], ranges[-1])
+        self.text_area.insert(tk.END, f'[状态] {compact}\n\n', ('status', 'inline_status'))
+        self.text_area.config(state=tk.DISABLED)
+        self._maybe_follow_transcript_end()
 
     # ── 统一状态管理 ─────────────────────────────────────────────
     # 所有状态更新通过 _set_status 写入，确保 status_var 只由一处管理，
@@ -2287,26 +2872,20 @@ class ChatWindow:
         last = self._last_status_texts.get(tag)
         if last == compact:
             # 文本未变，但确保状态栏同步
-            self.status_var.set(compact)
+            self._set_status_var_text(compact)
             return
         self._last_status_texts[tag] = compact
 
-        self.status_var.set(compact)
+        self._set_status_var_text(compact)
         if self.text_area is None:
             return
-
-        # 清除上一条内嵌状态行（统一标签，始终只保留一条）
-        ranges = self.text_area.tag_ranges('inline_status')
-        self.text_area.config(state=tk.NORMAL)
-        if len(ranges) >= 2:
-            self.text_area.delete(ranges[0], ranges[-1])
-        self.text_area.insert(tk.END, f'[状态] {compact}\n\n', ('status', 'inline_status'))
-        self.text_area.config(state=tk.DISABLED)
-        self.text_area.see(tk.END)
+        self._schedule_inline_status_render(compact)
 
     def _clear_inline_status(self):
         """清除文本区中的内嵌状态行并重置去重缓存。"""
         self._last_status_texts.clear()
+        self._pending_inline_status_text = None
+        self._cancel_inline_status_job()
         if self.text_area is None:
             return
         ranges = self.text_area.tag_ranges('inline_status')
@@ -2393,10 +2972,7 @@ class ChatWindow:
             text=f'{self._pick_tool_icon(compact)} {compact}',
             wraplength=max(240, self._transcript_width - 60),
         )
-        try:
-            self.text_area.see(tk.END)
-        except Exception:
-            pass
+        self._maybe_follow_transcript_end()
 
     def _clear_tool_status_widget(self):
         widget = self._tool_status_widget
@@ -2473,11 +3049,7 @@ class ChatWindow:
             fg=self.colors['subtext'] if done else self.colors['muted'],
             wraplength=max(240, self._transcript_width - 60),
         )
-        if done:
-            try:
-                self.text_area.see(tk.END)
-            except Exception:
-                pass
+        self._maybe_follow_transcript_end()
 
     def _render_summary_status(self, text: str):
         compact = self._task_progress_compact_text(text)
@@ -2656,11 +3228,19 @@ class ChatWindow:
     def _measure_status_text_px(self, text: str) -> int:
         if not text:
             return 0
+        cached = self._status_text_px_cache.get(text)
+        if cached is not None:
+            return cached
         try:
-            font = tkfont.Font(font=self.fonts['base'])
-            return int(font.measure(text))
+            if self._status_measure_font is None:
+                self._status_measure_font = tkfont.Font(font=self.fonts['base'])
+            measured = int(self._status_measure_font.measure(text))
         except Exception:
-            return len(text) * 8
+            measured = len(text) * 8
+        self._status_text_px_cache[text] = measured
+        if len(self._status_text_px_cache) > 256:
+            self._status_text_px_cache.pop(next(iter(self._status_text_px_cache)))
+        return measured
 
     def _truncate_text_to_px(self, text: str, max_px: int) -> str:
         if not text or max_px <= 0:
@@ -2861,6 +3441,17 @@ class ChatWindow:
         self._user_avatar = ImageTk.PhotoImage(avatar)
         return self._user_avatar
 
+    def _build_message_layout(self, text: str, text_width_chars: int) -> tuple[str, int, bool]:
+        plain_text = self._markdown_to_plain_text(text)
+        full_line_count = self._calc_text_display_lines(plain_text, text_width_chars, max_lines=999)
+        is_collapsible = full_line_count > MAX_COLLAPSED_MESSAGE_LINES
+        visible_lines = self._calc_text_display_lines(
+            plain_text,
+            text_width_chars,
+            max_lines=MAX_COLLAPSED_MESSAGE_LINES if is_collapsible else 40,
+        )
+        return plain_text, visible_lines, is_collapsible
+
     def _create_message_widget(self, role: str, text: str):
         container = tk.Frame(self.text_area, bg=self.colors['panel'], width=self._transcript_width)
         is_user = role == 'user'
@@ -2900,7 +3491,7 @@ class ChatWindow:
             bubble_wrap.pack(anchor='e', fill=tk.X)
 
             text_width_chars = self._pixels_to_chars(520)
-            text_height = self._calc_text_display_lines(self._markdown_to_plain_text(text), text_width_chars)
+            plain_text, text_height, is_collapsible = self._build_message_layout(text, text_width_chars)
             bubble = tk.Text(
                 bubble_wrap,
                 font=self.fonts['base'],
@@ -2926,7 +3517,22 @@ class ChatWindow:
             bubble.pack(anchor='e')
             container._message_bubble = bubble
             container._message_text = text
+            container._message_plain_text = plain_text
+            container._message_is_expanded = not is_collapsible
             self._bind_message_copy_events(bubble, text)
+
+            if is_collapsible:
+                toggle = tk.Label(
+                    content_col,
+                    text='展开全文',
+                    font=self.fonts['small'],
+                    bg=self.colors['panel'],
+                    fg=self.colors['accent'],
+                    cursor='hand2',
+                )
+                toggle.pack(anchor='e', pady=(6, 0))
+                container._message_toggle = toggle
+                toggle.bind('<Button-1>', lambda _event, item=container: self._toggle_message_expand(item), add='+')
 
             meta = tk.Frame(content_col, bg=self.colors['panel'])
             meta.pack(anchor='e', pady=(6, 0))
@@ -2960,7 +3566,7 @@ class ChatWindow:
             content_col.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
             text_width_chars = self._pixels_to_chars(520)
-            text_height = self._calc_text_display_lines(self._markdown_to_plain_text(text), text_width_chars)
+            plain_text, text_height, is_collapsible = self._build_message_layout(text, text_width_chars)
             bubble = tk.Text(
                 content_col,
                 font=self.fonts['base'],
@@ -2986,7 +3592,22 @@ class ChatWindow:
             bubble.pack(anchor='w')
             container._message_bubble = bubble
             container._message_text = text
+            container._message_plain_text = plain_text
+            container._message_is_expanded = not is_collapsible
             self._bind_message_copy_events(bubble, text)
+
+            if is_collapsible:
+                toggle = tk.Label(
+                    content_col,
+                    text='展开全文',
+                    font=self.fonts['small'],
+                    bg=self.colors['panel'],
+                    fg=self.colors['accent'],
+                    cursor='hand2',
+                )
+                toggle.pack(anchor='w', pady=(6, 0))
+                container._message_toggle = toggle
+                toggle.bind('<Button-1>', lambda _event, item=container: self._toggle_message_expand(item), add='+')
 
             meta = tk.Frame(content_col, bg=self.colors['panel'])
             meta.pack(anchor='w', pady=(6, 0))
@@ -3005,11 +3626,38 @@ class ChatWindow:
                 fg=self.colors['subtext'],
             ).pack(side=tk.LEFT, padx=(10, 0))
 
-        container.update_idletasks()
+        row.update_idletasks()
         container.configure(width=self._transcript_width, height=row.winfo_reqheight())
         container.pack_propagate(False)
         self._message_widgets.append(container)
         return container
+
+    def _toggle_message_expand(self, container):
+        bubble = getattr(container, '_message_bubble', None)
+        plain_text = getattr(container, '_message_plain_text', '')
+        toggle = getattr(container, '_message_toggle', None)
+        if bubble is None or not bubble.winfo_exists():
+            return 'break'
+
+        expanded = bool(getattr(container, '_message_is_expanded', False))
+        container._message_is_expanded = not expanded
+        char_width = int(bubble.cget('width')) if str(bubble.cget('width')).isdigit() else self._pixels_to_chars(self._transcript_width - 60)
+        bubble.configure(
+            height=self._calc_text_display_lines(
+                plain_text,
+                char_width,
+                max_lines=MAX_COLLAPSED_MESSAGE_LINES if expanded else 40,
+            )
+        )
+        if toggle is not None and toggle.winfo_exists():
+            toggle.config(text='展开全文' if expanded else '收起')
+        try:
+            container.update_idletasks()
+            container.configure(height=container.winfo_reqheight())
+        except Exception:
+            pass
+        self._maybe_follow_transcript_end()
+        return 'break'
 
     def _append_message(self, role: str, text: str, *, record_history: bool = True):
         reminder_text = self._translate_system_reminder(text)
@@ -3022,36 +3670,44 @@ class ChatWindow:
             self._insert_terminal_event(role, text)
             return
 
+        self._capture_transcript_follow_state()
         self.text_area.config(state=tk.NORMAL)
         card = self._create_message_widget(role, text)
         self.text_area.insert(tk.END, '\n')
         self.text_area.window_create(tk.END, window=card, padx=4, pady=4)
         self.text_area.insert(tk.END, '\n')
         self.text_area.config(state=tk.DISABLED)
-        self.text_area.see(tk.END)
+        self._maybe_follow_transcript_end()
 
         if record_history and role in {'user', 'assistant'}:
             self._conversation_history.append({'role': role, 'text': text})
             self._conversation_history = self._conversation_history[-12:]
 
     def _configure_markdown_tags(self, widget: tk.Text):
-        base_font = tkfont.Font(font=self.fonts['base'])
-        strong_font = tkfont.Font(font=self.fonts['base'])
-        strong_font.configure(weight='bold')
-        code_font = tkfont.Font(family='Consolas', size=max(9, int(base_font.cget('size')) - 1))
-        h1_font = tkfont.Font(font=self.fonts['base'])
-        h1_font.configure(weight='bold', size=max(int(base_font.cget('size')) + 5, 16))
-        h2_font = tkfont.Font(font=self.fonts['base'])
-        h2_font.configure(weight='bold', size=max(int(base_font.cget('size')) + 3, 14))
-        h3_font = tkfont.Font(font=self.fonts['base'])
-        h3_font.configure(weight='bold', size=max(int(base_font.cget('size')) + 1, 13))
-        widget._markdown_fonts = {
-            'strong': strong_font,
-            'code': code_font,
-            'h1': h1_font,
-            'h2': h2_font,
-            'h3': h3_font,
-        }
+        if self._markdown_fonts is None:
+            base_font = tkfont.Font(font=self.fonts['base'])
+            strong_font = tkfont.Font(font=self.fonts['base'])
+            strong_font.configure(weight='bold')
+            code_font = tkfont.Font(family='Consolas', size=max(9, int(base_font.cget('size')) - 1))
+            h1_font = tkfont.Font(font=self.fonts['base'])
+            h1_font.configure(weight='bold', size=max(int(base_font.cget('size')) + 5, 16))
+            h2_font = tkfont.Font(font=self.fonts['base'])
+            h2_font.configure(weight='bold', size=max(int(base_font.cget('size')) + 3, 14))
+            h3_font = tkfont.Font(font=self.fonts['base'])
+            h3_font.configure(weight='bold', size=max(int(base_font.cget('size')) + 1, 13))
+            self._markdown_fonts = {
+                'strong': strong_font,
+                'code': code_font,
+                'h1': h1_font,
+                'h2': h2_font,
+                'h3': h3_font,
+            }
+        strong_font = self._markdown_fonts['strong']
+        code_font = self._markdown_fonts['code']
+        h1_font = self._markdown_fonts['h1']
+        h2_font = self._markdown_fonts['h2']
+        h3_font = self._markdown_fonts['h3']
+        widget._markdown_fonts = self._markdown_fonts
         widget.tag_configure('md_h1', font=h1_font, spacing1=8, spacing3=4)
         widget.tag_configure('md_h2', font=h2_font, spacing1=6, spacing3=4)
         widget.tag_configure('md_h3', font=h3_font, spacing1=6, spacing3=3)
@@ -3211,6 +3867,7 @@ class ChatWindow:
         if not text:
             return
 
+        self._capture_transcript_follow_state()
         self.text_area.config(state=tk.NORMAL)
 
         if role == 'thinking_inline':
@@ -3226,7 +3883,7 @@ class ChatWindow:
                 self._render_system_info_terminal(text)
 
         self.text_area.config(state=tk.DISABLED)
-        self.text_area.see(tk.END)
+        self._maybe_follow_transcript_end()
 
     # ── 思考块（流式更新 + 默认展开） ────────────────────────────
     # 实现思路：
@@ -3320,7 +3977,14 @@ class ChatWindow:
     def _render_tool_result_terminal(self, text: str):
         """工具结果——逐行 diff 着色。"""
         has_diff = False
-        for line in text.split('\n'):
+        raw_text = text or ''
+        truncated_by_chars = len(raw_text) > MAX_INLINE_TOOL_RESULT_CHARS
+        display_text = raw_text[:MAX_INLINE_TOOL_RESULT_CHARS] if truncated_by_chars else raw_text
+        lines = display_text.split('\n')
+        truncated_by_lines = len(lines) > MAX_INLINE_TOOL_RESULT_LINES
+        visible_lines = lines[:MAX_INLINE_TOOL_RESULT_LINES]
+
+        for line in visible_lines:
             stripped = line.rstrip('\r')
             if stripped.startswith('+') and not stripped.startswith('+++'):
                 self.text_area.insert(tk.END, '⎿ ' + stripped + '\n', ('diff_add',))
@@ -3333,17 +3997,17 @@ class ChatWindow:
                 has_diff = True
             else:
                 self.text_area.insert(tk.END, '⎿ ' + stripped + '\n', ('term_result',))
-        # 如果没有 diff 行，给一个简洁摘要
-        if not has_diff and len(text) > 300:
-            first_line = text.split('\n')[0].strip()
-            if len(first_line) > 200:
-                first_line = first_line[:200] + '...'
-            # 已经作为普通行插入了，这里只做截断提示
-            if len(text.split('\n')) > 20:
-                self.text_area.insert(
-                    tk.END, '⎿ ...（输出过长，共 {} 行）\n'.format(len(text.split('\n'))),
-                    ('term_result',),
-                )
+        if truncated_by_chars or truncated_by_lines:
+            total_lines = raw_text.count('\n') + (1 if raw_text else 0)
+            self.text_area.insert(
+                tk.END,
+                '⎿ ...（输出过长，已显示前 {} 行 / {} 字符，共约 {} 行）\n'.format(
+                    len(visible_lines),
+                    min(len(raw_text), MAX_INLINE_TOOL_RESULT_CHARS),
+                    total_lines,
+                ),
+                ('term_result',),
+            )
 
     def _render_system_info_terminal(self, text: str):
         compact = self._task_progress_compact_text(text)
@@ -3483,14 +4147,14 @@ class ChatWindow:
         except Exception:
             return 50
 
-    def _calc_text_display_lines(self, text: str, char_width: int) -> int:
+    def _calc_text_display_lines(self, text: str, char_width: int, *, max_lines: int = 40) -> int:
         """估算文本在给定字符宽度下所需的显示行数。"""
         lines = text.count('\n') + 1
         # 为每行中超出宽度的部分增加额外的换行估算
         for line in text.split('\n'):
             if len(line) > char_width:
                 lines += len(line) // char_width
-        return max(1, min(lines, 40))
+        return max(1, min(lines, max_lines))
 
     def _copy_to_clipboard(self, text: str):
         """将文本复制到系统剪贴板。"""
@@ -3582,6 +4246,13 @@ class ChatWindow:
             except Exception:
                 pass
             self._connection_time_timer = None
+
+        if self._terminal_sync_job is not None:
+            try:
+                self.window.after_cancel(self._terminal_sync_job)
+            except Exception:
+                pass
+            self._terminal_sync_job = None
 
         if self._terminal_view is not None:
             self._terminal_view.hide(notify=False)

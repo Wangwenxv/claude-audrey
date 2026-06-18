@@ -57,8 +57,7 @@ export async function runSideQuestion({
   question: string
   cacheSafeParams: CacheSafeParams
 }): Promise<SideQuestionResult> {
-  // Wrap the question with instructions to answer without tools
-  const wrappedQuestion = `<system-reminder>This is a side question from the user. You must answer this question directly in a single response.
+  const buildWrappedQuestion = (userQuestion: string, retryReason?: string) => `<system-reminder>This is a side question from the user. You must answer this question directly in a single response.
 
 IMPORTANT CONTEXT:
 - You are a separate, lightweight agent spawned to answer this one question
@@ -72,33 +71,58 @@ CRITICAL CONSTRAINTS:
 - You can ONLY provide information based on what you already know from the conversation context
 - NEVER say things like "Let me try...", "I'll now...", "Let me check...", or promise to take any action
 - If you don't know the answer, say so - do not offer to look it up or investigate
+- If you previously attempted to call a tool, that was incorrect. You must now answer with plain text only and no tool calls.
 
-Simply answer the question with the information you have.</system-reminder>
+${retryReason ? `RETRY NOTE:
+- ${retryReason}
 
-${question}`
+` : ''}Simply answer the question with the information you have.</system-reminder>
 
-  const agentResult = await runForkedAgent({
-    promptMessages: [createUserMessage({ content: wrappedQuestion })],
-    // Do NOT override thinkingConfig — thinking is part of the API cache key,
-    // and diverging from the main thread's config busts the prompt cache.
-    // Adaptive thinking on a quick Q&A has negligible overhead.
-    cacheSafeParams,
-    canUseTool: async () => ({
-      behavior: 'deny' as const,
-      message: 'Side questions cannot use tools',
-      decisionReason: { type: 'other' as const, reason: 'side_question' },
-    }),
-    querySource: 'side_question',
-    forkLabel: 'side_question',
-    maxTurns: 1, // Single turn only - no tool use loops
-    // No future request shares this suffix; skip writing cache entries.
-    skipCacheWrite: true,
-  })
+${userQuestion}`
+
+  const runSingleSideQuestion = async (wrappedQuestion: string) =>
+    runForkedAgent({
+      promptMessages: [createUserMessage({ content: wrappedQuestion })],
+      // Do NOT override thinkingConfig — thinking is part of the API cache key,
+      // and diverging from the main thread's config busts the prompt cache.
+      // Adaptive thinking on a quick Q&A has negligible overhead.
+      cacheSafeParams,
+      canUseTool: async () => ({
+        behavior: 'deny' as const,
+        message: 'Side questions cannot use tools',
+        decisionReason: { type: 'other' as const, reason: 'side_question' },
+      }),
+      querySource: 'side_question',
+      forkLabel: 'side_question',
+      maxTurns: 1,
+      skipCacheWrite: true,
+    })
+
+  let agentResult = await runSingleSideQuestion(buildWrappedQuestion(question))
+  let response = extractSideQuestionResponse(agentResult.messages)
+
+  if (sideQuestionAttemptedTool(agentResult.messages)) {
+    agentResult = await runSingleSideQuestion(
+      buildWrappedQuestion(
+        question,
+        'Your previous response attempted to call a tool. Answer directly with plain text only.',
+      ),
+    )
+    response = extractSideQuestionResponse(agentResult.messages)
+  }
 
   return {
-    response: extractSideQuestionResponse(agentResult.messages),
+    response,
     usage: agentResult.totalUsage,
   }
+}
+
+function sideQuestionAttemptedTool(messages: Message[]): boolean {
+  return messages.some(
+    m =>
+      m.type === 'assistant' &&
+      m.message.content.some(block => block.type === 'tool_use'),
+  )
 }
 
 /**
