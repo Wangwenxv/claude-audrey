@@ -1,0 +1,392 @@
+<Window x:Class="Audrey.Chat.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:controls="clr-namespace:Audrey.Chat.Controls"
+        xmlns:models="clr-namespace:Audrey.Chat.Models"
+        Title="与奥黛丽聊聊"
+        Width="1120"
+        Height="760"
+        MinWidth="900"
+        MinHeight="600"
+        AllowsTransparency="True"
+        Background="Transparent"
+        ResizeMode="CanResizeWithGrip"
+        WindowStartupLocation="CenterScreen"
+        WindowStyle="None">
+  <Window.Resources>
+    <BooleanToVisibilityConverter x:Key="BoolToVisibility" />
+
+    <Style x:Key="ChromeButton" TargetType="Button">
+      <Setter Property="Width" Value="36" />
+      <Setter Property="Height" Value="30" />
+      <Setter Property="Background" Value="Transparent" />
+      <Setter Property="BorderThickness" Value="0" />
+      <Setter Property="Foreground" Value="#52676A" />
+      <Setter Property="Cursor" Value="Hand" />
+    </Style>
+
+    <Style x:Key="PillButton" TargetType="Button">
+      <Setter Property="Padding" Value="14,8" />
+      <Setter Property="Margin" Value="8,0,0,0" />
+      <Setter Property="Background" Value="#FFFDF8" />
+      <Setter Property="Foreground" Value="{StaticResource AudreyText}" />
+      <Setter Property="BorderBrush" Value="{StaticResource AudreyAccent}" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="Cursor" Value="Hand" />
+    </Style>
+
+    <Style TargetType="ComboBox">
+      <Setter Property="MinWidth" Value="148" />
+      <Setter Property="Padding" Value="8,5" />
+      <Setter Property="Margin" Value="8,0,0,0" />
+      <Setter Property="Background" Value="#FFFDF8" />
+      <Setter Property="BorderBrush" Value="#D8E8E4" />
+    </Style>
+
+    <DataTemplate DataType="{x:Type models:ChatMessage}">
+      <Grid Margin="0,8">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="Auto" />
+          <ColumnDefinition Width="*" />
+          <ColumnDefinition Width="Auto" />
+        </Grid.ColumnDefinitions>
+
+        <Border x:Name="Avatar"
+                Grid.Column="0"
+                Width="42"
+                Height="42"
+                Margin="0,20,10,0"
+                Background="#E7F3F0"
+                CornerRadius="21">
+          <Grid>
+            <Image Source="{Binding AvatarPath}"
+                   Width="42"
+                   Height="42"
+                   Stretch="Fill"
+                   Visibility="{Binding HasAvatarImage, Converter={StaticResource BoolToVisibility}}" />
+            <TextBlock x:Name="AvatarGlyph"
+                       Text="{Binding Avatar}"
+                       HorizontalAlignment="Center"
+                       VerticalAlignment="Center"
+                       FontWeight="SemiBold"
+                       Foreground="#3D6667" />
+          </Grid>
+        </Border>
+
+        <StackPanel x:Name="MessageStack" Grid.Column="1" MaxWidth="650" HorizontalAlignment="Left">
+          <DockPanel Margin="4,0,4,5">
+            <TextBlock Text="{Binding Author}"
+                       FontWeight="SemiBold"
+                       Foreground="{StaticResource AudreyText}" />
+            <TextBlock Text="{Binding Timestamp}"
+                       Margin="10,0,0,0"
+                       Foreground="{StaticResource AudreyMuted}"
+                       FontSize="12" />
+          </DockPanel>
+          <Border x:Name="Bubble"
+                  Padding="14,12"
+                  Background="{Binding BubbleBackground}"
+                  BorderBrush="{Binding BubbleBorder}"
+                  BorderThickness="1"
+                  CornerRadius="16">
+            <controls:MarkdownTextBlock x:Name="MessageText"
+                                        Markdown="{Binding Text}"
+                                        TextWrapping="Wrap"
+                                        Foreground="{StaticResource AudreyText}"
+                                        LineHeight="22"
+                                        FontSize="14" />
+          </Border>
+        </StackPanel>
+      </Grid>
+        <DataTemplate.Triggers>
+          <DataTrigger Binding="{Binding HasAvatarImage}" Value="True">
+            <Setter TargetName="Avatar" Property="Background" Value="Transparent" />
+            <Setter TargetName="AvatarGlyph" Property="Visibility" Value="Collapsed" />
+          </DataTrigger>
+          <DataTrigger Binding="{Binding IsUser}" Value="True">
+            <Setter TargetName="Avatar" Property="Grid.Column" Value="2" />
+            <Setter TargetName="Avatar" Property="Margin" Value="10,20,0,0" />
+            <Setter TargetName="MessageStack" Property="Grid.Column" Value="1" />
+            <Setter TargetName="MessageStack" Property="HorizontalAlignment" Value="Right" />
+        </DataTrigger>
+          <DataTrigger Binding="{Binding IsStatus}" Value="True">
+            <Setter TargetName="Avatar" Property="Visibility" Value="Collapsed" />
+            <Setter TargetName="MessageStack" Property="MaxWidth" Value="820" />
+            <Setter TargetName="MessageStack" Property="HorizontalAlignment" Value="Left" />
+            <Setter TargetName="Bubble" Property="CornerRadius" Value="0" />
+            <Setter TargetName="Bubble" Property="Background" Value="Transparent" />
+            <Setter TargetName="Bubble" Property="BorderThickness" Value="0" />
+            <Setter TargetName="Bubble" Property="Padding" Value="0" />
+            <Setter TargetName="MessageText" Property="Foreground" Value="#708487" />
+            <Setter TargetName="MessageText" Property="FontSize" Value="13" />
+          </DataTrigger>
+        </DataTemplate.Triggers>
+      </DataTemplate>
+
+    <DataTemplate DataType="{x:Type models:HistorySession}">
+      <Border x:Name="HistoryCard"
+              Width="220"
+              Height="112"
+              Padding="10"
+              Margin="0,0,0,8"
+              Background="#F8FBFA"
+              BorderBrush="#D8E8E4"
+              BorderThickness="1"
+              CornerRadius="12">
+        <Grid>
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+          </Grid.RowDefinitions>
+          <StackPanel>
+            <TextBlock Text="{Binding Title}"
+                       FontWeight="SemiBold"
+                       Foreground="{StaticResource AudreyText}"
+                       TextTrimming="CharacterEllipsis" />
+            <TextBlock Text="{Binding Summary}"
+                       Margin="0,4,0,0"
+                       Foreground="{StaticResource AudreyMuted}"
+                       TextTrimming="CharacterEllipsis" />
+          </StackPanel>
+          <Button HorizontalAlignment="Right"
+                  VerticalAlignment="Top"
+                  Content="✕"
+                  Tag="{Binding SessionId}"
+                  Click="DeleteHistoryButton_Click"
+                  Background="Transparent"
+                  BorderThickness="0"
+                  Foreground="#C07B7B"
+                  Cursor="Hand"
+                  Padding="2"
+                  Margin="4,0,0,0" />
+          <TextBlock Grid.Row="2"
+                     Text="{Binding Timestamp}"
+                     Margin="0,6,0,0"
+                     Foreground="#9AA8AA"
+                     FontSize="11" />
+        </Grid>
+      </Border>
+      <DataTemplate.Triggers>
+        <DataTrigger Binding="{Binding IsActive}" Value="True">
+          <Setter TargetName="HistoryCard" Property="Background" Value="#F3E3BF" />
+          <Setter TargetName="HistoryCard" Property="BorderBrush" Value="#D6B36A" />
+        </DataTrigger>
+      </DataTemplate.Triggers>
+    </DataTemplate>
+  </Window.Resources>
+
+  <Border Margin="10"
+          Background="{StaticResource AudreyBg}"
+          BorderBrush="#CFE2D3"
+          BorderThickness="1"
+          CornerRadius="22">
+    <Border.Effect>
+      <DropShadowEffect BlurRadius="20" ShadowDepth="0" Opacity="0.18" />
+    </Border.Effect>
+
+    <Grid>
+      <Grid.RowDefinitions>
+        <RowDefinition Height="42" />
+        <RowDefinition Height="*" />
+      </Grid.RowDefinitions>
+
+      <Grid Grid.Row="0" Background="#F2F7F6" MouseLeftButtonDown="TitleBar_MouseLeftButtonDown">
+        <TextBlock Text="与奥黛丽聊聊"
+                   Margin="16,0,0,0"
+                   VerticalAlignment="Center"
+                   Foreground="{StaticResource AudreyText}"
+                   FontWeight="SemiBold" />
+        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+          <Button Content="—" Click="MinimizeButton_Click" Style="{StaticResource ChromeButton}" />
+          <Button Content="□" Click="MaximizeButton_Click" Style="{StaticResource ChromeButton}" />
+          <Button Content="×" Click="CloseButton_Click" Style="{StaticResource ChromeButton}" />
+        </StackPanel>
+      </Grid>
+
+      <Grid Grid.Row="1" Margin="18">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="285" />
+          <ColumnDefinition Width="18" />
+          <ColumnDefinition Width="*" />
+        </Grid.ColumnDefinitions>
+
+        <Border Grid.Column="0"
+                Padding="16"
+                Background="{StaticResource AudreyPanel}"
+                BorderBrush="#D8E8E4"
+                BorderThickness="1"
+                CornerRadius="18">
+          <Grid>
+            <Grid.RowDefinitions>
+              <RowDefinition Height="Auto" />
+              <RowDefinition Height="Auto" />
+              <RowDefinition Height="*" />
+            </Grid.RowDefinitions>
+
+            <StackPanel>
+              <TextBlock Text="AUDREY HALL"
+                         Foreground="{StaticResource AudreyAccent}"
+                         FontWeight="SemiBold"
+                         FontSize="12" />
+              <TextBlock Text="会话"
+                         Margin="0,8,0,4"
+                         FontSize="26"
+                         Foreground="{StaticResource AudreyText}"
+                         FontWeight="SemiBold" />
+              <TextBlock x:Name="SessionLabel"
+                         Text="当前会话：新对话"
+                         TextWrapping="Wrap"
+                         Foreground="{StaticResource AudreyMuted}" />
+            </StackPanel>
+
+            <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,18,0,14">
+              <Button Content="新建" Click="NewSessionButton_Click" Style="{StaticResource PillButton}" Margin="0" />
+              <Button Content="刷新" Click="RefreshHistoryButton_Click" Style="{StaticResource PillButton}" />
+            </StackPanel>
+
+            <ListBox x:Name="HistoryList"
+                     Grid.Row="2"
+                     ItemsSource="{Binding HistorySessions}"
+                     BorderThickness="0"
+                     Background="Transparent"
+                     SelectionChanged="HistoryList_SelectionChanged"
+                     ScrollViewer.VerticalScrollBarVisibility="Auto" />
+          </Grid>
+        </Border>
+
+        <Grid Grid.Column="2">
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+          </Grid.RowDefinitions>
+
+          <Grid Grid.Row="0" Margin="0,0,0,12">
+            <Grid.RowDefinitions>
+              <RowDefinition Height="Auto" />
+              <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+            <StackPanel>
+              <TextBlock Text="与奥黛丽聊聊"
+                         FontSize="30"
+                         FontWeight="SemiBold"
+                         Foreground="{StaticResource AudreyText}" />
+              <TextBlock x:Name="StatusText"
+                         Text="正在连接奥黛丽..."
+                         Margin="0,4,0,0"
+                         Foreground="{StaticResource AudreyMuted}" />
+            </StackPanel>
+            <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,10,0,0">
+              <Button Content="连接" Click="ConnectButton_Click" Style="{StaticResource PillButton}" Margin="0,0,12,0" />
+              <TextBlock Text="模式" VerticalAlignment="Center" Foreground="{StaticResource AudreyMuted}" />
+              <ComboBox x:Name="ModeCombo" SelectionChanged="ModeCombo_SelectionChanged">
+                <ComboBoxItem Tag="default" Content="默认陪伴" IsSelected="True" />
+                <ComboBoxItem Tag="acceptEdits" Content="更改权限" />
+                <ComboBoxItem Tag="bypassPermissions" Content="全部权限" />
+              </ComboBox>
+              <TextBlock Text="思维链" Margin="14,0,0,0" VerticalAlignment="Center" Foreground="{StaticResource AudreyMuted}" />
+              <ComboBox x:Name="ConnectionCombo" SelectionChanged="ConnectionCombo_SelectionChanged">
+                <ComboBoxItem Tag="project" Content="本项目 Claude" IsSelected="True" />
+                <ComboBoxItem Tag="system" Content="本地 Claude" />
+                <ComboBoxItem Tag="auto" Content="自动选择" />
+              </ComboBox>
+            </StackPanel>
+          </Grid>
+
+          <Border Grid.Row="1"
+                  Padding="14"
+                  Background="{StaticResource AudreyPanel}"
+                  BorderBrush="#D8E8E4"
+                  BorderThickness="1"
+                  CornerRadius="18">
+            <ListBox x:Name="MessagesList"
+                     ItemsSource="{Binding Messages}"
+                     BorderThickness="0"
+                     Background="Transparent"
+                     FocusVisualStyle="{x:Null}"
+                     PreviewMouseRightButtonDown="MessagesList_PreviewMouseRightButtonDown"
+                     ScrollViewer.VerticalScrollBarVisibility="Auto"
+                     VirtualizingStackPanel.IsVirtualizing="True"
+                     VirtualizingStackPanel.VirtualizationMode="Recycling">
+              <ListBox.ContextMenu>
+                <ContextMenu>
+                  <MenuItem Header="复制消息" Click="CopyMessageMenuItem_Click" />
+                </ContextMenu>
+              </ListBox.ContextMenu>
+              <ListBox.ItemContainerStyle>
+                <Style TargetType="ListBoxItem">
+                  <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                  <Setter Property="FocusVisualStyle" Value="{x:Null}" />
+                  <Setter Property="Background" Value="Transparent" />
+                  <Setter Property="Template">
+                    <Setter.Value>
+                      <ControlTemplate TargetType="ListBoxItem">
+                        <ContentPresenter />
+                      </ControlTemplate>
+                    </Setter.Value>
+                  </Setter>
+                </Style>
+              </ListBox.ItemContainerStyle>
+            </ListBox>
+          </Border>
+
+          <Border x:Name="PermissionPanel"
+                  Grid.Row="2"
+                  Visibility="Collapsed"
+                  Margin="0,12,0,0"
+                  Padding="14"
+                  Background="#FFF7E8"
+                  BorderBrush="{StaticResource AudreyAccent}"
+                  BorderThickness="1"
+                  CornerRadius="14">
+            <DockPanel>
+              <StackPanel DockPanel.Dock="Left">
+                <TextBlock Text="AURORA PERMISSION"
+                           FontSize="12"
+                           FontWeight="SemiBold"
+                           Foreground="{StaticResource AudreyAccent}" />
+                <TextBlock x:Name="PermissionText"
+                           Margin="0,4,0,0"
+                           TextWrapping="Wrap"
+                           Foreground="{StaticResource AudreyText}" />
+              </StackPanel>
+              <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" HorizontalAlignment="Right">
+                <Button Content="拒绝" Click="DenyPermissionButton_Click" Style="{StaticResource PillButton}" />
+                <Button Content="总是允许" Click="AlwaysAllowPermissionButton_Click" Style="{StaticResource PillButton}" />
+                <Button Content="允许" Click="AllowPermissionButton_Click" Style="{StaticResource PillButton}" />
+              </StackPanel>
+            </DockPanel>
+          </Border>
+
+          <Grid Grid.Row="3" Margin="0,12,0,0">
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="*" />
+              <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <TextBox x:Name="InputBox"
+                     Grid.Column="0"
+                     MinHeight="78"
+                     MaxHeight="150"
+                     AcceptsReturn="True"
+                     TextWrapping="Wrap"
+                     VerticalScrollBarVisibility="Auto"
+                     Padding="12"
+                     BorderBrush="#D8E8E4"
+                     Background="#FFFDF8"
+                     Foreground="{StaticResource AudreyText}"
+                     KeyDown="InputBox_KeyDown"
+                     DataObject.Pasting="InputBox_Pasting" />
+            <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Bottom">
+              <Button Content="上传图片" Click="UploadButton_Click" Style="{StaticResource PillButton}" />
+              <Button Content="清空" Click="ClearButton_Click" Style="{StaticResource PillButton}" />
+              <Button Content="停止" Click="StopButton_Click" Style="{StaticResource PillButton}" />
+              <Button Content="发送" Click="SendButton_Click" Style="{StaticResource PillButton}" />
+            </StackPanel>
+          </Grid>
+        </Grid>
+      </Grid>
+    </Grid>
+  </Border>
+</Window>

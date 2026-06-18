@@ -468,9 +468,7 @@ class QuickContextMenu:
 
     def _open_chat(self):
         """打开 AI 对话窗口"""
-        from .chat_window import show_chat_dialog
-
-        show_chat_dialog(self.pet.root, self.manager, self.version)
+        self.manager.show_chat_window(self.pet.root, self.version)
     
     def _quit(self):
         """退出程序"""
@@ -515,9 +513,7 @@ class QuickContextMenu:
             show_settings_dialog(self.pet.root, self.manager, self.version)
 
         def on_chat(icon, item):
-            from .chat_window import show_chat_dialog
-
-            show_chat_dialog(self.pet.root, self.manager, self.version)
+            self.pet.root.after(0, lambda: self.manager.show_chat_window(self.pet.root, self.version))
         
         def on_quit(icon):
             self.manager.request_quit()

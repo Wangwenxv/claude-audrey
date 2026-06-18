@@ -45,9 +45,7 @@ def create_tray(app, version):
 
     def on_chat(icon, item):
         """打开 AI 对话窗口"""
-        from .chat_window import show_chat_dialog
-
-        show_chat_dialog(app.root, app, version)
+        app.root.after(0, lambda: app.show_chat_window(app.root, version))
 
     def on_quit(icon):
         """退出（只发信号，主线程统一收尾）"""
