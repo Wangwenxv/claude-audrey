@@ -209,6 +209,8 @@ class ChatWindow:
         self._status_dot_item = None
         self._status_dot_job = None
         self._status_dot_phase = 0.0
+        self._status_dot_tween = None
+        self._status_fade_seq = 0  # 状态行淡入用的自增标签序号
 
         self.theme = get_theme()
         self.fonts = self.theme['fonts']
@@ -490,6 +492,40 @@ class ChatWindow:
             style=tk.ARC, outline=color, width=1, tags=tag,
         )
         canvas.create_oval(x - 1 + d * 8, y - 7, x + 1 + d * 8, y - 5, fill=color, outline='', tags=tag)
+
+    def _draw_bubble_flourish(self, canvas, side):
+        """对话框下沿的金色卷草花纹：渐隐双金线 + 收尾卷草 + 点睛星光，
+        让气泡更像一帧考究的信笺。side='w' 左(奥黛丽)，'e' 右(用户)。"""
+        if canvas is None or not canvas.winfo_exists():
+            return
+        width = canvas.winfo_width()
+        height = canvas.winfo_height()
+        if width <= 2 or height <= 2:
+            return
+
+        gold = self.colors['gold']
+        gold_bright = self.colors['gold_bright']
+        gold_soft = self.colors['gold_soft']
+        cy = height // 2
+
+        canvas.delete('bubble_orn')
+        # 锚定端贴气泡一侧，金线向内侧延伸
+        if side == 'e':
+            x0 = width - 6
+            d = -1
+        else:
+            x0 = 6
+            d = 1
+        span = max(40, min(150, width - 16))
+        x1 = x0 + d * span
+        # 渐隐双金线
+        canvas.create_line(x0, cy, x1, cy, fill=gold, width=1, tags='bubble_orn')
+        canvas.create_line(x0 + d * 12, cy + 3, x1 - d * 16, cy + 3, fill=gold_soft, width=1, tags='bubble_orn')
+        # 收尾卷草
+        self._draw_scroll_flourish(canvas, x1, cy, d, gold, 'bubble_orn')
+        # 锚端星光 + 线身小星点
+        self._draw_sparkle(canvas, x0 + d * 3, cy, 3, gold_bright, 'bubble_orn')
+        self._draw_sparkle(canvas, x0 + d * int(span * 0.55), cy, 3, gold, 'bubble_orn')
 
     def _paint_header_ornament(self, event=None):
         canvas = self._chat_header_canvas
@@ -3069,14 +3105,32 @@ class ChatWindow:
             self._status_dot_job = None
 
         if self._busy:
+            if self._status_dot_tween is not None:
+                self._status_dot_tween.cancel()
             self._status_dot_phase = 0.0
             self._pulse_status_dot()
             return
         color = self.colors['accent'] if self._session_connected else self.colors['border_strong']
-        try:
-            self._status_dot.itemconfigure(self._status_dot_item, fill=color)
-        except Exception:
-            pass
+        self._tween_status_dot_to(color)
+
+    def _tween_status_dot_to(self, color: str):
+        """状态灯颜色缓动过渡，让"忙碌→空闲"的切换不再生硬。"""
+        if self._status_dot is None or self._status_dot_item is None:
+            return
+        if not self._status_dot.winfo_exists():
+            return
+        if self._status_dot_tween is None:
+            self._status_dot_tween = ColorTween(
+                self._status_dot,
+                lambda colors: (
+                    self._status_dot.winfo_exists()
+                    and self._status_dot.itemconfigure(self._status_dot_item, fill=colors['c'])
+                ),
+                duration_ms=260,
+                steps=12,
+            )
+            self._status_dot_tween.set_immediate({'c': color})
+        self._status_dot_tween.animate_to({'c': color}, duration_ms=260)
 
     def _pulse_status_dot(self):
         if self._status_dot is None or not self._status_dot.winfo_exists() or not self._busy:
@@ -3091,6 +3145,27 @@ class ChatWindow:
         self._status_dot_phase += 0.45
         self._status_dot_job = self._status_dot.after(60, self._pulse_status_dot)
 
+    def _fade_in_status_tag(self, tag_name: str, final_color: str, *, duration_ms: int = 240):
+        """让某段状态文字的前景色从面板色（近乎隐形）柔和淡入到目标色。"""
+        if self.text_area is None or not self.text_area.winfo_exists():
+            return
+        start = self.colors['panel']
+        try:
+            self.text_area.tag_configure(tag_name, foreground=start)
+        except Exception:
+            return
+
+        def _apply(colors, _tag=tag_name):
+            if self.text_area is not None and self.text_area.winfo_exists():
+                try:
+                    self.text_area.tag_configure(_tag, foreground=colors['f'])
+                except Exception:
+                    pass
+
+        tween = ColorTween(self.text_area, _apply, duration_ms=duration_ms, steps=12)
+        tween.set_immediate({'f': start})
+        tween.animate_to({'f': final_color}, duration_ms=duration_ms)
+
     def _append_inline_status(self, text: str):
         if self.text_area is None:
             compact = self._task_progress_compact_text(text)
@@ -3098,9 +3173,12 @@ class ChatWindow:
                 self._set_status_var_text(compact)
             return
         self._capture_transcript_follow_state()
+        self._status_fade_seq += 1
+        fade_tag = f'status_fade_{self._status_fade_seq}'
         self.text_area.config(state=tk.NORMAL)
-        self.text_area.insert(tk.END, f'[状态] {text}\n\n', ('status',))
+        self.text_area.insert(tk.END, f'[状态] {text}\n\n', ('status', fade_tag))
         self.text_area.config(state=tk.DISABLED)
+        self._fade_in_status_tag(fade_tag, self.colors['muted'])
         self._maybe_follow_transcript_end()
 
     def _set_status_var_text(self, text: str):
@@ -3138,11 +3216,14 @@ class ChatWindow:
         if not compact:
             return
         ranges = self.text_area.tag_ranges('inline_status')
+        self._status_fade_seq += 1
+        fade_tag = f'status_fade_{self._status_fade_seq}'
         self.text_area.config(state=tk.NORMAL)
         if len(ranges) >= 2:
             self.text_area.delete(ranges[0], ranges[-1])
-        self.text_area.insert(tk.END, f'[状态] {compact}\n\n', ('status', 'inline_status'))
+        self.text_area.insert(tk.END, f'[状态] {compact}\n\n', ('status', 'inline_status', fade_tag))
         self.text_area.config(state=tk.DISABLED)
+        self._fade_in_status_tag(fade_tag, self.colors['muted'])
         self._maybe_follow_transcript_end()
 
     # ── 统一状态管理 ─────────────────────────────────────────────
@@ -3874,6 +3955,7 @@ class ChatWindow:
             bubble.pack(anchor='e')
             container._message_bubble = bubble
             container._bubble_border = bubble_border
+            container._bubble_bg = bubble_bg
             container._message_text = text
             container._message_plain_text = plain_text
             container._message_is_expanded = not is_collapsible
@@ -3893,8 +3975,12 @@ class ChatWindow:
                 toggle.bind('<Button-1>', lambda _event, item=container: self._toggle_message_expand(item), add='+')
                 self._bind_toggle_hover(toggle)
 
+            flourish = tk.Canvas(content_col, height=16, bg=self.colors['panel'], highlightthickness=0, bd=0)
+            flourish.pack(anchor='e', fill=tk.X, pady=(7, 0))
+            flourish.bind('<Configure>', lambda _e, c=flourish: self._draw_bubble_flourish(c, 'e'), add='+')
+
             meta = tk.Frame(content_col, bg=self.colors['panel'])
-            meta.pack(anchor='e', pady=(6, 0))
+            meta.pack(anchor='e', pady=(4, 0))
             tk.Label(
                 meta,
                 text='You',
@@ -3951,6 +4037,7 @@ class ChatWindow:
             bubble.pack(anchor='w')
             container._message_bubble = bubble
             container._bubble_border = bubble_border
+            container._bubble_bg = bubble_bg
             container._message_text = text
             container._message_plain_text = plain_text
             container._message_is_expanded = not is_collapsible
@@ -3970,8 +4057,12 @@ class ChatWindow:
                 toggle.bind('<Button-1>', lambda _event, item=container: self._toggle_message_expand(item), add='+')
                 self._bind_toggle_hover(toggle)
 
+            flourish = tk.Canvas(content_col, height=16, bg=self.colors['panel'], highlightthickness=0, bd=0)
+            flourish.pack(anchor='w', fill=tk.X, pady=(7, 0))
+            flourish.bind('<Configure>', lambda _e, c=flourish: self._draw_bubble_flourish(c, 'w'), add='+')
+
             meta = tk.Frame(content_col, bg=self.colors['panel'])
-            meta.pack(anchor='w', pady=(6, 0))
+            meta.pack(anchor='w', pady=(4, 0))
             tk.Label(
                 meta,
                 text='奥黛丽',
@@ -4046,23 +4137,82 @@ class ChatWindow:
             self._conversation_history = self._conversation_history[-12:]
 
     def _animate_bubble_entrance(self, card):
-        """新消息登场：气泡描边从金色微光过渡回常态，给一个轻巧的"到达"提示。"""
-        if card is None:
+        """新消息登场：气泡自面板"浮起"（高度由矮渐展）+ 底色淡入 + 金边微光回落，
+        合成柔和的"淡入 + 入场"观感，而非生硬瞬现。"""
+        if card is None or not card.winfo_exists():
             return
         bubble = getattr(card, '_message_bubble', None)
         final_border = getattr(card, '_bubble_border', None)
-        if bubble is None or final_border is None or not bubble.winfo_exists():
+        final_bg = getattr(card, '_bubble_bg', None)
+        if bubble is None or not bubble.winfo_exists():
             return
+
+        # 目标高度：以创建时落定的 card 高度为准（pack_propagate 已关闭）
+        try:
+            target_h = int(card.cget('height'))
+        except Exception:
+            target_h = 0
+        if target_h <= 1:
+            try:
+                target_h = int(card.winfo_reqheight() or 0)
+            except Exception:
+                target_h = 0
+
+        panel = self.colors['panel']
         glow = self.colors['gold_bright']
-        tween = ColorTween(
-            bubble,
-            lambda colors: bubble.winfo_exists() and bubble.config(highlightbackground=colors['b']),
-            duration_ms=420,
-            steps=14,
-        )
-        tween.set_immediate({'b': glow})
-        tween.animate_to({'b': final_border}, duration_ms=420)
-        card._entrance_tween = tween
+        start_h = max(16, int(target_h * 0.55)) if target_h > 0 else 0
+
+        steps = 16
+        interval = 16
+        # 起始态：矮一截 + 底色贴近面板 + 金色描边微光，仿佛刚从桌面浮现
+        if target_h > 0:
+            try:
+                card.configure(height=start_h)
+            except Exception:
+                pass
+        try:
+            if final_bg is not None:
+                bubble.config(bg=panel)
+            if final_border is not None:
+                bubble.config(highlightbackground=glow)
+        except Exception:
+            pass
+
+        def _tick(step):
+            if not card.winfo_exists() or not bubble.winfo_exists():
+                return
+            p = _ease_out_cubic(step / steps)
+            if target_h > 0:
+                h = int(start_h + (target_h - start_h) * p)
+                try:
+                    card.configure(height=max(1, h))
+                except Exception:
+                    pass
+            try:
+                if final_bg is not None:
+                    bubble.config(bg=_blend_colors(panel, final_bg, p))
+                if final_border is not None:
+                    bubble.config(highlightbackground=_blend_colors(glow, final_border, p))
+            except Exception:
+                pass
+            if step < steps:
+                card._entrance_job = card.after(interval, lambda: _tick(step + 1))
+            else:
+                # 收尾：精确落定到目标值，避免插值残留
+                try:
+                    if target_h > 0:
+                        card.configure(height=target_h)
+                    if final_bg is not None:
+                        bubble.config(bg=final_bg)
+                    if final_border is not None:
+                        bubble.config(highlightbackground=final_border)
+                except Exception:
+                    pass
+                card._entrance_job = None
+                if self._auto_follow_transcript:
+                    self._maybe_follow_transcript_end()
+
+        _tick(1)
 
     def _bind_toggle_hover(self, toggle):
         """折叠/展开链接的悬停反馈：颜色加深 + 下划线，明确它可点。"""
