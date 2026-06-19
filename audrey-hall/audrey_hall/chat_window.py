@@ -202,6 +202,7 @@ class ChatWindow:
         self._markdown_fonts = None
         self._pending_image_attachments = []
         self._attachment_preview_frame = None
+        self._chat_header_canvas = None
 
         self.theme = get_theme()
         self.fonts = self.theme['fonts']
@@ -448,23 +449,62 @@ class ChatWindow:
 
     def _aurora_button_style(self):
         return {
-            'bg': '#F8FCFB',
+            'bg': '#FBFFFC',
             'fg': '#2E4245',
-            'highlightbackground': '#CFAF5F',
+            'highlightbackground': '#D1AE61',
             'highlightthickness': 0,
             
-            'hover_bg': '#EDF7F4',
+            'hover_bg': '#F6EBCB',
             'hover_fg': '#1F3033',
-            'hover_border_color': '#F9BE00',
+            'hover_border_color': '#F0D88D',
             'hover_border_thickness': 1,
-            'hover_color': '##F9BE00',
+            'hover_color': '#F0D88D',
             
-            'pressed_bg': '#F0E2C8',
+            'pressed_bg': '#D7EFE5',
             'pressed_fg': '#1F3033',
-            'pressed_border_color': '#9A7233',
+            'pressed_border_color': '#8D6835',
             
-            'pulse_border_off_color': '#FCF9F0',
+            'pulse_border_off_color': '#FCFFFB',
         }
+
+    def _paint_header_ornament(self, event=None):
+        canvas = self._chat_header_canvas
+        if canvas is None:
+            return
+        width = event.width if event is not None else canvas.winfo_width()
+        height = event.height if event is not None else canvas.winfo_height()
+        if width <= 2 or height <= 2:
+            return
+
+        canvas.delete('ornament')
+        canvas.create_rectangle(0, 0, width, height, fill='#DDEDEA', outline='', tags='ornament')
+        canvas.create_oval(-60, -28, 190, 54, fill='#F5FFFA', outline='', stipple='gray75', tags='ornament')
+        canvas.create_oval(width - 180, -34, width + 46, 56, fill='#ECF8F5', outline='', stipple='gray75', tags='ornament')
+        canvas.create_line(18, height // 2, width - 18, height // 2, fill='#D1AE61', width=1, tags='ornament')
+        canvas.create_line(84, height // 2 + 7, width - 84, height // 2 + 7, fill='#F0D88D', width=1, tags='ornament')
+        canvas.create_arc(width - 58, 5, width - 32, 31, start=80, extent=235, style=tk.ARC, outline='#D1AE61', width=1, tags='ornament')
+        for x, y, size in ((42, height // 2 - 8, 4), (width - 96, height // 2 - 7, 4)):
+            canvas.create_line(x - size, y, x + size, y, fill='#F0D88D', width=1, tags='ornament')
+            canvas.create_line(x, y - size, x, y + size, fill='#F0D88D', width=1, tags='ornament')
+
+    def _paint_input_shell(self, event=None):
+        canvas = self._input_canvas
+        if canvas is None:
+            return
+        width = event.width if event is not None else canvas.winfo_width()
+        height = event.height if event is not None else canvas.winfo_height()
+        if width <= 2 or height <= 2:
+            return
+
+        canvas.delete('input_decor')
+        canvas.create_rectangle(0, 0, width, height, fill=self.colors['bg'], outline='', tags='input_decor')
+        canvas.create_rectangle(12, 8, width - 12, height - 8, fill='#F4FBF2', outline='#D1AE61', width=1, tags='input_decor')
+        canvas.create_line(22, height - 17, width - 22, height - 17, fill='#F0D88D', width=1, tags='input_decor')
+        canvas.create_line(24, 16, width - 24, 16, fill='#E5D392', width=1, tags='input_decor')
+        for x, y in ((30, 26), (width - 36, height - 30)):
+            canvas.create_line(x - 4, y, x + 4, y, fill='#D1AE61', width=1, tags='input_decor')
+            canvas.create_line(x, y - 4, x, y + 4, fill='#D1AE61', width=1, tags='input_decor')
+        canvas.tag_lower('input_decor')
 
     def _update_input_background(self, event=None):
         if self._input_canvas is None or self._input_bg_source is None:
@@ -743,13 +783,33 @@ class ChatWindow:
 
         title_row = tk.Frame(header, bg=self.colors['bg'])
         title_row.pack(fill=tk.X)
+        title_text = tk.Frame(title_row, bg=self.colors['bg'])
+        title_text.pack(side=tk.LEFT, fill=tk.X, expand=True)
         tk.Label(
-            title_row,
+            title_text,
             text='与奥黛丽聊聊',
             font=self.fonts['title'],
             bg=self.colors['bg'],
-            fg=self.colors['text'],
-        ).pack(side=tk.LEFT)
+            fg=self.colors['text_strong'],
+            anchor='w',
+        ).pack(fill=tk.X)
+        tk.Label(
+            title_text,
+            text='Audrey Hall x Claude Code',
+            font=self.fonts['small'],
+            bg=self.colors['bg'],
+            fg=self.colors['muted'],
+            anchor='w',
+        ).pack(fill=tk.X, pady=(4, 0))
+        self._chat_header_canvas = tk.Canvas(
+            header,
+            height=34,
+            bg=self.colors['bg'],
+            highlightthickness=0,
+            bd=0,
+        )
+        self._chat_header_canvas.pack(fill=tk.X, pady=(8, 0))
+        self._chat_header_canvas.bind('<Configure>', self._paint_header_ornament, add='+')
         tk.Label(
             title_row,
             textvariable=self._connection_time_var,
@@ -757,14 +817,6 @@ class ChatWindow:
             bg=self.colors['bg'],
             fg=self.colors['accent'],
         ).pack(side=tk.RIGHT, pady=(0, 4))
-
-        tk.Label(
-            header,
-            text='Audrey Hall x Claude Code',
-            font=self.fonts['small'],
-            bg=self.colors['bg'],
-            fg=self.colors['muted'],
-        ).pack(anchor='w', pady=(4, 0))
 
         tk.Label(
             header,
@@ -926,15 +978,15 @@ class ChatWindow:
         self.text_area.tag_configure('task_progress', foreground=self.colors['muted'])
         # ── 终端风格标签 ──────────────────────────────────────────
         self.text_area.tag_configure(
-            'term_tool', foreground='#3D8884',
+            'term_tool', foreground='#4F827B',
             font=('Consolas', 10, 'bold'),
         )
         self.text_area.tag_configure(
-            'term_tool_detail', foreground='#6B8587',
+            'term_tool_detail', foreground='#638083',
             font=('Consolas', 9),
         )
         self.text_area.tag_configure(
-            'term_result', foreground='#555548',
+            'term_result', foreground='#5C624F',
             font=('Consolas', 9),
         )
         self.text_area.tag_configure(
@@ -942,7 +994,7 @@ class ChatWindow:
             font=self.fonts['small'],
         )
         self.text_area.tag_configure(
-            'term_prefix', foreground='#A09078',
+            'term_prefix', foreground='#8D6835',
             font=('Consolas', 9),
         )
         self.text_area.tag_configure(
@@ -964,13 +1016,13 @@ class ChatWindow:
         # 思考标题行——可点击切换折叠/展开
         self.text_area.tag_configure(
             'term_thinking_header',
-            foreground='#6B5E4B',
+            foreground='#8D6835',
             font=('Consolas', 9, 'bold'),
             underline=False,
         )
         # 思考内容展开时的文本
         self.text_area.tag_configure(
-            'term_thinking', foreground='#8B7E6B',
+            'term_thinking', foreground='#6F817F',
             font=('Consolas', 9),
         )
         # 绑定点击事件：点击 thinking_toggle 标签区切换折叠
@@ -993,7 +1045,7 @@ class ChatWindow:
             height=self.window_theme['input_height'],
             wrap=tk.WORD,
             font=self.fonts['base'],
-            bg='#E3EFE8',
+            bg=self.colors['input_bg'],
             fg=self.colors['text'],
             relief=tk.FLAT,
             insertbackground=self.colors['accent_dark'],
@@ -1012,10 +1064,13 @@ class ChatWindow:
         )
         input_shell.bind(
             '<Configure>',
-            lambda event: input_shell.itemconfigure(
-                input_window_id,
-                width=max(1, event.width - 36),
-                height=max(1, event.height - 28),
+            lambda event: (
+                input_shell.itemconfigure(
+                    input_window_id,
+                    width=max(1, event.width - 36),
+                    height=max(1, event.height - 28),
+                ),
+                self._paint_input_shell(event),
             ),
             add='+',
         )
@@ -1091,12 +1146,12 @@ class ChatWindow:
     def _build_history_sidebar(self, parent):
         tk.Label(
             parent,
-            text='AURORA HISTORY',
+            text='AURORA SALON',
             font=self.fonts['small'],
             bg=self.colors['panel'],
             fg=self.colors['gold'],
             anchor='w',
-        ).pack(fill=tk.X, padx=12, pady=(12, 4))
+        ).pack(fill=tk.X, padx=14, pady=(14, 4))
         tk.Label(
             parent,
             text='最近会话',
@@ -1104,10 +1159,23 @@ class ChatWindow:
             bg=self.colors['panel'],
             fg=self.colors['text'],
             anchor='w',
-        ).pack(fill=tk.X, padx=12)
+        ).pack(fill=tk.X, padx=14)
+
+        ornament = tk.Canvas(parent, height=22, bg=self.colors['panel'], highlightthickness=0, bd=0)
+        ornament.pack(fill=tk.X, padx=14, pady=(4, 4))
+
+        def _paint_sidebar_ornament(event):
+            width = event.width
+            ornament.delete('all')
+            ornament.create_line(0, 11, width, 11, fill=self.colors['gold_soft'], width=1)
+            ornament.create_oval(width // 2 - 7, 4, width // 2 + 7, 18, outline=self.colors['gold'], width=1)
+            ornament.create_line(width // 2 - 4, 11, width // 2 + 4, 11, fill=self.colors['gold'], width=1)
+            ornament.create_line(width // 2, 7, width // 2, 15, fill=self.colors['gold'], width=1)
+
+        ornament.bind('<Configure>', _paint_sidebar_ornament, add='+')
 
         toolbar = tk.Frame(parent, bg=self.colors['panel'])
-        toolbar.pack(fill=tk.X, padx=12, pady=(10, 8))
+        toolbar.pack(fill=tk.X, padx=12, pady=(8, 8))
         create_button(
             toolbar,
             text='新建会话',
@@ -1293,8 +1361,8 @@ class ChatWindow:
     def _render_history_item(self, item: dict):
         session_id = item.get('session_id') or ''
         is_active = session_id == self._current_session_id()
-        card_bg = '#F8FBFA' if not is_active else '#F3E3BF'
-        border = '#D6B36A' if is_active else '#D8E8E4'
+        card_bg = '#FBFFFC' if not is_active else '#F6EBCB'
+        border = '#D1AE61' if is_active else '#D7EFE5'
         card = tk.Frame(self._history_container, bg=border, bd=0, highlightthickness=0, cursor='hand2')
         inner = tk.Frame(card, bg=card_bg, bd=0, highlightthickness=0)
         inner.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
@@ -2972,15 +3040,15 @@ class ChatWindow:
             card = create_card(
                 self.text_area,
                 self.theme,
-                bg='panel',
-                border='border',
+                bg='info',
+                border='gold',
             )
             label = tk.Label(
                 card,
                 text='',
                 font=self._tool_status_font,
-                bg=self.colors['panel'],
-                fg='#3D8884',
+                bg=self.colors['info'],
+                fg=self.colors['accent_dark'],
                 justify='left',
                 anchor='w',
                 wraplength=max(240, self._transcript_width - 60),
@@ -3046,14 +3114,14 @@ class ChatWindow:
             card = create_card(
                 self.text_area,
                 self.theme,
-                bg='panel',
-                border='border',
+                bg='info',
+                border='accent_soft',
             )
             label = tk.Label(
                 card,
                 text='',
                 font=self._task_widget_font,
-                bg=self.colors['panel'],
+                bg=self.colors['info'],
                 fg=self.colors['muted'],
                 justify='left',
                 anchor='w',
@@ -3490,13 +3558,18 @@ class ChatWindow:
         is_error = role == 'error'
         is_warn = role == 'warn'
 
-        bubble_bg = '#EAF6EE'
+        bubble_bg = '#EFF9F0'
+        bubble_border = '#BFE3CA'
+        bubble_fg = self.colors['text_strong']
         if is_user:
-            bubble_bg = '#E8F1FF'
+            bubble_bg = '#F8E7EC'
+            bubble_border = '#E8BFCA'
         elif is_error:
             bubble_bg = self.colors['error']
+            bubble_border = '#DAB8BE'
         elif is_warn:
             bubble_bg = self.colors['warn']
+            bubble_border = self.colors['gold']
 
         row = tk.Frame(container, bg=self.colors['panel'], width=self._transcript_width)
         row.pack(fill=tk.X)
@@ -3511,7 +3584,7 @@ class ChatWindow:
             if user_avatar is not None:
                 tk.Label(avatar_col, image=user_avatar, bg=self.colors['panel'], bd=0).pack(anchor='e')
             else:
-                fallback = tk.Canvas(avatar_col, width=48, height=48, bg='#E8F1FF', highlightthickness=0, bd=0)
+                fallback = tk.Canvas(avatar_col, width=48, height=48, bg='#F8E7EC', highlightthickness=0, bd=0)
                 fallback.create_text(24, 24, text='你', font=self.fonts['title'], fill=self.colors['accent_dark'])
                 fallback.pack(anchor='e')
 
@@ -3527,13 +3600,13 @@ class ChatWindow:
                 bubble_wrap,
                 font=self.fonts['base'],
                 bg=bubble_bg,
-                fg=self.colors['text_strong'],
+                fg=bubble_fg,
                 wrap=tk.WORD,
                 width=text_width_chars,
                 height=text_height,
                 padx=14,
                 pady=10,
-                highlightbackground='#C8D8F4',
+                highlightbackground=bubble_border,
                 highlightthickness=1,
                 bd=0,
                 relief=tk.FLAT,
@@ -3572,7 +3645,7 @@ class ChatWindow:
                 text='You',
                 font=self.fonts['control'],
                 bg=self.colors['panel'],
-                fg=self.colors['muted'],
+                fg='#9B6874',
             ).pack(side=tk.LEFT)
             tk.Label(
                 meta,
@@ -3602,13 +3675,13 @@ class ChatWindow:
                 content_col,
                 font=self.fonts['base'],
                 bg=bubble_bg,
-                fg=self.colors['text_strong'],
+                fg=bubble_fg,
                 wrap=tk.WORD,
                 width=text_width_chars,
                 height=text_height,
                 padx=14,
                 pady=10,
-                highlightbackground='#CFE2D3' if is_assistant else self.colors['gold_soft'],
+                highlightbackground=bubble_border if is_assistant else self.colors['gold_soft'],
                 highlightthickness=1,
                 bd=0,
                 relief=tk.FLAT,
@@ -3647,7 +3720,7 @@ class ChatWindow:
                 text='奥黛丽',
                 font=self.fonts['control'],
                 bg=self.colors['panel'],
-                fg=self.colors['muted'],
+                fg=self.colors['gold_deep'],
             ).pack(side=tk.LEFT)
             tk.Label(
                 meta,
@@ -3743,10 +3816,10 @@ class ChatWindow:
         widget.tag_configure('md_h2', font=h2_font, spacing1=6, spacing3=4)
         widget.tag_configure('md_h3', font=h3_font, spacing1=6, spacing3=3)
         widget.tag_configure('md_bold', font=strong_font)
-        widget.tag_configure('md_inline_code', font=code_font, background='#F4EFE4', foreground='#7A5530')
-        widget.tag_configure('md_code_block', font=code_font, background='#F7F3EA', foreground='#5B4D3A', lmargin1=12, lmargin2=12)
-        widget.tag_configure('md_quote', foreground='#6B7C7E', lmargin1=12, lmargin2=12)
-        widget.tag_configure('md_list_marker', foreground='#68898C')
+        widget.tag_configure('md_inline_code', font=code_font, background='#F6EBCB', foreground='#6B4E2B')
+        widget.tag_configure('md_code_block', font=code_font, background='#F8F5E8', foreground='#4F625E', lmargin1=12, lmargin2=12)
+        widget.tag_configure('md_quote', foreground='#638083', lmargin1=12, lmargin2=12)
+        widget.tag_configure('md_list_marker', foreground='#8D6835')
 
     def _markdown_to_plain_text(self, text: str) -> str:
         if not isinstance(text, str) or not text:

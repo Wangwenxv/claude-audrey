@@ -1,0 +1,41 @@
+{
+  "version": 3,
+  "skills": {
+    "impeccable": {
+      "source": "pbakaus/impeccable",
+      "sourceType": "github",
+      "sourceUrl": "https://github.com/pbakaus/impeccable.git",
+      "skillPath": ".claude/skills/impeccable/SKILL.md",
+      "skillFolderHash": "19aaf53fe628fc3bfad7ddf0962d4a086b9983ae84a3f372bc0ed8e194c9ef1c",
+      "installedAt": "2026-06-19T02:33:37.268Z",
+      "updatedAt": "2026-06-19T02:33:37.268Z"
+    },
+    "find-skills": {
+      "source": "vercel-labs/skills",
+      "sourceType": "github",
+      "sourceUrl": "https://github.com/vercel-labs/skills.git",
+      "skillPath": "skills/find-skills/SKILL.md",
+      "skillFolderHash": "645b891da1edbae76ab79c7b088d4e73397464f8396edaf773c0e01971ce75d6",
+      "installedAt": "2026-06-19T02:33:44.783Z",
+      "updatedAt": "2026-06-19T02:36:25.432Z"
+    }
+  },
+  "dismissed": {
+    "findSkillsPrompt": true
+  },
+  "lastSelectedAgents": [
+    "amp",
+    "antigravity",
+    "antigravity-cli",
+    "cline",
+    "codex",
+    "cursor",
+    "deepagents",
+    "gemini-cli",
+    "github-copilot",
+    "kimi-code-cli",
+    "opencode",
+    "warp",
+    "zed"
+  ]
+}
