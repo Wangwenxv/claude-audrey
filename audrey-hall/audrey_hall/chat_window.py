@@ -1,3 +1,5 @@
+import base64
+import io
 import json
 import os
 import queue
@@ -9,6 +11,11 @@ from datetime import datetime
 from pathlib import Path
 
 from PIL import Image, ImageTk
+
+try:
+    from PIL import ImageGrab
+except Exception:
+    ImageGrab = None
 
 from .claude_agent import (
     CONNECTION_TARGET_LABELS,
@@ -40,8 +47,22 @@ MAX_SIDE_CONTEXT_CHARS = 2800
 MAX_STATUS_WIDTH_PX = 600
 MIN_STATUS_CORE_WIDTH_PX = 180
 MAX_HISTORY_SESSIONS = 18
-MAX_HISTORY_LABEL_CHARS = 7
+MAX_HISTORY_LABEL_CHARS = 14
 EVENT_POLL_INTERVAL_MS = 100
+WELCOME_MESSAGE = (
+    '不属于这个时代的愚者...\n\n'
+    '灰雾之上的神秘主宰...\n\n'
+    '执掌好运的黄黑之王...\n\n'
+    '按 Ctrl+Enter 发送，/btw 可发起旁路问题，Ctrl+V 可粘贴图片。'
+)
+INPUT_PLACEHOLDER = '输入想对奥黛丽说的话，Ctrl+Enter 发送，Ctrl+V 粘贴图片'
+SUPPORTED_IMAGE_FORMATS = {
+    'PNG': 'image/png',
+    'JPEG': 'image/jpeg',
+    'JPG': 'image/jpeg',
+    'GIF': 'image/gif',
+    'WEBP': 'image/webp',
+}
 CONNECTION_TARGET_CHOICES = [
     ('auto', '自动抉择'),
     ('project', '奥黛丽agent'),
@@ -86,8 +107,20 @@ class ChatWindow:
         self.status_var = tk.StringVar(value='正在唤醒奥黛丽的助手...')
         self._event_queue = queue.Queue()
         self._busy = False
+        self._status_dot = None
+        self._status_dot_item = None
+        self._status_label = None
+        self._aurora_bar = None
+        self._aurora_bar_item = None
+        self._aurora_bar_job = None
+        self._aurora_phase = 0
+        self._aurora_direction = 1
+        self._aurora_colors = ('#DDE9E5', '#B8D1CB')
+        self._attachment_preview_frame = None
+        self._content_pane = None
         self._auto_allow_tools = set()  # 用户选择“总是允许”的工具名
         self._pending_perm_frames = {}  # request_id -> 内嵌权限卡片 frame
+        self._pending_image_attachments = []
         self._conversation_history = []
         self._active_model = 'default'
         self._active_permission_mode = 'default'
@@ -110,12 +143,15 @@ class ChatWindow:
         self._connection_start_time = None
         self._connection_time_var = tk.StringVar(value='')
         self._connection_time_timer = None
+        self._input_shell_frame = None
+        self._input_placeholder_active = False
 
         self.theme = get_theme()
         self.fonts = self.theme['fonts']
         self.colors = self.theme['colors']
         self.window_theme = self.theme['windows']['chat']
         self.chat_theme = self.theme['chat']
+        self.status_var.trace_add('write', self._handle_status_var_change)
 
         avatar_path = os.path.join(os.path.dirname(__file__), 'img', 'avat.png')
         if os.path.isfile(avatar_path):
@@ -350,6 +386,353 @@ class ChatWindow:
             },
         )
 
+    def _handle_status_var_change(self, *_args):
+        self._refresh_status_visuals()
+
+    def _color(self, key: str) -> str:
+        return self.colors.get(key, key)
+
+    def _welcome_message(self) -> str:
+        return WELCOME_MESSAGE
+
+    def _set_widget_tree_bg(self, widget, bg: str, *, exclude=None):
+        excluded = set(exclude or ())
+        if widget in excluded:
+            return
+        try:
+            widget.configure(bg=bg)
+        except Exception:
+            pass
+        for child in widget.winfo_children():
+            self._set_widget_tree_bg(child, bg, exclude=excluded)
+
+    def _status_palette(self, text: str) -> tuple[str, str]:
+        compact = (text or '').strip()
+        if any(token in compact for token in ('失败', '错误', '拒绝', '超时')):
+            return self._color('danger_edge'), self._color('text_strong')
+        if any(token in compact for token in ('允许', '权限', '模式', '切换')):
+            return self._color('line_gold'), self._color('text_strong')
+        if any(token in compact for token in ('完成', '已连接', '恢复', '创建', '清除', '空闲')):
+            return self._color('accent_dark'), self._color('text_strong')
+        if any(token in compact for token in ('思考', '理解', '处理中', '进行中', '呼唤')):
+            return self._color('accent'), self._color('text')
+        return self._color('line_strong'), self._color('muted')
+
+    def _refresh_status_visuals(self):
+        if self._status_dot is None or self._status_dot_item is None:
+            return
+        dot_color, text_color = self._status_palette(self.status_var.get())
+        try:
+            self._status_dot.itemconfigure(self._status_dot_item, fill=dot_color, outline=dot_color)
+        except Exception:
+            pass
+        if self._status_label is not None:
+            try:
+                self._status_label.configure(fg=text_color)
+            except Exception:
+                pass
+        self._refresh_aurora_palette()
+
+    def _refresh_aurora_palette(self):
+        text = self.status_var.get()
+        primary, _text_color = self._status_palette(text)
+        compact = (text or '').strip()
+        if any(token in compact for token in ('思考', '理解', '处理中', '进行中')):
+            secondary = self._color('accent_dark')
+        elif any(token in compact for token in ('权限', '允许', '模式')):
+            secondary = self._color('gold')
+        elif any(token in compact for token in ('失败', '错误', '拒绝', '超时')):
+            secondary = self._color('danger_edge')
+        else:
+            secondary = self._color('line_soft')
+        self._aurora_colors = (primary, secondary)
+        self._draw_aurora_bar()
+
+    def _draw_aurora_bar(self):
+        if self._aurora_bar is None or self._aurora_bar_item is None:
+            return
+        width = max(1, int(self._aurora_bar.winfo_width() or 1))
+        height = max(1, int(self._aurora_bar.winfo_height() or 1))
+        base_color, glow_color = self._aurora_colors
+        progress = self._aurora_phase / 12.0
+        left = int(width * (0.15 + 0.55 * progress))
+        right = min(width, left + max(90, int(width * 0.28)))
+        self._aurora_bar.coords(self._aurora_bar_item, 0, 0, width, height)
+        try:
+            self._aurora_bar.itemconfigure(self._aurora_bar_item, fill=base_color, outline=base_color)
+        except Exception:
+            pass
+        self._aurora_bar.delete('aurora-glow')
+        self._aurora_bar.create_rectangle(left, 0, right, height, fill=glow_color, outline=glow_color, tags='aurora-glow')
+
+    def _tick_aurora_bar(self):
+        self._aurora_bar_job = None
+        if self.window is None or not self.window.winfo_exists() or self._aurora_bar is None:
+            return
+        self._aurora_phase += self._aurora_direction
+        if self._aurora_phase >= 12:
+            self._aurora_phase = 12
+            self._aurora_direction = -1
+        elif self._aurora_phase <= 0:
+            self._aurora_phase = 0
+            self._aurora_direction = 1
+        self._draw_aurora_bar()
+        self._aurora_bar_job = self.window.after(180, self._tick_aurora_bar)
+
+    def _start_aurora_bar(self):
+        if self.window is None or self._aurora_bar is None or self._aurora_bar_job is not None:
+            return
+        self._tick_aurora_bar()
+
+    def _has_input_text(self) -> bool:
+        if self.input_box is None or self._input_placeholder_active:
+            return False
+        return bool(self.input_box.get('1.0', tk.END).strip())
+
+    def _show_input_placeholder(self):
+        if self.input_box is None or self._has_input_text():
+            return
+        self._input_placeholder_active = True
+        self.input_box.configure(fg=self._color('text_soft'))
+        self.input_box.delete('1.0', tk.END)
+        self.input_box.insert('1.0', INPUT_PLACEHOLDER)
+
+    def _hide_input_placeholder(self):
+        if self.input_box is None or not self._input_placeholder_active:
+            return
+        self._input_placeholder_active = False
+        self.input_box.configure(fg=self._color('text'))
+        self.input_box.delete('1.0', tk.END)
+
+    def _handle_input_focus_in(self, _event=None):
+        self._set_input_focus_state(True)
+        if self._input_placeholder_active:
+            self._hide_input_placeholder()
+
+    def _handle_input_focus_out(self, _event=None):
+        self._set_input_focus_state(False)
+        if not self._has_input_text():
+            self._show_input_placeholder()
+
+    def _handle_input_keypress(self, _event=None):
+        if self._input_placeholder_active:
+            self._hide_input_placeholder()
+
+    def _set_input_focus_state(self, focused: bool):
+        if self._input_shell_frame is None:
+            return
+        border = self._color('input_focus' if focused else 'input_border')
+        try:
+            self._input_shell_frame.configure(bg=border)
+        except Exception:
+            pass
+
+    def _initialize_content_split(self, pane, transcript_frame, composer_card):
+        if self.window is None or not self.window.winfo_exists():
+            return
+        try:
+            pane.update_idletasks()
+            total_height = pane.winfo_height()
+            if total_height <= 1:
+                return
+            composer_target = max(220, min(320, int(total_height * 0.32)))
+            sash_y = max(260, total_height - composer_target)
+            pane.sash_place(0, 0, sash_y)
+        except Exception:
+            pass
+
+    def _create_inline_shell(
+        self,
+        eyebrow: str,
+        title: str,
+        *,
+        accent='accent',
+        border='line_soft',
+        body_bg='panel_tinted',
+        title_fg='text_strong',
+    ):
+        card = tk.Frame(self.text_area, bg=self._color(border), bd=0, highlightthickness=0)
+        body = tk.Frame(card, bg=self._color(body_bg), bd=0, highlightthickness=0)
+        body.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+
+        tk.Frame(body, bg=self._color(accent), height=3).pack(fill=tk.X)
+        header = tk.Frame(body, bg=self._color(body_bg))
+        header.pack(fill=tk.X, padx=self.chat_theme['inline_card_pad_x'], pady=(10, 6))
+        tk.Label(
+            header,
+            text=eyebrow,
+            font=self.fonts['eyebrow'],
+            bg=self._color(body_bg),
+            fg=self._color('gold'),
+            anchor='w',
+        ).pack(anchor='w')
+        tk.Label(
+            header,
+            text=title,
+            font=self.fonts['control'],
+            bg=self._color(body_bg),
+            fg=self._color(title_fg),
+            anchor='w',
+            justify='left',
+        ).pack(anchor='w', pady=(4, 0))
+        return card, body
+
+    def _clipboard_image_to_attachment(self):
+        if ImageGrab is None:
+            return None
+        try:
+            grabbed = ImageGrab.grabclipboard()
+        except Exception:
+            return None
+        if grabbed is None:
+            return None
+
+        image = None
+        if isinstance(grabbed, Image.Image):
+            image = grabbed
+        elif isinstance(grabbed, list):
+            for item in grabbed:
+                try:
+                    if isinstance(item, str) and os.path.isfile(item):
+                        with Image.open(item) as opened:
+                            image = opened.convert('RGBA' if opened.mode in ('RGBA', 'LA') else 'RGB')
+                        break
+                except Exception:
+                    continue
+        if image is None:
+            return None
+
+        if image.mode not in ('RGB', 'RGBA'):
+            image = image.convert('RGBA' if 'A' in image.mode else 'RGB')
+
+        output = io.BytesIO()
+        save_format = 'PNG' if image.mode == 'RGBA' else 'JPEG'
+        save_kwargs = {}
+        if save_format == 'JPEG':
+            image = image.convert('RGB')
+            save_kwargs['quality'] = 92
+        image.save(output, format=save_format, **save_kwargs)
+        encoded = base64.b64encode(output.getvalue()).decode('ascii')
+        width, height = image.size
+        return {
+            'type': 'image',
+            'media_type': SUPPORTED_IMAGE_FORMATS[save_format],
+            'data': encoded,
+            'filename': f'clipboard-{datetime.now().strftime("%H%M%S")}.{save_format.lower()}',
+            'dimensions': (width, height),
+        }
+
+    def _handle_input_paste(self, _event=None):
+        attachment = self._clipboard_image_to_attachment()
+        if attachment is None:
+            return None
+        self._pending_image_attachments.append(attachment)
+        self._refresh_attachment_preview()
+        self.status_var.set(f'已粘贴图片 {len(self._pending_image_attachments)} 张')
+        return 'break'
+
+    def _refresh_attachment_preview(self):
+        frame = self._attachment_preview_frame
+        if frame is None:
+            return
+        for child in list(frame.winfo_children()):
+            child.destroy()
+
+        if not self._pending_image_attachments:
+            return
+
+        tk.Label(
+            frame,
+            text=f'待发送图片 {len(self._pending_image_attachments)} 张',
+            font=self.fonts['small'],
+            bg=self.colors['panel'],
+            fg=self.colors['muted'],
+            anchor='w',
+        ).pack(fill=tk.X, pady=(0, 4))
+
+        chips = tk.Frame(frame, bg=self.colors['panel'])
+        chips.pack(fill=tk.X)
+        for index, item in enumerate(self._pending_image_attachments):
+            chip = tk.Frame(chips, bg=self.colors['panel_tinted'], highlightbackground=self.colors['line_soft'], highlightthickness=1)
+            chip.pack(fill=tk.X, pady=(0, 6))
+            dims = item.get('dimensions') or ()
+            size_text = ''
+            if len(dims) == 2:
+                size_text = f' ({dims[0]}x{dims[1]})'
+            content = tk.Frame(chip, bg=self.colors['panel_tinted'])
+            content.pack(fill=tk.X, expand=True)
+            tk.Label(
+                content,
+                text=(item.get('filename') or '图片') + size_text,
+                font=self.fonts['small'],
+                bg=self.colors['panel_tinted'],
+                fg=self.colors['text'],
+                padx=8,
+                pady=4,
+                justify='left',
+                anchor='w',
+            ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+            remove_button = tk.Label(
+                content,
+                text='✕',
+                font=self.fonts['small'],
+                bg=self.colors['panel_tinted'],
+                fg=self.colors['subtext'],
+                cursor='hand2',
+                padx=6,
+            )
+            remove_button.pack(side=tk.RIGHT)
+            remove_button.bind(
+                '<Button-1>',
+                lambda _event, idx=index: self._remove_pending_image_attachment(idx),
+                add='+',
+            )
+
+    def _remove_pending_image_attachment(self, index: int):
+        if index < 0 or index >= len(self._pending_image_attachments):
+            return
+        self._pending_image_attachments.pop(index)
+        self._refresh_attachment_preview()
+        if self._pending_image_attachments:
+            self.status_var.set(f'还剩 {len(self._pending_image_attachments)} 张待发送图片')
+        else:
+            self.status_var.set('图片附件已清空')
+
+    def _clear_pending_image_attachments(self):
+        if not self._pending_image_attachments:
+            return
+        self._pending_image_attachments = []
+        self._refresh_attachment_preview()
+
+    def _build_message_content(self, text: str):
+        clean_text = (text or '').strip()
+        if not self._pending_image_attachments:
+            return clean_text
+        blocks = []
+        for item in self._pending_image_attachments:
+            blocks.append(
+                {
+                    'type': 'image',
+                    'source': {
+                        'type': 'base64',
+                        'media_type': item['media_type'],
+                        'data': item['data'],
+                    },
+                }
+            )
+        if clean_text:
+            blocks.append({'type': 'text', 'text': clean_text})
+        return blocks
+
+    def _build_display_text(self, text: str) -> str:
+        clean_text = (text or '').strip()
+        image_count = len(self._pending_image_attachments)
+        if image_count and clean_text:
+            return f'[附带 {image_count} 张图片]\n{clean_text}'
+        if image_count:
+            return f'[附带 {image_count} 张图片]'
+        return clean_text
+
     def show(self):
         if self.window is not None and self.window.winfo_exists():
             self.window.lift()
@@ -392,7 +775,7 @@ class ChatWindow:
         # 全局 Ctrl+C 复制快捷键
         self.window.bind('<Control-c>', self._handle_window_copy)
         self.window.bind('<Control-C>', self._handle_window_copy)
-        self.window.configure(bg=self.colors['bg'])
+        self.window.configure(bg=self.colors['bg_app'])
         self.window.protocol('WM_DELETE_WINDOW', self.close)
 
         try:
@@ -401,7 +784,7 @@ class ChatWindow:
         except Exception:
             pass
 
-        main_frame = tk.Frame(self.window, bg=self.colors['bg'])
+        main_frame = tk.Frame(self.window, bg=self.colors['bg_app'])
         main_frame.pack(
             fill=tk.BOTH,
             expand=True,
@@ -409,137 +792,330 @@ class ChatWindow:
             pady=self.window_theme['outer_pad'],
         )
 
-        body_frame = tk.Frame(main_frame, bg=self.colors['bg'])
+        body_frame = tk.Frame(main_frame, bg=self.colors['bg_app'])
         body_frame.pack(fill=tk.BOTH, expand=True)
 
         side_panel = create_card(
             body_frame,
             self.theme,
             bg='panel',
-            border='border',
+            border='line_soft',
         )
         side_panel.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 14))
-        side_panel.configure(width=260)
+        side_panel.configure(width=self.chat_theme['sidebar_width'])
         side_panel.pack_propagate(False)
 
-        content_frame = tk.Frame(body_frame, bg=self.colors['bg'])
+        content_frame = tk.Frame(body_frame, bg=self.colors['bg_app'])
         content_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        header = tk.Frame(content_frame, bg=self.colors['bg'])
-        header.pack(fill=tk.X, pady=(0, self.window_theme['header_gap']))
+        header_card = create_card(
+            content_frame,
+            self.theme,
+            bg='panel',
+            border='line_soft',
+        )
+        header_card.pack(fill=tk.X, pady=(0, self.window_theme['header_gap']))
+        tk.Frame(header_card, bg=self.colors['accent'], height=3).pack(fill=tk.X)
 
-        title_row = tk.Frame(header, bg=self.colors['bg'])
+        header = tk.Frame(header_card, bg=self.colors['panel'])
+        header.pack(
+            fill=tk.X,
+            padx=self.chat_theme['header_pad_x'],
+            pady=self.chat_theme['header_pad_y'],
+        )
+
+        title_row = tk.Frame(header, bg=self.colors['panel'])
         title_row.pack(fill=tk.X)
-        tk.Label(
-            title_row,
-            text='与奥黛丽聊聊',
-            font=self.fonts['title'],
-            bg=self.colors['bg'],
-            fg=self.colors['text'],
-        ).pack(side=tk.LEFT)
-        tk.Label(
-            title_row,
-            textvariable=self._connection_time_var,
-            font=self.fonts['small'],
-            bg=self.colors['bg'],
-            fg=self.colors['accent'],
-        ).pack(side=tk.RIGHT, pady=(0, 4))
 
+        title_col = tk.Frame(title_row, bg=self.colors['panel'])
+        title_col.pack(side=tk.LEFT, fill=tk.X, expand=True)
         tk.Label(
-            header,
+            title_col,
+            text='与奥黛丽聊聊',
+            font=self.fonts['hero'],
+            bg=self.colors['panel'],
+            fg=self.colors['text_strong'],
+        ).pack(anchor='w')
+        tk.Label(
+            title_col,
             text='Audrey Hall x Claude Code',
             font=self.fonts['small'],
-            bg=self.colors['bg'],
+            bg=self.colors['panel'],
             fg=self.colors['muted'],
         ).pack(anchor='w', pady=(4, 0))
-
         tk.Label(
-            header,
+            title_col,
             textvariable=self._session_label_var,
             font=self.fonts['small'],
-            bg=self.colors['bg'],
-            fg=self.colors['muted'],
+            bg=self.colors['panel'],
+            fg=self.colors['subtext'],
         ).pack(anchor='w', pady=(6, 0))
 
-        connection_row = tk.Frame(header, bg=self.colors['bg'])
-        connection_row.pack(fill=tk.X, pady=(10, 0))
-
-        connection_button_row = tk.Frame(connection_row, bg=self.colors['bg'])
-        connection_button_row.pack(fill=tk.X)
-        reconnect_button = create_button(
-            connection_button_row,
-            text='再次呼唤',
-            command=lambda: self._reconnect_session(announce=True),
-            theme=self.theme,
-            variant='secondary',
-            font=self.fonts['small'],
-            style_overrides=self._aurora_button_style(),
-            padx=8,
-            pady=5,
+        status_chip = create_card(
+            title_row,
+            self.theme,
+            bg='panel_tinted',
+            border='line_soft',
         )
-        reconnect_button.pack(side=tk.RIGHT)
+        status_chip.pack(side=tk.RIGHT, anchor='n')
+        tk.Label(
+            status_chip,
+            text='连接状态',
+            font=self.fonts['eyebrow'],
+            bg=self.colors['panel_tinted'],
+            fg=self.colors['gold'],
+            anchor='e',
+        ).pack(anchor='e', padx=12, pady=(8, 2))
+        tk.Label(
+            status_chip,
+            textvariable=self._connection_time_var,
+            font=self.fonts['small'],
+            bg=self.colors['panel_tinted'],
+            fg=self.colors['accent_dark'],
+            width=14,
+            anchor='e',
+        ).pack(anchor='e', padx=12, pady=(0, 8))
+
+        control_card = create_card(
+            content_frame,
+            self.theme,
+            bg='panel',
+            border='line_soft',
+        )
+        control_card.pack(fill=tk.X, pady=(0, self.window_theme['header_gap']))
+        tk.Frame(control_card, bg=self.colors['gold'], height=2).pack(fill=tk.X)
+
+        controls = tk.Frame(control_card, bg=self.colors['panel'])
+        controls.pack(
+            fill=tk.X,
+            padx=self.chat_theme['control_pad_x'],
+            pady=self.chat_theme['control_pad_y'],
+        )
+
+        left_controls = tk.Frame(controls, bg=self.colors['panel'])
+        left_controls.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        right_controls = tk.Frame(controls, bg=self.colors['panel'])
+        right_controls.pack(side=tk.RIGHT)
+
         connection_dropdown = create_dropdown(
-            connection_button_row,
+            left_controls,
             theme=self.theme,
             label='连接目标',
             value_getter=lambda: self._connection_var.get(),
             options=CONNECTION_TARGET_CHOICES,
             on_select=self._switch_connection_target,
             font=self.fonts['small'],
-            width=240,
+            width=220,
         )
-        connection_dropdown.pack(side=tk.LEFT, anchor='w')
+        connection_dropdown.pack(side=tk.LEFT, padx=(0, self.chat_theme['control_gap']))
         self._refresh_connection_buttons()
 
-        mode_row = tk.Frame(header, bg=self.colors['bg'])
-        mode_row.pack(fill=tk.X, pady=(10, 0))
-
-        mode_button_row = tk.Frame(mode_row, bg=self.colors['bg'])
-        mode_button_row.pack(fill=tk.X)
         mode_dropdown = create_dropdown(
-            mode_button_row,
+            left_controls,
             theme=self.theme,
-            label='当前模式',
+            label='对话模式',
             value_getter=lambda: self._mode_var.get(),
             options=MODE_CHOICES,
             on_select=self._apply_permission_mode,
             font=self.fonts['small'],
-            width=300,
+            width=250,
         )
-        mode_dropdown.pack(side=tk.LEFT, anchor='w')
+        mode_dropdown.pack(side=tk.LEFT)
         self._refresh_mode_buttons()
 
-        # 先把底部的输入区和按钮行用 side=BOTTOM 占住空间，再让会话区填充剩余
-        # 区域。这样无论窗口被压到多小（高 DPI / 小屏），输入框都不会被会话区
-        # 挤出窗口——之前正是这个问题导致"只有会话、看不到输入框"。
-        button_row = tk.Frame(content_frame, bg=self.colors['bg'])
-        button_row.pack(side=tk.BOTTOM, fill=tk.X, pady=(self.window_theme['button_gap'], 0))
+        create_button(
+            right_controls,
+            text='再次呼唤',
+            command=lambda: self._reconnect_session(announce=True),
+            theme=self.theme,
+            variant='primary',
+            font=self.fonts['small'],
+            padx=12,
+            pady=8,
+        ).pack(side=tk.RIGHT)
 
-        composer = tk.Frame(content_frame, bg=self.colors['bg'])
-        composer.pack(side=tk.BOTTOM, fill=tk.X, pady=(self.window_theme['composer_gap'], 0))
+        split_host = tk.Frame(content_frame, bg=self.colors['bg_app'])
+        split_host.pack(fill=tk.BOTH, expand=True)
 
-        input_shell = tk.Canvas(
-            composer,
-            height=max(96, self.window_theme['input_height'] * 24 + self.chat_theme['input_pad_y'] * 2),
-            bg=self.colors['bg'],
-            highlightthickness=0,
+        content_pane = tk.PanedWindow(
+            split_host,
+            orient=tk.VERTICAL,
+            sashwidth=8,
+            sashrelief=tk.FLAT,
             bd=0,
+            bg=self.colors['bg_app'],
+            opaqueresize=True,
+            showhandle=False,
         )
-        input_shell.pack(fill=tk.X)
-        self._input_canvas = input_shell
-        transcript_frame = create_card(
-            content_frame,
+        content_pane.pack(fill=tk.BOTH, expand=True)
+        self._content_pane = content_pane
+
+        composer_card = create_card(
+            content_pane,
             self.theme,
             bg='panel',
-            border='border',
+            border='line_soft',
         )
-        transcript_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        tk.Frame(composer_card, bg=self.colors['accent_soft'], height=2).pack(fill=tk.X)
 
-        scrollbar = tk.Scrollbar(transcript_frame)
+        composer = tk.Frame(composer_card, bg=self.colors['panel'])
+        composer.pack(
+            fill=tk.BOTH,
+            expand=True,
+            padx=self.chat_theme['composer_pad_x'],
+            pady=self.chat_theme['composer_pad_y'],
+        )
+
+        tk.Label(
+            composer,
+            text='输入工作台',
+            font=self.fonts['eyebrow'],
+            bg=self.colors['panel'],
+            fg=self.colors['gold'],
+            anchor='w',
+        ).pack(anchor='w')
+        tk.Label(
+            composer,
+            text='和奥黛丽继续对话，Ctrl+Enter 发送。',
+            font=self.fonts['small'],
+            bg=self.colors['panel'],
+            fg=self.colors['muted'],
+            anchor='w',
+        ).pack(anchor='w', pady=(4, 10))
+
+        self._attachment_preview_frame = tk.Frame(composer, bg=self.colors['panel'])
+        self._attachment_preview_frame.pack(fill=tk.X, pady=(0, 8))
+
+        self._input_shell_frame = tk.Frame(
+            composer,
+            bg=self.colors['input_border'],
+            bd=0,
+            highlightthickness=0,
+        )
+        self._input_shell_frame.pack(fill=tk.BOTH, expand=True)
+        input_inner = tk.Frame(self._input_shell_frame, bg=self.colors['input_bg'], bd=0, highlightthickness=0)
+        input_inner.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+        self._input_canvas = None
+
+        self.input_box = tk.Text(
+            input_inner,
+            height=self.window_theme['input_height'],
+            wrap=tk.WORD,
+            font=self.fonts['base'],
+            bg=self.colors['input_bg'],
+            fg=self.colors['text'],
+            relief=tk.FLAT,
+            insertbackground=self.colors['accent_dark'],
+            highlightthickness=0,
+            bd=0,
+            padx=self.chat_theme['input_pad_x'],
+            pady=self.chat_theme['input_pad_y'],
+        )
+        self.input_box.pack(fill=tk.BOTH, expand=True)
+        self.input_box.bind('<Control-Return>', self._handle_send_shortcut)
+        self.input_box.bind('<Control-v>', self._handle_input_paste, add='+')
+        self.input_box.bind('<Control-V>', self._handle_input_paste, add='+')
+        self.input_box.bind('<<Paste>>', self._handle_input_paste, add='+')
+        self.input_box.bind('<FocusIn>', self._handle_input_focus_in, add='+')
+        self.input_box.bind('<FocusOut>', self._handle_input_focus_out, add='+')
+        self.input_box.bind('<KeyPress>', self._handle_input_keypress, add='+')
+
+        composer_bottom = tk.Frame(composer, bg=self.colors['panel'])
+        composer_bottom.pack(side=tk.BOTTOM, fill=tk.X, pady=(10, 0))
+        status_block = tk.Frame(composer_bottom, bg=self.colors['panel'])
+        status_block.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self._aurora_bar = tk.Canvas(status_block, height=4, bg=self.colors['panel'], highlightthickness=0, bd=0)
+        self._aurora_bar.pack(fill=tk.X, pady=(0, 6))
+        self._aurora_bar_item = self._aurora_bar.create_rectangle(0, 0, 1, 4, fill=self.colors['line_soft'], outline=self.colors['line_soft'])
+        self._aurora_bar.bind('<Configure>', lambda _event: self._draw_aurora_bar(), add='+')
+        self._status_dot = tk.Canvas(status_block, width=14, height=14, bg=self.colors['panel'], highlightthickness=0, bd=0)
+        self._status_dot_item = self._status_dot.create_oval(3, 3, 11, 11, fill=self.colors['line_strong'], outline=self.colors['line_strong'])
+        self._status_dot.pack(side=tk.LEFT, pady=(2, 0))
+        self._status_label = tk.Label(
+            status_block,
+            textvariable=self.status_var,
+            font=self.fonts['small'],
+            bg=self.colors['panel'],
+            fg=self.colors['muted'],
+            anchor='w',
+        )
+        self._status_label.pack(side=tk.LEFT, padx=(8, 0))
+
+        action_row = tk.Frame(composer_bottom, bg=self.colors['panel'])
+        action_row.pack(side=tk.RIGHT)
+        create_button(
+            action_row,
+            text='清除对话',
+            command=self._clear_conversation,
+            theme=self.theme,
+            variant='ghost',
+            font=self.fonts['control'],
+            padx=12,
+            pady=8,
+        ).pack(side=tk.RIGHT)
+        self.stop_button = create_button(
+            action_row,
+            text='中止对话',
+            command=self._on_stop,
+            theme=self.theme,
+            variant='secondary',
+            font=self.fonts['control'],
+            padx=12,
+            pady=8,
+            state=tk.DISABLED,
+        )
+        self.stop_button.pack(side=tk.RIGHT, padx=(0, 8))
+        self.send_button = create_button(
+            action_row,
+            text='发送',
+            command=self._on_send,
+            theme=self.theme,
+            variant='primary',
+            font=self.fonts['control'],
+            padx=18,
+            pady=8,
+        )
+        self.send_button.pack(side=tk.RIGHT, padx=(0, 8))
+
+        transcript_frame = create_card(
+            content_pane,
+            self.theme,
+            bg='panel',
+            border='line_soft',
+        )
+        tk.Frame(transcript_frame, bg=self.colors['accent_soft'], height=3).pack(fill=tk.X)
+
+        transcript_header = tk.Frame(transcript_frame, bg=self.colors['panel'])
+        transcript_header.pack(
+            fill=tk.X,
+            padx=self.chat_theme['transcript_header_pad_x'],
+            pady=self.chat_theme['transcript_header_pad_y'],
+        )
+        tk.Label(
+            transcript_header,
+            text='对话实况',
+            font=self.fonts['control'],
+            bg=self.colors['panel'],
+            fg=self.colors['text_strong'],
+            anchor='w',
+        ).pack(side=tk.LEFT)
+        tk.Label(
+            transcript_header,
+            text='陪伴中',
+            font=self.fonts['small'],
+            bg=self.colors['panel'],
+            fg=self.colors['muted'],
+            anchor='e',
+        ).pack(side=tk.RIGHT)
+
+        transcript_body = tk.Frame(transcript_frame, bg=self.colors['panel'])
+        transcript_body.pack(fill=tk.BOTH, expand=True)
+
+        scrollbar = tk.Scrollbar(transcript_body)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
         self.text_area = tk.Text(
-            transcript_frame,
+            transcript_body,
             wrap=tk.WORD,
             font=self.fonts['base'],
             bg=self.colors['panel'],
@@ -574,18 +1150,16 @@ class ChatWindow:
                 was_at_bottom = yview[1] >= 0.99
             except Exception:
                 pass
-            msg_char_width = self._pixels_to_chars(self._transcript_width - 60)
             for widget in self._message_widgets:
                 try:
                     if widget.winfo_exists():
                         widget.configure(width=self._transcript_width)
-                        # 同步更新子行组件的宽度
-                        for child in widget.winfo_children():
-                            if isinstance(child, tk.Text):
-                                # Text 组件的 width 以字符为单位
-                                child.configure(width=msg_char_width)
-                            else:
-                                child.configure(width=self._transcript_width)
+                        bubble = getattr(widget, '_message_bubble', None)
+                        if bubble is not None and bubble.winfo_exists():
+                            max_px = getattr(widget, '_bubble_width_px', self.chat_theme['bubble_max_width'])
+                            bubble.configure(width=self._pixels_to_chars(min(max_px, self._transcript_width - 140)))
+                        widget.update_idletasks()
+                        widget.configure(height=widget.winfo_reqheight())
                 except Exception:
                     pass
             # 清理已销毁的组件引用
@@ -603,119 +1177,59 @@ class ChatWindow:
         self.text_area.tag_configure('main_status', foreground=self.colors['muted'])
         self.text_area.tag_configure('task_progress', foreground=self.colors['muted'])
 
-        self.input_box = tk.Text(
-            input_shell,
-            height=self.window_theme['input_height'],
-            wrap=tk.WORD,
-            font=self.fonts['base'],
-            bg='#E3EFE8',
-            fg=self.colors['text'],
-            relief=tk.FLAT,
-            insertbackground=self.colors['accent_dark'],
-            highlightthickness=0,
-            bd=0,
-            padx=self.chat_theme['input_pad_x'],
-            pady=self.chat_theme['input_pad_y'],
-        )
-        input_window_id = input_shell.create_window(
-            18,
-            14,
-            anchor='nw',
-            window=self.input_box,
-            width=max(1, win_w - self.window_theme['outer_pad'] * 2 - 36),
-            height=max(1, int(input_shell.cget('height')) - 28),
-        )
-        input_shell.bind(
-            '<Configure>',
-            lambda event: input_shell.itemconfigure(
-                input_window_id,
-                width=max(1, event.width - 36),
-                height=max(1, event.height - 28),
-            ),
-            add='+',
-        )
-        self.input_box.bind('<Control-Return>', self._handle_send_shortcut)
-
-        tk.Label(
-            button_row,
-            textvariable=self.status_var,
-            font=self.fonts['small'],
-            bg=self.colors['bg'],
-            fg=self.colors['muted'],
-        ).pack(side=tk.LEFT)
-
-        self.stop_button = create_button(
-            button_row,
-            text='中止对话',
-            command=self._on_stop,
-            theme=self.theme,
-            variant='secondary',
-            width=10,
-            font=self.fonts['control'],
-            style_overrides=self._aurora_button_style(),
-        )
-        self.stop_button.pack(side=tk.RIGHT, padx=(8, 0))
-
-        self.send_button = create_button(
-            button_row,
-            text='发送',
-            command=self._on_send,
-            theme=self.theme,
-            variant='secondary',
-            width=10,
-            font=self.fonts['control'],
-            style_overrides=self._aurora_button_style(),
-        )
-        self.send_button.pack(side=tk.RIGHT)
-
-        clear_button = create_button(
-            button_row,
-            text='清除对话',
-            command=self._clear_conversation,
-            theme=self.theme,
-            variant='secondary',
-            width=10,
-            font=self.fonts['control'],
-            style_overrides=self._aurora_button_style(),
-        )
-        clear_button.pack(side=tk.RIGHT, padx=(8, 0))
+        content_pane.add(transcript_frame, minsize=260, stretch='always')
+        content_pane.add(composer_card, minsize=200, stretch='never')
+        self.window.after(40, lambda: self._initialize_content_split(content_pane, transcript_frame, composer_card))
 
         self._build_history_sidebar(side_panel)
         self._refresh_history_sidebar()
+        self._show_input_placeholder()
+        self._refresh_status_visuals()
+        self._start_aurora_bar()
 
         self._append_message(
             'assistant',
-            '不属于这个时代的愚者...\n\n灰雾之上的神秘主宰...\n\n执掌好运的黄黑之王...\n\n \n\n按 Ctrl+Enter 发送。',
+            self._welcome_message(),
         )
 
     def _build_history_sidebar(self, parent):
+        tk.Frame(parent, bg=self.colors['gold'], height=3).pack(fill=tk.X)
         tk.Label(
             parent,
             text='AURORA HISTORY',
-            font=self.fonts['small'],
+            font=self.fonts['eyebrow'],
             bg=self.colors['panel'],
             fg=self.colors['gold'],
             anchor='w',
-        ).pack(fill=tk.X, padx=12, pady=(12, 4))
+        ).pack(fill=tk.X, padx=14, pady=(14, 4))
         tk.Label(
             parent,
             text='最近会话',
             font=self.fonts['control'],
             bg=self.colors['panel'],
-            fg=self.colors['text'],
+            fg=self.colors['text_strong'],
             anchor='w',
-        ).pack(fill=tk.X, padx=12)
+        ).pack(fill=tk.X, padx=14)
+        tk.Label(
+            parent,
+            text='恢复最近的对话记录，继续陪伴或工作。',
+            font=self.fonts['small'],
+            bg=self.colors['panel'],
+            fg=self.colors['muted'],
+            anchor='w',
+            justify='left',
+            wraplength=220,
+        ).pack(fill=tk.X, padx=14, pady=(4, 10))
 
         toolbar = tk.Frame(parent, bg=self.colors['panel'])
-        toolbar.pack(fill=tk.X, padx=12, pady=(10, 8))
+        toolbar.pack(fill=tk.X, padx=14, pady=(0, 10))
         create_button(
             toolbar,
             text='新建会话',
             command=self._new_conversation,
             theme=self.theme,
-            variant='secondary',
+            variant='ghost',
             font=self.fonts['small'],
-            style_overrides=self._aurora_button_style(),
             padx=8,
             pady=4,
         ).pack(side=tk.RIGHT)
@@ -724,12 +1238,13 @@ class ChatWindow:
             text='刷新',
             command=self._refresh_history_sidebar,
             theme=self.theme,
-            variant='secondary',
+            variant='ghost',
             font=self.fonts['small'],
-            style_overrides=self._aurora_button_style(),
             padx=8,
             pady=4,
         ).pack(side=tk.RIGHT, padx=(0, 6))
+
+        tk.Frame(parent, bg=self.colors['separator'], height=1).pack(fill=tk.X, padx=14, pady=(0, 10))
 
         list_frame = tk.Frame(parent, bg=self.colors['panel'])
         list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
@@ -876,15 +1391,15 @@ class ChatWindow:
         if not self._history_items:
             self._history_empty_label = tk.Label(
                 self._history_container,
-                text='还没有可恢复的历史会话。',
+                text='还没有可恢复的历史会话。\n开始一次新的对话，记录就会出现在这里。',
                 font=self.fonts['small'],
                 bg=self.colors['panel'],
                 fg=self.colors['muted'],
                 justify='left',
                 anchor='w',
-                wraplength=220,
+                wraplength=self.chat_theme['history_wraplength'],
             )
-            self._history_empty_label.pack(fill=tk.X, padx=6, pady=6)
+            self._history_empty_label.pack(fill=tk.X, padx=8, pady=8)
             return
 
         for item in self._history_items:
@@ -893,19 +1408,23 @@ class ChatWindow:
     def _render_history_item(self, item: dict):
         session_id = item.get('session_id') or ''
         is_active = session_id == self._current_session_id()
-        card_bg = '#F8FBFA' if not is_active else '#F3E3BF'
-        border = '#D6B36A' if is_active else '#D8E8E4'
+        card_bg = self.colors['gold_soft'] if is_active else self.colors['panel_tinted']
+        border = self.colors['line_gold'] if is_active else self.colors['line_soft']
+        accent = self.colors['gold'] if is_active else self.colors['accent_soft']
         card = tk.Frame(self._history_container, bg=border, bd=0, highlightthickness=0, cursor='hand2')
         inner = tk.Frame(card, bg=card_bg, bd=0, highlightthickness=0)
         inner.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
         card.pack(fill=tk.X, padx=4, pady=4)
+        accent_bar = tk.Frame(inner, bg=accent, width=4)
+        accent_bar.pack(side=tk.LEFT, fill=tk.Y)
+        content = tk.Frame(inner, bg=card_bg)
+        content.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         title = item.get('title') or item.get('session_id')
         summary = item.get('summary') or ''
         timestamp = self._format_history_timestamp(item.get('timestamp') or '')
 
-        # 标题行：标题 + 删除按钮
-        title_row = tk.Frame(inner, bg=card_bg)
+        title_row = tk.Frame(content, bg=card_bg)
         title_row.pack(fill=tk.X, padx=10, pady=(8, 2))
         tk.Label(
             title_row,
@@ -915,7 +1434,7 @@ class ChatWindow:
             fg=self.colors['text_strong'],
             justify='left',
             anchor='w',
-            wraplength=180,
+            wraplength=self.chat_theme['history_wraplength'] - 24,
         ).pack(side=tk.LEFT)
 
         delete_btn = tk.Label(
@@ -923,7 +1442,7 @@ class ChatWindow:
             text='✕',
             font=self.fonts['small'],
             bg=card_bg,
-            fg='#C07B7B',
+            fg=self.colors['subtext'],
             cursor='hand2',
             padx=6,
         )
@@ -934,11 +1453,10 @@ class ChatWindow:
             return 'break'
 
         delete_btn.bind('<Button-1>', handle_delete, add='+')
-        # Tooltip effect on hover
         def _on_delete_enter(_event, btn=delete_btn):
-            btn.configure(fg='#D43D3D')
+            btn.configure(fg=self.colors['text_strong'])
         def _on_delete_leave(_event, btn=delete_btn):
-            btn.configure(fg='#C07B7B')
+            btn.configure(fg=self.colors['subtext'])
         delete_btn.bind('<Enter>', _on_delete_enter, add='+')
         delete_btn.bind('<Leave>', _on_delete_leave, add='+')
 
@@ -954,17 +1472,17 @@ class ChatWindow:
 
         if summary:
             tk.Label(
-                inner,
+                content,
                 text=summary,
                 font=self.fonts['small'],
                 bg=card_bg,
                 fg=self.colors['muted'],
                 justify='left',
                 anchor='w',
-                wraplength=208,
+                wraplength=self.chat_theme['history_wraplength'],
             ).pack(fill=tk.X, padx=10)
         tk.Label(
-            inner,
+            content,
             text=f'{timestamp}  {session_id[:8]}',
             font=self.fonts['small'],
             bg=card_bg,
@@ -973,17 +1491,33 @@ class ChatWindow:
             anchor='w',
         ).pack(fill=tk.X, padx=10, pady=(6, 8))
 
+        def _apply_history_hover(active: bool):
+            if is_active:
+                return
+            current_bg = self.colors['panel_elevated'] if active else card_bg
+            current_border = self.colors['line_strong'] if active else border
+            card.configure(bg=current_border)
+            inner.configure(bg=current_bg)
+            content.configure(bg=current_bg)
+            accent_bar.configure(bg=self.colors['accent'] if active else accent)
+            self._set_widget_tree_bg(content, current_bg, exclude={delete_btn})
+            delete_btn.configure(bg=current_bg)
+
+        card.bind('<Enter>', lambda _event: _apply_history_hover(True), add='+')
+        card.bind('<Leave>', lambda _event: _apply_history_hover(False), add='+')
+        inner.bind('<Enter>', lambda _event: _apply_history_hover(True), add='+')
+        inner.bind('<Leave>', lambda _event: _apply_history_hover(False), add='+')
+
         def handle_click(_event=None, target_session_id=session_id):
             self._resume_history_session(target_session_id)
 
         for widget in (card, inner):
             widget.bind('<Button-1>', handle_click, add='+')
             widget.bind('<Button-3>', show_context_menu, add='+')
-        for widget in inner.winfo_children():
+        for widget in content.winfo_children():
             widget.bind('<Button-1>', handle_click, add='+')
             if widget is not delete_btn:
                 widget.bind('<Button-3>', show_context_menu, add='+')
-            # 递归绑定子组件的子组件（如 title_row 内的 Label）
             for grandchild in widget.winfo_children():
                 if grandchild is not delete_btn:
                     grandchild.bind('<Button-1>', handle_click, add='+')
@@ -1046,7 +1580,7 @@ class ChatWindow:
             self._reset_transcript_view()
             self._append_message(
                 'assistant',
-                '不属于这个时代的愚者...\n\n灰雾之上的神秘主宰...\n\n执掌好运的黄黑之王...\n\n \n\n按 Ctrl+Enter 发送。',
+                self._welcome_message(),
             )
             self._append_inline_status('已删除当前会话，准备开启新对话。')
             self._reconnect_session(announce=True)
@@ -1067,7 +1601,7 @@ class ChatWindow:
         self._reset_transcript_view()
         self._append_message(
             'assistant',
-            '不属于这个时代的愚者...\n\n灰雾之上的神秘主宰...\n\n执掌好运的黄黑之王...\n\n \n\n按 Ctrl+Enter 发送。',
+            self._welcome_message(),
         )
         self._append_inline_status('已清除当前对话，准备开启新会话。')
         self._reconnect_session(announce=True)
@@ -1088,7 +1622,7 @@ class ChatWindow:
         self._reset_transcript_view()
         self._append_message(
             'assistant',
-            '不属于这个时代的愚者...\n\n灰雾之上的神秘主宰...\n\n执掌好运的黄黑之王...\n\n \n\n按 Ctrl+Enter 发送。',
+            self._welcome_message(),
         )
         self._append_inline_status('已创建新会话。')
         self._reconnect_session(announce=True)
@@ -1209,37 +1743,63 @@ class ChatWindow:
         return 'break'
 
     def _on_send(self):
-        text = self.input_box.get('1.0', tk.END).strip()
-        if not text:
+        if self._input_placeholder_active:
+            text = ''
+        else:
+            text = self.input_box.get('1.0', tk.END).strip()
+        if not text and not self._pending_image_attachments:
             return
 
-        if self._handle_local_command(text):
+        if text and self._handle_local_command(text):
             self.input_box.delete('1.0', tk.END)
+            self._show_input_placeholder()
             return
 
         if self._busy:
+            if self._pending_image_attachments:
+                self._append_inline_status('当前正在对话中；图片附件暂不支持旁路插话。')
+                return
+            if not text:
+                return
+            self._append_inline_status(f'旁路提问：{text}')
+            self.input_box.delete('1.0', tk.END)
+            self._show_input_placeholder()
+            self._handle_btw_command(text)
             return
 
         self.input_box.delete('1.0', tk.END)
-        self._submit_prompt(text)
+        self._show_input_placeholder()
+        payload = self._build_message_content(text)
+        display_text = self._build_display_text(text)
+        self._submit_prompt(payload, display_text=display_text)
 
-    def _submit_prompt(self, text: str, display_text: str | None = None):
-        text = (text or '').strip()
-        if not text:
-            return
+    def _submit_prompt(self, text: str | list[dict], display_text: str | None = None):
+        if isinstance(text, str):
+            prompt_text = text.strip()
+            if not prompt_text:
+                return
+            visible_text = display_text or prompt_text
+            payload = prompt_text
+        else:
+            payload = text
+            if not payload:
+                return
+            visible_text = (display_text or '').strip() or '[图片消息]'
 
-        self._append_message('user', display_text or text)
+        self._append_message('user', visible_text)
         self.status_var.set('奥黛丽 正在思考...')
         self._set_busy(True)
-        self._update_bubble_state('thinking', {'prompt': text})
+        self._update_bubble_state('thinking', {'prompt': visible_text})
 
         try:
-            self.session.send_user_message(text)
+            self.session.send_user_message(payload)
+            self._clear_pending_image_attachments()
         except Exception as exc:
             self._set_busy(False)
             self.status_var.set('发送失败')
             self._clear_bubble_state()
             self._append_message('error', f'发送失败：{exc}')
+            self._show_input_placeholder()
 
     def _handle_local_command(self, text: str) -> bool:
         if not text.startswith('/'):
@@ -1377,33 +1937,19 @@ class ChatWindow:
         self._append_inline_status(f'模型已切换：{self._active_model}')
 
     def _show_model_picker_card(self):
-        card = create_card(
-            self.text_area,
-            self.theme,
-            bg='assistant',
-            border='accent',
-        )
+        card, body = self._create_inline_shell('MODEL PICKER', '选择模型', accent='accent', body_bg='assistant')
         tk.Label(
-            card,
-            text='选择模型',
-            font=self.fonts['control'],
-            bg=self.colors['assistant'],
-            fg=self.colors['text'],
-            anchor='w',
-        ).pack(fill=tk.X, padx=10, pady=(8, 4))
-        tk.Label(
-            card,
             text='点击按钮切换，或直接输入 /model <模型名>',
             font=self.fonts['small'],
             bg=self.colors['assistant'],
             fg=self.colors['muted'],
             anchor='w',
-        ).pack(fill=tk.X, padx=10, pady=(0, 8))
+        ).pack(in_=body, fill=tk.X, padx=14, pady=(0, 8))
 
         rows = [MODEL_QUICK_CHOICES[index : index + 2] for index in range(0, len(MODEL_QUICK_CHOICES), 2)]
         for row_choices in rows:
-            row = tk.Frame(card, bg=self.colors['assistant'])
-            row.pack(fill=tk.X, padx=10, pady=(0, 8))
+            row = tk.Frame(body, bg=self.colors['assistant'])
+            row.pack(fill=tk.X, padx=14, pady=(0, 8))
             for choice in row_choices:
                 create_button(
                     row,
@@ -1430,22 +1976,8 @@ class ChatWindow:
             self._append_inline_status('用法：/btw <你的旁路问题>')
             return
 
-        card = create_card(
-            self.text_area,
-            self.theme,
-            bg='assistant',
-            border='border',
-        )
+        card, body = self._create_inline_shell('SIDE QUESTION', '/btw 旁路问题', accent='accent', body_bg='assistant')
         tk.Label(
-            card,
-            text='/btw 旁路问题',
-            font=self.fonts['control'],
-            bg=self.colors['assistant'],
-            fg=self.colors['text'],
-            anchor='w',
-        ).pack(fill=tk.X, padx=10, pady=(8, 2))
-        tk.Label(
-            card,
             text=question,
             font=self.fonts['base'],
             bg=self.colors['assistant'],
@@ -1453,10 +1985,10 @@ class ChatWindow:
             wraplength=self.chat_theme['permission_wraplength'],
             justify='left',
             anchor='w',
-        ).pack(fill=tk.X, padx=10, pady=(0, 6))
+        ).pack(in_=body, fill=tk.X, padx=14, pady=(0, 6))
 
         status_label = tk.Label(
-            card,
+            body,
             text='回答中...',
             font=self.fonts['small'],
             bg=self.colors['assistant'],
@@ -1465,10 +1997,10 @@ class ChatWindow:
             anchor='w',
             wraplength=self.chat_theme['permission_wraplength'],
         )
-        status_label.pack(fill=tk.X, padx=10, pady=(0, 8))
+        status_label.pack(fill=tk.X, padx=14, pady=(0, 8))
 
-        action_row = tk.Frame(card, bg=self.colors['assistant'])
-        action_row.pack(fill=tk.X, padx=10, pady=(0, 8))
+        action_row = tk.Frame(body, bg=self.colors['assistant'])
+        action_row.pack(fill=tk.X, padx=14, pady=(0, 10))
         create_button(
             action_row,
             text='关闭',
@@ -1568,7 +2100,7 @@ class ChatWindow:
         try:
             status_label.config(
                 text=text,
-                fg=self.colors['text'] if not is_error else self.colors['accent_dark'],
+                fg=self.colors['text'] if not is_error else self.colors['danger_edge'],
             )
         except Exception:
             pass
@@ -1805,37 +2337,13 @@ class ChatWindow:
         self.text_area.config(state=tk.NORMAL)
         self.text_area.insert(tk.END, '\n')
 
-        card = tk.Frame(
-            self.text_area,
-            bg=style['card_border'],
-            bd=0,
-            highlightthickness=0,
+        card, card_body = self._create_inline_shell(
+            'AURORA PERMISSION',
+            f'请求执行工具：{tool_name}',
+            accent='gold',
+            border='line_gold',
+            body_bg='panel_tinted',
         )
-        card_body = tk.Frame(card, bg=style['card_bg'], bd=0, highlightthickness=0)
-        card_body.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
-
-        accent_bar = tk.Frame(card_body, bg=style['accent_line'], height=3)
-        accent_bar.pack(fill=tk.X)
-
-        header = tk.Frame(card_body, bg=style['card_bg'])
-        header.pack(fill=tk.X, padx=14, pady=(10, 6))
-        tk.Label(
-            header,
-            text='AURORA PERMISSION',
-            font=self.fonts['small'],
-            bg=style['card_bg'],
-            fg=self.colors['gold'],
-            anchor='w',
-        ).pack(anchor='w')
-        tk.Label(
-            header,
-            text=f'请求执行工具：{tool_name}',
-            font=self.fonts['control'],
-            bg=style['card_bg'],
-            fg=style['title_fg'],
-            anchor='w',
-            justify='left',
-        ).pack(anchor='w', pady=(4, 0))
 
         if input_payload:
             summary_frame = tk.Frame(card_body, bg=style['summary_bg'])
@@ -1843,7 +2351,7 @@ class ChatWindow:
             tk.Label(
                 summary_frame,
                 text=summary,
-                font=self.fonts['small'],
+                font=self.fonts['mono'],
                 bg=style['summary_bg'],
                 fg=style['summary_fg'],
                 anchor='w',
@@ -1924,7 +2432,12 @@ class ChatWindow:
     def _set_busy(self, busy: bool):
         self._busy = busy
         if self.send_button is not None:
-            self.send_button.config(state=tk.NORMAL)
+            self.send_button.config(
+                state=tk.NORMAL,
+                text='我插个话...' if busy else '发送',
+            )
+        if self.stop_button is not None:
+            self.stop_button.config(state=tk.NORMAL if busy else tk.DISABLED)
 
     def _append_inline_status(self, text: str):
         if self.text_area is None:
@@ -2341,13 +2854,27 @@ class ChatWindow:
         is_error = role == 'error'
         is_warn = role == 'warn'
 
-        bubble_bg = '#EAF6EE'
+        bubble_bg = self.colors['assistant_bubble']
+        border_color = self.colors['assistant_edge']
+        strip_color = self.colors['accent_soft']
+        label_text = '奥黛丽'
+        bubble_width_px = self.chat_theme['bubble_max_width']
         if is_user:
-            bubble_bg = '#E8F1FF'
+            bubble_bg = self.colors['user_bubble']
+            border_color = self.colors['user_edge']
+            strip_color = self.colors['gold_soft']
+            label_text = '你'
+            bubble_width_px = self.chat_theme['user_bubble_max_width']
         elif is_error:
-            bubble_bg = self.colors['error']
+            bubble_bg = self.colors['danger_bg']
+            border_color = self.colors['danger_edge']
+            strip_color = self.colors['danger_edge']
+            label_text = '系统'
         elif is_warn:
             bubble_bg = self.colors['warn']
+            border_color = self.colors['warn_edge']
+            strip_color = self.colors['gold_soft']
+            label_text = '提示'
 
         row = tk.Frame(container, bg=self.colors['panel'], width=self._transcript_width)
         row.pack(fill=tk.X)
@@ -2369,23 +2896,26 @@ class ChatWindow:
             content_col = tk.Frame(row, bg=self.colors['panel'])
             content_col.pack(side=tk.RIGHT, fill=tk.X, expand=True)
 
-            bubble_wrap = tk.Frame(content_col, bg=self.colors['panel'])
-            bubble_wrap.pack(anchor='e', fill=tk.X)
+            bubble_wrap = tk.Frame(content_col, bg=border_color)
+            bubble_wrap.pack(anchor='e', fill=tk.NONE)
 
-            text_width_chars = self._pixels_to_chars(520)
+            bubble_inner = tk.Frame(bubble_wrap, bg=bubble_bg)
+            bubble_inner.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+            tk.Frame(bubble_inner, bg=strip_color, height=self.chat_theme['bubble_strip_height']).pack(fill=tk.X)
+
+            text_width_chars = self._pixels_to_chars(bubble_width_px)
             text_height = self._calc_text_display_lines(text, text_width_chars)
             bubble = tk.Text(
-                bubble_wrap,
+                bubble_inner,
                 font=self.fonts['base'],
                 bg=bubble_bg,
                 fg=self.colors['text_strong'],
                 wrap=tk.WORD,
                 width=text_width_chars,
                 height=text_height,
-                padx=14,
-                pady=10,
-                highlightbackground='#C8D8F4',
-                highlightthickness=1,
+                padx=self.chat_theme['bubble_pad_x'],
+                pady=self.chat_theme['bubble_pad_y'],
+                highlightthickness=0,
                 bd=0,
                 relief=tk.FLAT,
                 cursor='arrow',
@@ -2396,13 +2926,15 @@ class ChatWindow:
             bubble.insert('1.0', text)
             bubble.configure(state=tk.DISABLED)
             bubble.pack(anchor='e')
+            container._message_bubble = bubble
+            container._bubble_width_px = bubble_width_px
             self._bind_message_copy_events(bubble, text)
 
             meta = tk.Frame(content_col, bg=self.colors['panel'])
             meta.pack(anchor='e', pady=(6, 0))
             tk.Label(
                 meta,
-                text='You',
+                text=label_text,
                 font=self.fonts['control'],
                 bg=self.colors['panel'],
                 fg=self.colors['muted'],
@@ -2429,20 +2961,25 @@ class ChatWindow:
             content_col = tk.Frame(row, bg=self.colors['panel'])
             content_col.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-            text_width_chars = self._pixels_to_chars(520)
+            bubble_wrap = tk.Frame(content_col, bg=border_color)
+            bubble_wrap.pack(anchor='w', fill=tk.NONE)
+            bubble_inner = tk.Frame(bubble_wrap, bg=bubble_bg)
+            bubble_inner.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+            tk.Frame(bubble_inner, bg=strip_color, height=self.chat_theme['bubble_strip_height']).pack(fill=tk.X)
+
+            text_width_chars = self._pixels_to_chars(bubble_width_px)
             text_height = self._calc_text_display_lines(text, text_width_chars)
             bubble = tk.Text(
-                content_col,
+                bubble_inner,
                 font=self.fonts['base'],
                 bg=bubble_bg,
                 fg=self.colors['text_strong'],
                 wrap=tk.WORD,
                 width=text_width_chars,
                 height=text_height,
-                padx=14,
-                pady=10,
-                highlightbackground='#CFE2D3' if is_assistant else self.colors['gold_soft'],
-                highlightthickness=1,
+                padx=self.chat_theme['bubble_pad_x'],
+                pady=self.chat_theme['bubble_pad_y'],
+                highlightthickness=0,
                 bd=0,
                 relief=tk.FLAT,
                 cursor='arrow',
@@ -2453,13 +2990,15 @@ class ChatWindow:
             bubble.insert('1.0', text)
             bubble.configure(state=tk.DISABLED)
             bubble.pack(anchor='w')
+            container._message_bubble = bubble
+            container._bubble_width_px = bubble_width_px
             self._bind_message_copy_events(bubble, text)
 
             meta = tk.Frame(content_col, bg=self.colors['panel'])
             meta.pack(anchor='w', pady=(6, 0))
             tk.Label(
                 meta,
-                text='奥黛丽',
+                text=label_text,
                 font=self.fonts['control'],
                 bg=self.colors['panel'],
                 fg=self.colors['muted'],
@@ -2500,35 +3039,21 @@ class ChatWindow:
         if len(options) < 2:
             return
 
-        card = create_card(
-            self.text_area,
-            self.theme,
-            bg='panel',
-            border='accent',
-        )
+        card, body = self._create_inline_shell('QUICK REPLY', '快速选择', accent='accent', body_bg='panel_tinted')
         tk.Label(
-            card,
-            text='快速选择',
-            font=self.fonts['control'],
-            bg=self.colors['panel'],
-            fg=self.colors['text'],
-            anchor='w',
-        ).pack(fill=tk.X, padx=10, pady=(8, 4))
-        tk.Label(
-            card,
             text='点击按钮可直接回复，也可以继续手动输入。',
             font=self.fonts['small'],
-            bg=self.colors['panel'],
+            bg=self.colors['panel_tinted'],
             fg=self.colors['muted'],
             anchor='w',
-        ).pack(fill=tk.X, padx=10, pady=(0, 8))
+        ).pack(in_=body, fill=tk.X, padx=14, pady=(0, 8))
 
         for option in options:
             button_text = option['label']
             if option['detail']:
                 button_text = f"{option['label']}\n{option['detail']}"
             create_button(
-                card,
+                body,
                 text=button_text,
                 command=lambda reply=option['label'], frame=card: self._handle_choice_selection(reply, frame),
                 theme=self.theme,
@@ -2539,7 +3064,7 @@ class ChatWindow:
                 justify='left',
                 anchor='w',
                 wraplength=self.chat_theme['permission_wraplength'],
-            ).pack(fill=tk.X, padx=10, pady=(0, 8))
+            ).pack(fill=tk.X, padx=14, pady=(0, 8))
 
         self._insert_inline_card(card)
 
@@ -2674,6 +3199,12 @@ class ChatWindow:
         widget.bind('<Button-1>', lambda e: e.widget.focus_set(), add='+')
 
     def close(self):
+        if self._aurora_bar_job is not None and self.window is not None:
+            try:
+                self.window.after_cancel(self._aurora_bar_job)
+            except Exception:
+                pass
+            self._aurora_bar_job = None
         if self._connection_time_timer is not None:
             try:
                 self.window.after_cancel(self._connection_time_timer)

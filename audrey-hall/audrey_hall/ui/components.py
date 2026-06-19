@@ -239,7 +239,7 @@ class AnimatedButton(tk.Frame):
     def _on_enter(self, _event):
         if self._state == tk.DISABLED:
             return
-        self._apply_state('hover', pulse=True)
+        self._apply_state('hover')
 
     def _on_leave(self, _event):
         if self._state == tk.DISABLED:
@@ -256,7 +256,7 @@ class AnimatedButton(tk.Frame):
         if self._state == tk.DISABLED or not self._command:
             return
         if self._pointer_inside():
-            self._apply_state('hover', pulse=True)
+            self._apply_state('hover')
             self._command()
         else:
             self._apply_state('normal')
@@ -373,29 +373,29 @@ class StyledDropdown(tk.Frame):
             font=self._font,
             width=max(18, int(width / 12)),
             style_overrides={
-                'bg': 'panel',
+                'bg': 'panel_elevated',
                 'fg': 'text',
-                'hover_bg': 'white',
+                'hover_bg': 'panel_tinted',
                 'hover_fg': 'text',
-                'pressed_bg': 'gold_soft',
+                'pressed_bg': 'hover',
                 'pressed_fg': 'text',
-                'highlightbackground': 'gold',
+                'highlightbackground': 'line_strong',
                 'highlightthickness': 1,
-                'hover_border_color': 'gold_bright',
-                'pressed_border_color': 'gold_deep',
-                'pulse_border_off_color': 'panel',
+                'hover_border_color': 'line_gold',
+                'pressed_border_color': 'line_strong',
+                'pulse_border_off_color': 'panel_elevated',
             },
             anchor='w',
             justify='left',
             padx=12,
-            pady=8,
+            pady=9,
         )
         self._button.pack(fill=tk.X)
         self.refresh()
 
     def refresh(self):
         current = self._value_getter()
-        self._button.config(text=f'{self._label}: {current}  v')
+        self._button.config(text=f'{self._label}  {current}  v')
 
     def toggle(self):
         if self._menu is not None and self._menu.winfo_exists():
@@ -408,8 +408,8 @@ class StyledDropdown(tk.Frame):
         overlay_host = self.winfo_toplevel()
         menu = tk.Frame(
             overlay_host,
-            bg=_resolve_color(self._theme, 'panel'),
-            highlightbackground=_resolve_color(self._theme, 'gold'),
+            bg=_resolve_color(self._theme, 'panel_elevated'),
+            highlightbackground=_resolve_color(self._theme, 'line_strong'),
             highlightthickness=1,
             bd=0,
         )
@@ -421,7 +421,7 @@ class StyledDropdown(tk.Frame):
                 card,
                 text=display,
                 font=self._font,
-                bg=_resolve_color(self._theme, 'panel'),
+                bg=_resolve_color(self._theme, 'panel_elevated'),
                 fg=_resolve_color(self._theme, 'text'),
                 anchor='w',
                 justify='left',
@@ -437,10 +437,10 @@ class StyledDropdown(tk.Frame):
                 self.refresh()
 
             def _hover_on(_event, widget=row):
-                widget.config(bg=_resolve_color(self._theme, 'gold_soft'))
+                widget.config(bg=_resolve_color(self._theme, 'panel_tinted'))
 
             def _hover_off(_event, widget=row):
-                widget.config(bg=_resolve_color(self._theme, 'panel'))
+                widget.config(bg=_resolve_color(self._theme, 'panel_elevated'))
 
             row.bind('<Button-1>', _choose, add='+')
             row.bind('<Enter>', _hover_on, add='+')
