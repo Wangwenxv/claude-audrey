@@ -294,6 +294,11 @@ public partial class MainWindow : Window
         {
             return;
         }
+        if (string.IsNullOrWhiteSpace(target))
+        {
+            StatusText.Text = "请选择思维链后点击连接。";
+            return;
+        }
         _ipc.Send(new { type = "connection.set", target });
     }
 

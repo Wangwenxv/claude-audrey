@@ -226,7 +226,32 @@ class ClaudeCodeSession:
         self.connection_target = normalize_connection_target(connection_target)
         self._connection_source = '未连接'
         self._session_id = ''
+        self._last_tool_summaries = {}
         self.resume_session_id = (resume_session_id or '').strip()
+
+    def _tool_summary_cache_key(self, tool_name: str) -> tuple[str, str] | None:
+        session_id = self._session_id.strip()
+        tool_key = str(tool_name or '').strip().lower()
+        if not session_id or not tool_key:
+            return None
+        return session_id, tool_key
+
+    def _remember_tool_summary(self, tool_name: str, summary: str):
+        cache_key = self._tool_summary_cache_key(tool_name)
+        compact = summary.strip() if isinstance(summary, str) else ''
+        if cache_key is None or not compact:
+            return
+        self._last_tool_summaries[cache_key] = compact
+
+    def _resolve_tool_summary(self, tool_name: str, input_payload) -> str:
+        summary_text = _summarize_tool_input(str(tool_name), input_payload)
+        if summary_text:
+            self._remember_tool_summary(tool_name, summary_text)
+            return summary_text
+        cache_key = self._tool_summary_cache_key(tool_name)
+        if cache_key is None:
+            return ''
+        return self._last_tool_summaries.get(cache_key, '')
 
     def _send_control_request(self, request: dict):
         self._ensure_started()
@@ -899,10 +924,7 @@ class ClaudeCodeSession:
                 self._total_tokens = total_tokens
             for tool_use in _extract_tool_use_blocks(content):
                 tool_name = tool_use.get('name') or tool_use.get('tool_name') or '未知工具'
-                summary_text = _summarize_tool_input(
-                    str(tool_name),
-                    tool_use.get('input') or {},
-                )
+                summary_text = self._resolve_tool_summary(tool_name, tool_use.get('input') or {})
                 terminal_text = str(tool_name)
                 if summary_text:
                     terminal_text = f'{terminal_text} | {summary_text}'

@@ -13,6 +13,8 @@ from .claude_agent import ClaudeCodeSession, normalize_connection_target
 
 MAX_HISTORY_SESSIONS = 18
 MAX_HISTORY_LABEL_CHARS = 24
+MAX_TOOL_DETAIL_CHARS = 160
+UNSELECTED_CONNECTION_TARGET = ''
 CLAUDE_PROJECTS_DIR = Path.home() / '.claude' / 'projects'
 BRIDGE_LOG_PATH = Path(gettempdir()) / 'audrey-chat-bridge.log'
 TOOL_ICONS = {
@@ -39,7 +41,7 @@ class WpfChatBridge:
         self._busy = False
         self._started = False
         self._active_session_id = ''
-        self._connection_target = 'auto'
+        self._connection_target = UNSELECTED_CONNECTION_TARGET
         self._active_permission_mode = 'default'
         self._resume_session_id = ''
         self._pending_image_paths = []
@@ -89,6 +91,10 @@ class WpfChatBridge:
             return
         if command_type == 'session.connect':
             self._log('session.connect')
+            if not self._connection_target:
+                self._send_status('请先选择思维链，再点击连接。')
+                self._append_stream_message('status', '请先选择思维链，再点击连接。', stream_key='connect-required')
+                return
             self._ensure_session_started(async_start=True)
             return
         if command_type == 'message.send':
@@ -175,10 +181,13 @@ class WpfChatBridge:
         image_items = self._build_image_items(image_paths)
         if not normalized and not image_items:
             return
+        if not self._started and not self._starting_session:
+            self._send_status('请先选择思维链并点击连接，再发送消息。')
+            self._append_stream_message('status', '请先选择思维链并点击连接，再发送消息。', stream_key='send-before-connect')
+            return
         if self._busy:
             self._send_status('当前正在对话中，请稍后。')
             return
-        self._ensure_session_started(async_start=True)
         self._busy = True
         display_text = self._build_display_text(normalized, image_items)
         message_content = self._build_message_content(normalized, image_items)
@@ -396,7 +405,7 @@ class WpfChatBridge:
 
     def _set_connection_target(self, target: str):
         normalized = normalize_connection_target(target)
-        if normalized == self._connection_target:
+        if normalized == self._connection_target and self._connection_target:
             self._send_status(f'当前思维链：{self._connection_label(normalized)}')
             return
         was_started = self._started or self._starting_session
@@ -611,6 +620,7 @@ class WpfChatBridge:
             'project': '本项目 Claude',
             'system': '本地 Claude',
             'auto': '自动选择',
+            '': '请选择思维链',
         }.get(target, target)
         self.process_manager.send(
             {
@@ -680,10 +690,21 @@ class WpfChatBridge:
         name = str(tool_name or '工具').strip()
         icon = self._pick_tool_icon(name)
         detail = str(summary or '').strip()
+        if not detail:
+            detail = self._summarize_tool_input(name, event.get('input') or {})
+        detail = self._truncate_tool_detail(detail)
         base = f'{icon} {name}'
         if detail:
-            base = f'{base} {detail}'
+            base = f'{base} | {detail}'
         return self._with_token_suffix(base, event)
+
+    def _truncate_tool_detail(self, text: str) -> str:
+        compact = ' '.join(str(text or '').strip().split())
+        if not compact:
+            return ''
+        if len(compact) <= MAX_TOOL_DETAIL_CHARS:
+            return compact
+        return compact[:MAX_TOOL_DETAIL_CHARS - 3].rstrip() + '...'
 
     def _pick_tool_icon(self, tool_header: str) -> str:
         lowered = str(tool_header or '').split('|', 1)[0].strip().lower()

@@ -234,7 +234,8 @@ def main():
                 self.root.after(0, lambda: self.show_chat_window(parent, version))
                 return
 
-            self._show_chat_picker(parent, version)
+            self._close_chat_picker()
+            self._show_tk_chat_window(parent, version)
 
         def _show_chat_picker(self, parent, version):
             if self.chat_picker is not None:

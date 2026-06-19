@@ -77,6 +77,8 @@ INLINE_STATUS_DEBOUNCE_MS = 120
 MAX_COLLAPSED_MESSAGE_LINES = 12
 MAX_INLINE_TOOL_RESULT_CHARS = 12000
 MAX_INLINE_TOOL_RESULT_LINES = 120
+MAX_TOOL_STATUS_DETAIL_CHARS = 160
+UNSELECTED_CONNECTION_LABEL = '请选择思维链'
 CONNECTION_TARGET_CHOICES = [
     ('auto', '自动抉择'),
     ('project', '奥黛丽agent'),
@@ -146,7 +148,7 @@ class ChatWindow:
         self._tool_status_widget = None
         self._tool_status_font = None
         self._auto_follow_transcript = True
-        self.status_var = tk.StringVar(value='正在唤醒奥黛丽的助手...')
+        self.status_var = tk.StringVar(value='请选择思维链后点击连接。')
         self._event_queue = queue.Queue()
         self._busy = False
         self._auto_allow_tools = set()  # 用户选择“总是允许”的工具名
@@ -157,6 +159,8 @@ class ChatWindow:
         self._active_model = 'default'
         self._active_permission_mode = 'default'
         self._connection_target = 'auto'
+        self._connection_target_selected = False
+        self._session_connected = False
         self._main_status_text = ''
         self._task_progress_text = ''
         self._current_total_tokens = None
@@ -223,6 +227,8 @@ class ChatWindow:
         )
 
     def _format_connection_status(self):
+        if not self._connection_target_selected:
+            return UNSELECTED_CONNECTION_LABEL
         label = CONNECTION_OPTION_LABELS.get(self._connection_target, self._connection_target)
         return label
 
@@ -230,22 +236,36 @@ class ChatWindow:
         self._connection_var.set(self._format_connection_status())
 
     def _set_connection_target(self, target: str):
+        if not isinstance(target, str) or not target.strip():
+            self._connection_target_selected = False
+            self._refresh_connection_buttons()
+            return
         normalized = normalize_connection_target(target)
-        if normalized != self._connection_target:
+        if normalized != self._connection_target or not self._connection_target_selected:
             self._connection_target = normalized
             self.session.connection_target = normalized
+        self._connection_target_selected = True
         self._refresh_connection_buttons()
 
     def _switch_connection_target(self, target: str):
         normalized = normalize_connection_target(target)
-        if normalized == self._connection_target and self.session.process is not None:
+        if normalized == self._connection_target and self._connection_target_selected and self._session_connected:
             self.status_var.set(f'已连上{CONNECTION_OPTION_LABELS.get(normalized, normalized)}')
             return
 
         self._set_connection_target(normalized)
-        self._reconnect_session(announce=True)
+        if self._session_connected or self.session.process is not None:
+            self._reconnect_session(announce=True)
+        else:
+            label = CONNECTION_OPTION_LABELS.get(normalized, normalized)
+            self._append_inline_status(f'已选择思维链：{label}')
+            self.status_var.set(self._compose_status_text(f'已选择思维链：{label}，点击连接后生效'))
 
     def _reconnect_session(self, announce: bool = False):
+        if not self._connection_target_selected:
+            self._append_inline_status('请先选择思维链，再点击连接。')
+            self.status_var.set(self._compose_status_text('请先选择思维链，再点击连接。'))
+            return
         try:
             self.session.close()
         except Exception:
@@ -253,6 +273,7 @@ class ChatWindow:
 
         self._event_queue = queue.Queue()
         self._busy = False
+        self._session_connected = False
         self._set_busy(False)
         self._pending_perm_frames = {}
         self._pending_question_cards = {}
@@ -280,8 +301,9 @@ class ChatWindow:
         self._start_session()
 
     def _start_session(self):
-        self._connection_start_time = datetime.now()
-        self._update_connection_time()
+        self._connection_start_time = None
+        self._connection_time_var.set('')
+        self.status_var.set(self._compose_status_text('正在连接...'))
         try:
             self.session.start()
         except Exception as exc:
@@ -647,7 +669,6 @@ class ChatWindow:
             return
 
         self._create_window()
-        self._start_session()
         self.window.after(EVENT_POLL_INTERVAL_MS, self._drain_events)
         # 初次把窗口放到桌宠附近；之后由桌宠的 window_snap 逻辑自动附着到本窗口
         # 顶部（与贴靠微信的机制一致），无需窗口反向跟随桌宠。
@@ -760,7 +781,7 @@ class ChatWindow:
         connection_button_row.pack(fill=tk.X)
         reconnect_button = create_button(
             connection_button_row,
-            text='再次呼唤',
+            text='连接',
             command=lambda: self._reconnect_session(announce=True),
             theme=self.theme,
             variant='secondary',
@@ -1862,6 +1883,10 @@ class ChatWindow:
         visible_text = (display_text or '').strip() or prompt_text
         if not visible_text:
             return False
+        if not self._session_connected or self.session.process is None:
+            self.status_var.set(self._compose_status_text('请先选择思维链并点击连接，再发送消息。'))
+            self._append_inline_status('请先选择思维链并点击连接，再发送消息。')
+            return False
 
         # 新轮次开始前彻底清理上一轮的状态缓存，防止去重逻辑复用旧值
         self._last_status_texts.clear()
@@ -2256,7 +2281,7 @@ class ChatWindow:
                 self._render_task_tool_event(tool_name, terminal_text)
             else:
                 self._render_tool_status_widget(terminal_text)
-            self.status_var.set(self._compose_status_text(f'🔧 {tool_name}'))
+            self.status_var.set(self._compose_status_text(f'🔧 {self._format_main_tool_status(event)}'))
             return
 
         if kind == 'thinking':
@@ -2286,6 +2311,7 @@ class ChatWindow:
 
             # 连接成功：重置计时器到实际连上时刻，显示已连接确认
             if status == 'ready':
+                self._session_connected = True
                 self._connection_start_time = datetime.now()
                 self._update_connection_time()
                 target_label = CONNECTION_OPTION_LABELS.get(self._connection_target, self._connection_target)
@@ -2294,6 +2320,7 @@ class ChatWindow:
 
             # 连接断开：清除计时器并重置 UI 状态，防止永久锁死
             if status == 'disconnected':
+                self._session_connected = False
                 self._connection_start_time = None
                 self._connection_time_var.set('')
                 if self._connection_time_timer is not None:
@@ -2324,7 +2351,7 @@ class ChatWindow:
                 else:
                     self._render_main_status(text)
                 connection_target = event.get('connection_target')
-                if isinstance(connection_target, str):
+                if isinstance(connection_target, str) and connection_target.strip():
                     self._set_connection_target(connection_target)
                 if status == 'working' and not event.get('tool_name') and source != 'system':
                     self._update_bubble_state('working', {'message': text})
@@ -3353,8 +3380,12 @@ class ChatWindow:
     def _format_main_tool_status(self, event: dict) -> str:
         tool_name = self._task_progress_compact_text(event.get('tool_name')) or '工具'
         summary = self._task_progress_compact_text(event.get('summary'))
+        if not summary:
+            summary = self._summarize_working_input(tool_name, event.get('input') or {})
+        if summary and len(summary) > MAX_TOOL_STATUS_DETAIL_CHARS:
+            summary = summary[:MAX_TOOL_STATUS_DETAIL_CHARS - 3].rstrip() + '...'
         if summary:
-            return f'{tool_name} ({summary})'
+            return f'{tool_name} | {summary}'
         return tool_name
 
     def _summarize_working_input(self, tool_name: str, input_payload: dict) -> str:
@@ -3380,7 +3411,7 @@ class ChatWindow:
             value = input_payload.get(key)
             if isinstance(value, str) and value.strip():
                 val = value.strip()
-                return val[:120] + ('...' if len(val) > 120 else '')
+                return val[:MAX_TOOL_STATUS_DETAIL_CHARS] + ('...' if len(val) > MAX_TOOL_STATUS_DETAIL_CHARS else '')
         return ''
 
     def _handle_sdk_status(self, event: dict):

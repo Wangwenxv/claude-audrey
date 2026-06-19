@@ -274,7 +274,7 @@
                          FontWeight="SemiBold"
                          Foreground="{StaticResource AudreyText}" />
               <TextBlock x:Name="StatusText"
-                         Text="正在连接奥黛丽..."
+                         Text="请选择思维链后点击连接。"
                          Margin="0,4,0,0"
                          Foreground="{StaticResource AudreyMuted}" />
             </StackPanel>
@@ -288,7 +288,8 @@
               </ComboBox>
               <TextBlock Text="思维链" Margin="14,0,0,0" VerticalAlignment="Center" Foreground="{StaticResource AudreyMuted}" />
               <ComboBox x:Name="ConnectionCombo" SelectionChanged="ConnectionCombo_SelectionChanged">
-                <ComboBoxItem Tag="project" Content="本项目 Claude" IsSelected="True" />
+                <ComboBoxItem Tag="" Content="请选择思维链" IsSelected="True" />
+                <ComboBoxItem Tag="project" Content="本项目 Claude" />
                 <ComboBoxItem Tag="system" Content="本地 Claude" />
                 <ComboBoxItem Tag="auto" Content="自动选择" />
               </ComboBox>
