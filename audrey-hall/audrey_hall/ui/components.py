@@ -186,6 +186,9 @@ class AnimatedButton(tk.Frame):
                 container_bg = _resolve_color(theme, 'bg')
 
         super().__init__(parent, bg=container_bg, bd=0, highlightthickness=0)
+        for color_key in ('bg', 'hover_bg'):
+            if self._style.get(color_key) == 'transparent':
+                self._style[color_key] = container_bg
 
         self._command = command
         self._font = font or theme['fonts']['button']
@@ -199,6 +202,7 @@ class AnimatedButton(tk.Frame):
             theme,
             self._style.get('pulse_border_off_color', self._style.get('hover_bg', self._style['bg'])),
         )
+        self._pulse_mid_color = _resolve_color(theme, self._style.get('pulse_border_mid_color'))
         self._pulse_step_ms = int(self._style.get('pulse_step_ms', 32))
         self._pulse_steps = max(2, int(self._style.get('pulse_steps', 18)))
 
@@ -206,6 +210,10 @@ class AnimatedButton(tk.Frame):
         self._color_tween = ColorTween(self, self._apply_content_colors, duration_ms=170, steps=11)
         self._enter_ms = int(self._style.get('transition_enter_ms', 170))
         self._leave_ms = int(self._style.get('transition_leave_ms', 130))
+
+        content_pady = self._style.get('content_pady')
+        if content_pady is not None:
+            kwargs['pady'] = max(int(kwargs.get('pady', 0) or 0), int(content_pady))
 
         self._content = tk.Label(
             self,
@@ -310,13 +318,18 @@ class AnimatedButton(tk.Frame):
             return
         try:
             progress = self._pulse_index / self._pulse_steps
-            color = _blend_colors(self._pulse_on_color, self._pulse_off_color, progress)
+            if self._pulse_mid_color:
+                if progress <= 0.5:
+                    color = _blend_colors(self._pulse_on_color, self._pulse_mid_color, progress * 2)
+                else:
+                    color = _blend_colors(self._pulse_mid_color, self._pulse_off_color, (progress - 0.5) * 2)
+            else:
+                color = _blend_colors(self._pulse_on_color, self._pulse_off_color, progress)
             tk.Frame.config(self, bg=color)
             if self._pulse_index >= self._pulse_steps:
-                self._pulse_direction = -1
-            elif self._pulse_index <= 0:
-                self._pulse_direction = 1
-            self._pulse_index += self._pulse_direction
+                self._pulse_index = 0
+            else:
+                self._pulse_index += 1
             self._pulse_job = self.after(self._pulse_step_ms, self._run_pulse)
         except Exception:
             self._pulse_job = None
@@ -481,15 +494,17 @@ class StyledDropdown(tk.Frame):
             font=self._font,
             width=max(18, int(width / 12)),
             style_overrides={
-                'bg': 'panel',
+                'bg': 'transparent',
                 'fg': 'text',
-                'hover_bg': 'white',
-                'hover_fg': 'text',
+                'hover_bg': 'transparent',
+                'hover_fg': 'gold',
                 'pressed_bg': 'gold_soft',
-                'pressed_fg': 'text',
-                'highlightbackground': 'gold',
+                'pressed_fg': 'gold',
+                'highlightbackground': 'accent',
                 'highlightthickness': 1,
+                'normal_side_border_only': False,
                 'hover_border_color': 'gold_bright',
+                'hover_highlightthickness': 1,
                 'pressed_border_color': 'gold_deep',
                 'pulse_border_off_color': 'panel',
             },
@@ -566,7 +581,7 @@ class StyledDropdown(tk.Frame):
                 'ind': gold if is_active else panel,
                 'fg': text_strong if is_active else text_color,
             }
-            hot = {'row': gold_soft, 'ind': gold, 'fg': text_strong}
+            hot = {'row': panel, 'ind': gold, 'fg': gold}
             tween.set_immediate(rest)
 
             def _choose(_event, selected=key):

@@ -150,6 +150,8 @@ class ChatWindow:
         self._tool_status_widget = None
         self._tool_status_font = None
         self._auto_follow_transcript = True
+        self._transcript_programmatic_update = False
+        self._transcript_follow_generation = 0
         self.status_var = tk.StringVar(value='请选择思维链后点击连接。')
         self._event_queue = queue.Queue()
         self._busy = False
@@ -187,6 +189,7 @@ class ChatWindow:
         self._session_label_var = tk.StringVar(value='当前会话：新对话')
         self._history_items = []
         self._history_container = None
+        self._history_canvas = None
         self._history_empty_label = None
         self._history_context_menu = None
         self._connection_start_time = None
@@ -204,6 +207,9 @@ class ChatWindow:
         self._markdown_fonts = None
         self._pending_image_attachments = []
         self._attachment_preview_frame = None
+        self._input_window_id = None
+        self._input_shell_min_height = 96
+        self._input_shell_max_height = 220
         self._chat_header_canvas = None
         self._status_dot = None
         self._status_dot_item = None
@@ -457,22 +463,24 @@ class ChatWindow:
 
     def _aurora_button_style(self):
         return {
-            'bg': '#FBFFFC',
+            'bg': 'transparent',
             'fg': '#2E4245',
-            'highlightbackground': '#D1AE61',
-            'highlightthickness': 0,
-            
-            'hover_bg': '#F6EBCB',
-            'hover_fg': '#1F3033',
-            'hover_border_color': '#F0D88D',
-            'hover_border_thickness': 1,
-            'hover_color': '#F0D88D',
-            
+            'highlightbackground': '#8CCFB2',
+            'highlightthickness': 1,
+            'normal_side_border_only': False,
+
+            'hover_bg': 'transparent',
+            'hover_fg': '#D1AE61',
+            'hover_border_color': '#D1AE61',
+            'hover_highlightthickness': 1,
+
             'pressed_bg': '#D7EFE5',
-            'pressed_fg': '#1F3033',
+            'pressed_fg': '#D1AE61',
             'pressed_border_color': '#8D6835',
-            
-            'pulse_border_off_color': '#FCFFFB',
+            'content_pady': 9,
+
+            'pulse_border_off_color': '#D1AE61',
+            'pulse_border_mid_color': '#8CCFB2',
         }
 
     def _draw_sparkle(self, canvas, x, y, r, color, tag, *, width=1):
@@ -526,6 +534,66 @@ class ChatWindow:
         # 锚端星光 + 线身小星点
         self._draw_sparkle(canvas, x0 + d * 3, cy, 3, gold_bright, 'bubble_orn')
         self._draw_sparkle(canvas, x0 + d * int(span * 0.55), cy, 3, gold, 'bubble_orn')
+
+    def _draw_rounded_rect(self, canvas, x1, y1, x2, y2, radius, *, fill, outline='', width=1, tags=None):
+        radius = max(1, min(int(radius), int((x2 - x1) / 2), int((y2 - y1) / 2)))
+        tag_tuple = tags if tags is not None else ()
+        canvas.create_rectangle(x1 + radius, y1, x2 - radius, y2, fill=fill, outline='', tags=tag_tuple)
+        canvas.create_rectangle(x1, y1 + radius, x2, y2 - radius, fill=fill, outline='', tags=tag_tuple)
+        canvas.create_arc(x1, y1, x1 + radius * 2, y1 + radius * 2, start=90, extent=90, fill=fill, outline='', tags=tag_tuple)
+        canvas.create_arc(x2 - radius * 2, y1, x2, y1 + radius * 2, start=0, extent=90, fill=fill, outline='', tags=tag_tuple)
+        canvas.create_arc(x2 - radius * 2, y2 - radius * 2, x2, y2, start=270, extent=90, fill=fill, outline='', tags=tag_tuple)
+        canvas.create_arc(x1, y2 - radius * 2, x1 + radius * 2, y2, start=180, extent=90, fill=fill, outline='', tags=tag_tuple)
+        if outline:
+            inset = max(0, width // 2)
+            canvas.create_line(x1 + radius, y1 + inset, x2 - radius, y1 + inset, fill=outline, width=width, tags=tag_tuple)
+            canvas.create_line(x2 - inset, y1 + radius, x2 - inset, y2 - radius, fill=outline, width=width, tags=tag_tuple)
+            canvas.create_line(x1 + radius, y2 - inset, x2 - radius, y2 - inset, fill=outline, width=width, tags=tag_tuple)
+            canvas.create_line(x1 + inset, y1 + radius, x1 + inset, y2 - radius, fill=outline, width=width, tags=tag_tuple)
+            canvas.create_arc(x1, y1, x1 + radius * 2, y1 + radius * 2, start=90, extent=90, style=tk.ARC, outline=outline, width=width, tags=tag_tuple)
+            canvas.create_arc(x2 - radius * 2, y1, x2, y1 + radius * 2, start=0, extent=90, style=tk.ARC, outline=outline, width=width, tags=tag_tuple)
+            canvas.create_arc(x2 - radius * 2, y2 - radius * 2, x2, y2, start=270, extent=90, style=tk.ARC, outline=outline, width=width, tags=tag_tuple)
+            canvas.create_arc(x1, y2 - radius * 2, x1 + radius * 2, y2, start=180, extent=90, style=tk.ARC, outline=outline, width=width, tags=tag_tuple)
+
+    def _paint_bubble_shell(self, shell, fill=None, outline=None):
+        if shell is None or not shell.winfo_exists():
+            return
+        fill = fill or getattr(shell, '_bubble_fill', self.colors['panel'])
+        outline = outline or getattr(shell, '_bubble_outline', self.colors['border'])
+        width = shell.winfo_width() or int(shell.cget('width'))
+        height = shell.winfo_height() or int(shell.cget('height'))
+        if width <= 2 or height <= 2:
+            return
+        shell.delete('bubble_shell')
+        self._draw_rounded_rect(shell, 1, 1, width - 1, height - 1, 14, fill=fill, outline=outline, width=1, tags='bubble_shell')
+        shell.tag_lower('bubble_shell')
+        shell._bubble_fill = fill
+        shell._bubble_outline = outline
+
+    def _wrap_bubble_in_shell(self, parent, bubble, *, fill, outline, anchor):
+        bubble.configure(
+            bg=fill,
+            highlightbackground=outline,
+            highlightcolor=outline,
+            highlightthickness=1,
+            bd=0,
+        )
+        bubble.pack(anchor=anchor)
+        return None
+
+    def _resize_bubble_shell(self, container):
+        shell = getattr(container, '_bubble_shell', None)
+        bubble = getattr(container, '_message_bubble', None)
+        if shell is None or bubble is None or not shell.winfo_exists() or not bubble.winfo_exists():
+            return
+        bubble.update_idletasks()
+        width = max(80, bubble.winfo_reqwidth() + 8)
+        height = max(34, bubble.winfo_reqheight() + 8)
+        shell.configure(width=width, height=height)
+        window_id = getattr(shell, '_bubble_window', None)
+        if window_id is not None:
+            shell.itemconfigure(window_id, width=width - 8, height=height - 8)
+        self._paint_bubble_shell(shell)
 
     def _paint_header_ornament(self, event=None):
         canvas = self._chat_header_canvas
@@ -713,9 +781,10 @@ class ChatWindow:
                         height=self._calc_text_display_lines(
                             plain_text,
                             msg_char_width,
-                            max_lines=40 if is_expanded else MAX_COLLAPSED_MESSAGE_LINES,
+                            max_lines=None if is_expanded else MAX_COLLAPSED_MESSAGE_LINES,
                         ),
                     )
+                    self._resize_bubble_shell(widget)
                     widget._message_full_line_count = self._calc_text_display_lines(
                         plain_text,
                         msg_char_width,
@@ -758,9 +827,31 @@ class ChatWindow:
         if self.text_area is None or not self._auto_follow_transcript:
             return
         try:
-            self.text_area.see(tk.END)
+            self._transcript_follow_generation += 1
+            generation = self._transcript_follow_generation
+            self._transcript_programmatic_update = True
+            self.text_area.yview_moveto(1.0)
+            self.text_area.after_idle(lambda gen=generation: self._settle_transcript_follow(gen, 0))
+        except Exception:
+            self._transcript_programmatic_update = False
+
+    def _settle_transcript_follow(self, generation: int, step: int):
+        if generation != self._transcript_follow_generation:
+            return
+        if self.text_area is None or not self.text_area.winfo_exists():
+            self._transcript_programmatic_update = False
+            return
+        try:
+            self.text_area.yview_moveto(1.0)
+            if step < 2:
+                self.text_area.after(35, lambda gen=generation, next_step=step + 1: self._settle_transcript_follow(gen, next_step))
+                return
+            self._auto_follow_transcript = self.text_area.yview()[1] >= 0.98
         except Exception:
             pass
+        finally:
+            if generation == self._transcript_follow_generation and step >= 2:
+                self._transcript_programmatic_update = False
 
     def _handle_transcript_scroll_activity(self, _event=None):
         self._capture_transcript_follow_state()
@@ -769,7 +860,10 @@ class ChatWindow:
         if self.text_area is None:
             return
         try:
-            self._auto_follow_transcript = float(last) >= 0.98
+            if not self._transcript_programmatic_update:
+                self._auto_follow_transcript = float(last) >= 0.98
+            elif float(last) >= 0.98:
+                self._auto_follow_transcript = True
         except Exception:
             pass
         scrollbar = getattr(self, '_transcript_scrollbar', None)
@@ -1023,9 +1117,12 @@ class ChatWindow:
         self._attachment_preview_frame = tk.Frame(composer, bg=self.colors['bg'])
         self._attachment_preview_frame.pack(fill=tk.X, pady=(0, 6))
 
+        input_shell_height = max(96, self.window_theme['input_height'] * 24 + self.chat_theme['input_pad_y'] * 2)
+        self._input_shell_min_height = input_shell_height
+        self._input_shell_max_height = 220
         input_shell = tk.Canvas(
             composer,
-            height=max(96, self.window_theme['input_height'] * 24 + self.chat_theme['input_pad_y'] * 2),
+            height=input_shell_height,
             bg=self.colors['bg'],
             highlightthickness=0,
             bd=0,
@@ -1165,6 +1262,7 @@ class ChatWindow:
             width=max(1, win_w - self.window_theme['outer_pad'] * 2 - 36),
             height=max(1, int(input_shell.cget('height')) - 28),
         )
+        self._input_window_id = input_window_id
         input_shell.bind(
             '<Configure>',
             lambda event: (
@@ -1181,6 +1279,9 @@ class ChatWindow:
         self.input_box.bind('<Control-v>', self._handle_input_paste, add='+')
         self.input_box.bind('<Control-V>', self._handle_input_paste, add='+')
         self.input_box.bind('<<Paste>>', self._handle_input_paste, add='+')
+        self.input_box.bind('<KeyRelease>', self._resize_input_to_content, add='+')
+        self.input_box.bind('<<Modified>>', self._handle_input_modified, add='+')
+        self._resize_input_to_content()
 
         self._status_dot = tk.Canvas(
             status_row,
@@ -1326,6 +1427,7 @@ class ChatWindow:
         list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
 
         canvas = tk.Canvas(list_frame, bg=self.colors['panel'], highlightthickness=0, bd=0)
+        self._history_canvas = canvas
         scrollbar = tk.Scrollbar(list_frame, orient=tk.VERTICAL, command=canvas.yview)
         canvas.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
@@ -1342,6 +1444,25 @@ class ChatWindow:
 
         canvas.bind('<Configure>', _sync_history_width, add='+')
         self._history_container.bind('<Configure>', _sync_history_scroll, add='+')
+
+        def _scroll_history_wheel(event):
+            if self._history_canvas is None:
+                return None
+            try:
+                if getattr(event, 'num', None) == 4:
+                    delta = -1
+                elif getattr(event, 'num', None) == 5:
+                    delta = 1
+                else:
+                    delta = -1 if event.delta > 0 else 1
+                self._history_canvas.yview_scroll(delta, 'units')
+                return 'break'
+            except Exception:
+                return None
+
+        for wheel_event in ('<MouseWheel>', '<Button-4>', '<Button-5>'):
+            canvas.bind(wheel_event, _scroll_history_wheel, add='+')
+            self._history_container.bind(wheel_event, _scroll_history_wheel, add='+')
 
         self._history_empty_label = tk.Label(
             self._history_container,
@@ -1456,7 +1577,31 @@ class ChatWindow:
     def _current_session_id(self) -> str:
         return (self._active_session_id or self._resume_session_id or '').strip()
 
-    def _refresh_history_sidebar(self):
+    def _history_scroll_fraction(self) -> float | None:
+        canvas = self._history_canvas
+        if canvas is None or not canvas.winfo_exists():
+            return None
+        try:
+            first, _last = canvas.yview()
+            return float(first)
+        except Exception:
+            return None
+
+    def _restore_history_scroll_fraction(self, fraction: float | None):
+        if fraction is None:
+            return
+        canvas = self._history_canvas
+        if canvas is None or not canvas.winfo_exists():
+            return
+        try:
+            canvas.update_idletasks()
+            canvas.configure(scrollregion=canvas.bbox('all'))
+            canvas.yview_moveto(max(0.0, min(1.0, float(fraction))))
+        except Exception:
+            pass
+
+    def _refresh_history_sidebar(self, *, preserve_scroll: bool = True):
+        saved_scroll = self._history_scroll_fraction() if preserve_scroll else None
         self._history_items = self._read_recent_sessions()
         if self._history_container is None:
             return
@@ -1476,6 +1621,7 @@ class ChatWindow:
                 wraplength=220,
             )
             self._history_empty_label.pack(fill=tk.X, padx=6, pady=6)
+            self._restore_history_scroll_fraction(saved_scroll)
             return
 
         for index, item in enumerate(self._history_items):
@@ -1491,6 +1637,10 @@ class ChatWindow:
                 self.window.after(index * 45, lambda c=card: self._reveal_history_card(c))
             else:
                 self._reveal_history_card(card)
+        if saved_scroll is not None and self.window is not None:
+            self.window.after(len(self._history_items) * 45 + 20, lambda s=saved_scroll: self._restore_history_scroll_fraction(s))
+        else:
+            self._restore_history_scroll_fraction(saved_scroll)
 
     def _reveal_history_card(self, card):
         if card is None or not card.winfo_exists():
@@ -1504,13 +1654,13 @@ class ChatWindow:
         session_id = item.get('session_id') or ''
         is_active = session_id == self._current_session_id()
 
-        # 配色：静止 / 悬停 / 选中 三态，悬停时金边亮起、底色微暖（hover lift 观感）
+        # 配色：静止 / 悬停 / 选中 三态，悬停时文字转金，边框做金绿循环呼吸。
         rail_rest = self.colors['gold'] if is_active else '#DCEFE8'
-        rail_hot = self.colors['gold']
         border_rest = self.colors['gold'] if is_active else '#DCEFE8'
-        border_hot = self.colors['gold_bright']
-        bg_rest = self.colors['gold_soft'] if is_active else self.colors['card_bg']
-        bg_hot = self.colors['gold_soft'] if is_active else self.colors['hover']
+        bg_rest = '#FFFDF4' if is_active else self.colors['card_bg']
+        fg_rest = self.colors['text_strong']
+        summary_fg_rest = self.colors['muted']
+        fg_hot = self.colors['gold']
 
         card = tk.Frame(self._history_container, bg=border_rest, bd=0, highlightthickness=0, cursor='hand2')
         body = tk.Frame(card, bg=bg_rest, bd=0, highlightthickness=0)
@@ -1589,6 +1739,7 @@ class ChatWindow:
             )
             summary_label.pack(fill=tk.X, padx=10)
             bg_widgets.append(summary_label)
+            card._summary_labels = (summary_label,)
         meta_label = tk.Label(
             inner,
             text=f'{timestamp}  ·  {session_id[:8]}',
@@ -1600,8 +1751,10 @@ class ChatWindow:
         )
         meta_label.pack(fill=tk.X, padx=10, pady=(6, 8))
         bg_widgets.append(meta_label)
+        if not hasattr(card, '_summary_labels'):
+            card._summary_labels = ()
 
-        # 悬停过渡：卡片边框、底色、左条统一缓动，营造"浮起"质感
+        # 悬停过渡：卡片底色保持克制，文字转金；边框/左条由独立循环动画驱动。
         def _apply_card_colors(colors, _card=card, _rail=rail, _bgs=tuple(bg_widgets), _del=delete_btn):
             try:
                 _card.config(bg=colors['border'])
@@ -1609,14 +1762,20 @@ class ChatWindow:
                 for w in _bgs:
                     w.config(bg=colors['bg'])
                 _del.config(bg=colors['bg'])
+                title_label.config(fg=colors['fg'])
+                meta_label.config(fg=colors['meta_fg'])
+                for extra in getattr(card, '_summary_labels', ()):
+                    extra.config(fg=colors['summary_fg'])
             except Exception:
                 pass
 
         tween = ColorTween(card, _apply_card_colors, duration_ms=170, steps=11)
-        rest_colors = {'border': border_rest, 'rail': rail_rest, 'bg': bg_rest}
-        hot_colors = {'border': border_hot, 'rail': rail_hot, 'bg': bg_hot}
+        rest_colors = {'border': border_rest, 'rail': rail_rest, 'bg': bg_rest, 'fg': fg_rest, 'summary_fg': summary_fg_rest, 'meta_fg': self.colors['subtext']}
+        hot_colors = {'border': self.colors['gold'], 'rail': self.colors['gold'], 'bg': bg_rest, 'fg': fg_hot, 'summary_fg': fg_hot, 'meta_fg': fg_hot}
         tween.set_immediate(rest_colors)
         card._hover_tween = tween
+        card._pulse_job = None
+        card._pulse_index = 0
 
         def handle_click(_event=None, target_session_id=session_id):
             self._resume_history_session(target_session_id)
@@ -1631,12 +1790,41 @@ class ChatWindow:
             except Exception:
                 return False
 
+        def _cancel_card_pulse(_card=card):
+            job = getattr(_card, '_pulse_job', None)
+            if job is not None:
+                try:
+                    _card.after_cancel(job)
+                except Exception:
+                    pass
+                _card._pulse_job = None
+
+        def _run_card_pulse(_card=card, _rail=rail):
+            if not _card.winfo_exists():
+                return
+            try:
+                progress = getattr(_card, '_pulse_index', 0) / 28
+                if progress <= 0.5:
+                    color = _blend_colors(self.colors['gold'], self.colors['accent'], progress * 2)
+                else:
+                    color = _blend_colors(self.colors['accent'], self.colors['gold'], (progress - 0.5) * 2)
+                _card.config(bg=color)
+                _rail.config(bg=color)
+                _card._pulse_index = 0 if getattr(_card, '_pulse_index', 0) >= 28 else getattr(_card, '_pulse_index', 0) + 1
+                _card._pulse_job = _card.after(38, _run_card_pulse)
+            except Exception:
+                _card._pulse_job = None
+
         def _hover_on(_event, _tween=tween, _hot=hot_colors):
             _tween.animate_to(_hot, duration_ms=170)
+            if getattr(card, '_pulse_job', None) is None:
+                card._pulse_index = 0
+                _run_card_pulse()
 
         def _hover_off(_event, _tween=tween, _rest=rest_colors):
             # 仅当指针真正离开整张卡片时复位，避免在子组件间穿梭导致闪烁
             if not _pointer_in_card():
+                _cancel_card_pulse()
                 _tween.animate_to(_rest, duration_ms=130)
 
         all_widgets = [card, body, inner, rail, title_row, *bg_widgets]
@@ -1881,6 +2069,40 @@ class ChatWindow:
         added_count = self._add_images_from_clipboard()
         if added_count > 0:
             return 'break'
+        self._schedule_ui(self._resize_input_to_content)
+        return None
+
+    def _handle_input_modified(self, _event=None):
+        if self.input_box is None:
+            return None
+        try:
+            if not self.input_box.edit_modified():
+                return None
+            self.input_box.edit_modified(False)
+        except Exception:
+            pass
+        self._resize_input_to_content()
+        return None
+
+    def _resize_input_to_content(self, _event=None):
+        if self.input_box is None or self._input_canvas is None or self._input_window_id is None:
+            return None
+        try:
+            self.input_box.update_idletasks()
+            line_count = int(float(self.input_box.index('end-1c').split('.')[0]))
+            line_px = max(18, tkfont.Font(font=self.fonts['base']).metrics('linespace'))
+            desired = line_count * line_px + self.chat_theme['input_pad_y'] * 2 + 28
+            desired = max(self._input_shell_min_height, min(self._input_shell_max_height, desired))
+            current = int(float(self._input_canvas.cget('height')))
+            if desired != current:
+                self._input_canvas.configure(height=desired)
+            self._input_canvas.itemconfigure(
+                self._input_window_id,
+                height=max(1, desired - 28),
+            )
+            self._paint_input_shell()
+        except Exception:
+            pass
         return None
 
     def _is_local_only_command(self, text: str) -> bool:
@@ -2111,6 +2333,7 @@ class ChatWindow:
 
         if text and self._handle_local_command(text):
             self.input_box.delete('1.0', tk.END)
+            self._resize_input_to_content()
             return
 
         if self._busy:
@@ -2120,12 +2343,14 @@ class ChatWindow:
             self._append_inline_status(f'旁路提问：{text}')
             self._handle_btw_command(text)
             self.input_box.delete('1.0', tk.END)
+            self._resize_input_to_content()
             return
 
         display_text = self._build_user_display_text(text)
         message_content = self._build_user_message_content(text)
         if self._submit_prompt(message_content, display_text=display_text):
             self.input_box.delete('1.0', tk.END)
+            self._resize_input_to_content()
             self._clear_pending_image_attachments()
 
     def _submit_prompt(self, message_content: str | list[dict], display_text: str | None = None):
@@ -2957,6 +3182,7 @@ class ChatWindow:
 
     def _show_permission_card(self, request_id, tool_name, input_payload):
         """在对话流中内嵌一张权限确认卡片，不再弹出抢焦点的模态窗。"""
+        follow_transcript = self._capture_transcript_follow_state()
         summary = json.dumps(input_payload, ensure_ascii=False, indent=2)
         if len(summary) > self.chat_theme['permission_summary_max_chars']:
             summary = summary[: self.chat_theme['permission_summary_max_chars']] + ' …'
@@ -3077,6 +3303,7 @@ class ChatWindow:
         self.text_area.window_create(tk.END, window=card, padx=6, pady=4)
         self.text_area.insert(tk.END, '\n\n')
         self.text_area.config(state=tk.DISABLED)
+        self._auto_follow_transcript = follow_transcript
         self._maybe_follow_transcript_end()
         self._pending_perm_frames[request_id] = card
 
@@ -3309,6 +3536,9 @@ class ChatWindow:
             return
         self._ensure_tool_status_font()
         existing = self._tool_status_widget
+        if existing is not None:
+            self._remove_tool_status_widget(existing)
+            existing = None
         if existing is None:
             card = create_card(
                 self.text_area,
@@ -3342,9 +3572,7 @@ class ChatWindow:
         )
         self._maybe_follow_transcript_end()
 
-    def _clear_tool_status_widget(self):
-        widget = self._tool_status_widget
-        self._tool_status_widget = None
+    def _remove_tool_status_widget(self, widget):
         if not widget:
             return
         card = widget.get('card')
@@ -3353,6 +3581,13 @@ class ChatWindow:
                 card.destroy()
             except Exception:
                 pass
+
+    def _clear_tool_status_widget(self):
+        widget = self._tool_status_widget
+        self._tool_status_widget = None
+        self._remove_tool_status_widget(widget)
+        if self._auto_follow_transcript:
+            self._maybe_follow_transcript_end()
 
     def _render_task_widget(self, event: dict, text: str) -> bool:
         task_key = self._task_widget_key(event)
@@ -3881,7 +4116,7 @@ class ChatWindow:
         visible_lines = self._calc_text_display_lines(
             plain_text,
             text_width_chars,
-            max_lines=MAX_COLLAPSED_MESSAGE_LINES if is_collapsible else 40,
+            max_lines=MAX_COLLAPSED_MESSAGE_LINES if is_collapsible else None,
         )
         return plain_text, visible_lines, is_collapsible
 
@@ -3892,18 +4127,24 @@ class ChatWindow:
         is_error = role == 'error'
         is_warn = role == 'warn'
 
-        bubble_bg = '#EFF9F0'
-        bubble_border = '#C3E6D0'
-        bubble_fg = self.colors['text_strong']
+        bubble_bg = self.colors['assistant']
+        bubble_border = '#B5DFC3'
+        bubble_fg = '#172B2D'
+        code_fg = '#654417'
+        quote_fg = '#466266'
+        marker_fg = '#7A5423'
         if is_user:
-            bubble_bg = '#FAEAEF'
+            bubble_bg = self.colors['user']
             bubble_border = '#EAC8D2'
+            bubble_fg = '#2B171F'
         elif is_error:
             bubble_bg = self.colors['error']
             bubble_border = '#DAB8BE'
+            bubble_fg = '#3D1118'
         elif is_warn:
             bubble_bg = self.colors['warn']
             bubble_border = self.colors['gold']
+            bubble_fg = '#382704'
 
         row = tk.Frame(container, bg=self.colors['panel'], width=self._transcript_width)
         row.pack(fill=tk.X)
@@ -3940,8 +4181,8 @@ class ChatWindow:
                 height=text_height,
                 padx=14,
                 pady=10,
-                highlightbackground=bubble_border,
-                highlightthickness=1,
+                highlightbackground=bubble_bg,
+                highlightthickness=0,
                 bd=0,
                 relief=tk.FLAT,
                 cursor='arrow',
@@ -3949,13 +4190,19 @@ class ChatWindow:
                 spacing1=4,
                 spacing3=4,
             )
+            bubble._message_text_fg = bubble_fg
+            bubble._message_code_fg = code_fg
+            bubble._message_quote_fg = quote_fg
+            bubble._message_marker_fg = marker_fg
             self._configure_markdown_tags(bubble)
             self._insert_markdown_text(bubble, text)
             bubble.configure(state=tk.DISABLED)
-            bubble.pack(anchor='e')
+            shell = self._wrap_bubble_in_shell(bubble_wrap, bubble, fill=bubble_bg, outline=bubble_border, anchor='e')
             container._message_bubble = bubble
+            container._bubble_shell = shell
             container._bubble_border = bubble_border
             container._bubble_bg = bubble_bg
+            container._bubble_fg = bubble_fg
             container._message_text = text
             container._message_plain_text = plain_text
             container._message_is_expanded = not is_collapsible
@@ -4022,8 +4269,8 @@ class ChatWindow:
                 height=text_height,
                 padx=14,
                 pady=10,
-                highlightbackground=bubble_border if is_assistant else self.colors['gold_soft'],
-                highlightthickness=1,
+                highlightbackground=bubble_bg,
+                highlightthickness=0,
                 bd=0,
                 relief=tk.FLAT,
                 cursor='arrow',
@@ -4031,13 +4278,19 @@ class ChatWindow:
                 spacing1=4,
                 spacing3=4,
             )
+            bubble._message_text_fg = bubble_fg
+            bubble._message_code_fg = code_fg
+            bubble._message_quote_fg = quote_fg
+            bubble._message_marker_fg = marker_fg
             self._configure_markdown_tags(bubble)
             self._insert_markdown_text(bubble, text)
             bubble.configure(state=tk.DISABLED)
-            bubble.pack(anchor='w')
+            shell = self._wrap_bubble_in_shell(content_col, bubble, fill=bubble_bg, outline=bubble_border if is_assistant else self.colors['gold_soft'], anchor='w')
             container._message_bubble = bubble
+            container._bubble_shell = shell
             container._bubble_border = bubble_border
             container._bubble_bg = bubble_bg
+            container._bubble_fg = bubble_fg
             container._message_text = text
             container._message_plain_text = plain_text
             container._message_is_expanded = not is_collapsible
@@ -4098,9 +4351,10 @@ class ChatWindow:
             height=self._calc_text_display_lines(
                 plain_text,
                 char_width,
-                max_lines=MAX_COLLAPSED_MESSAGE_LINES if expanded else 40,
+                max_lines=MAX_COLLAPSED_MESSAGE_LINES if expanded else None,
             )
         )
+        self._resize_bubble_shell(container)
         if toggle is not None and toggle.winfo_exists():
             toggle.config(text='展开全文' if expanded else '收起')
         try:
@@ -4142,9 +4396,16 @@ class ChatWindow:
         if card is None or not card.winfo_exists():
             return
         bubble = getattr(card, '_message_bubble', None)
+        shell = getattr(card, '_bubble_shell', None)
         final_border = getattr(card, '_bubble_border', None)
         final_bg = getattr(card, '_bubble_bg', None)
-        if bubble is None or not bubble.winfo_exists():
+        final_fg = getattr(card, '_bubble_fg', None)
+        if final_fg is None and bubble is not None:
+            try:
+                final_fg = bubble.cget('fg')
+            except Exception:
+                final_fg = self.colors['text_strong']
+        if bubble is None or shell is None or not bubble.winfo_exists() or not shell.winfo_exists():
             return
 
         # 目标高度：以创建时落定的 card 高度为准（pack_propagate 已关闭）
@@ -4172,9 +4433,10 @@ class ChatWindow:
                 pass
         try:
             if final_bg is not None:
-                bubble.config(bg=panel)
-            if final_border is not None:
-                bubble.config(highlightbackground=glow)
+                bubble.config(bg=panel, fg=final_fg)
+                self._paint_bubble_shell(shell, fill=panel, outline=glow)
+            elif final_border is not None:
+                self._paint_bubble_shell(shell, outline=glow)
         except Exception:
             pass
 
@@ -4189,10 +4451,14 @@ class ChatWindow:
                 except Exception:
                     pass
             try:
+                shell_fill = final_bg
+                shell_outline = final_border
                 if final_bg is not None:
-                    bubble.config(bg=_blend_colors(panel, final_bg, p))
+                    shell_fill = _blend_colors(panel, final_bg, p)
+                    bubble.config(bg=shell_fill, fg=final_fg)
                 if final_border is not None:
-                    bubble.config(highlightbackground=_blend_colors(glow, final_border, p))
+                    shell_outline = _blend_colors(glow, final_border, p)
+                self._paint_bubble_shell(shell, fill=shell_fill, outline=shell_outline)
             except Exception:
                 pass
             if step < steps:
@@ -4203,9 +4469,8 @@ class ChatWindow:
                     if target_h > 0:
                         card.configure(height=target_h)
                     if final_bg is not None:
-                        bubble.config(bg=final_bg)
-                    if final_border is not None:
-                        bubble.config(highlightbackground=final_border)
+                        bubble.config(bg=final_bg, fg=final_fg)
+                    self._paint_bubble_shell(shell, fill=final_bg, outline=final_border)
                 except Exception:
                     pass
                 card._entrance_job = None
@@ -4261,14 +4526,18 @@ class ChatWindow:
         h2_font = self._markdown_fonts['h2']
         h3_font = self._markdown_fonts['h3']
         widget._markdown_fonts = self._markdown_fonts
-        widget.tag_configure('md_h1', font=h1_font, spacing1=8, spacing3=4)
-        widget.tag_configure('md_h2', font=h2_font, spacing1=6, spacing3=4)
-        widget.tag_configure('md_h3', font=h3_font, spacing1=6, spacing3=3)
-        widget.tag_configure('md_bold', font=strong_font)
-        widget.tag_configure('md_inline_code', font=code_font, background='#F6EBCB', foreground='#6B4E2B')
-        widget.tag_configure('md_code_block', font=code_font, background='#F8F5E8', foreground='#4F625E', lmargin1=12, lmargin2=12)
-        widget.tag_configure('md_quote', foreground='#638083', lmargin1=12, lmargin2=12)
-        widget.tag_configure('md_list_marker', foreground='#8D6835')
+        text_fg = getattr(widget, '_message_text_fg', self.colors['text_strong'])
+        code_fg = getattr(widget, '_message_code_fg', self.colors['text_strong'])
+        quote_fg = getattr(widget, '_message_quote_fg', self.colors['muted'])
+        marker_fg = getattr(widget, '_message_marker_fg', self.colors['gold_deep'])
+        widget.tag_configure('md_h1', font=h1_font, foreground=text_fg, spacing1=8, spacing3=4)
+        widget.tag_configure('md_h2', font=h2_font, foreground=text_fg, spacing1=6, spacing3=4)
+        widget.tag_configure('md_h3', font=h3_font, foreground=text_fg, spacing1=6, spacing3=3)
+        widget.tag_configure('md_bold', font=strong_font, foreground=text_fg)
+        widget.tag_configure('md_inline_code', font=code_font, background='#F6EBCB', foreground=code_fg)
+        widget.tag_configure('md_code_block', font=code_font, background='#FFF8DD', foreground=code_fg, lmargin1=12, lmargin2=12)
+        widget.tag_configure('md_quote', foreground=quote_fg, lmargin1=12, lmargin2=12)
+        widget.tag_configure('md_list_marker', foreground=marker_fg)
 
     def _markdown_to_plain_text(self, text: str) -> str:
         if not isinstance(text, str) or not text:
@@ -4700,13 +4969,15 @@ class ChatWindow:
         except Exception:
             return 50
 
-    def _calc_text_display_lines(self, text: str, char_width: int, *, max_lines: int = 40) -> int:
+    def _calc_text_display_lines(self, text: str, char_width: int, *, max_lines: int | None = 40) -> int:
         """估算文本在给定字符宽度下所需的显示行数。"""
         lines = text.count('\n') + 1
         # 为每行中超出宽度的部分增加额外的换行估算
         for line in text.split('\n'):
             if len(line) > char_width:
                 lines += len(line) // char_width
+        if max_lines is None:
+            return max(1, lines)
         return max(1, min(lines, max_lines))
 
     def _copy_to_clipboard(self, text: str):
