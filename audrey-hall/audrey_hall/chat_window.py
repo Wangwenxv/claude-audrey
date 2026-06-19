@@ -1,6 +1,7 @@
 import base64
 import io
 import json
+import math
 import os
 import queue
 import re
@@ -12,7 +13,7 @@ from tkinter import filedialog
 from datetime import datetime
 from pathlib import Path
 
-from PIL import Image, ImageTk
+from PIL import Image, ImageDraw, ImageTk
 
 try:
     from PIL import ImageGrab
@@ -26,6 +27,7 @@ from .claude_agent import (
 )
 from .terminal_view import TerminalViewWindow
 from .ui import create_button, create_card, create_dropdown, get_theme
+from .ui.components import ColorTween, _blend_colors, _ease_out_cubic
 from .utils import resource_path
 
 
@@ -203,6 +205,10 @@ class ChatWindow:
         self._pending_image_attachments = []
         self._attachment_preview_frame = None
         self._chat_header_canvas = None
+        self._status_dot = None
+        self._status_dot_item = None
+        self._status_dot_job = None
+        self._status_dot_phase = 0.0
 
         self.theme = get_theme()
         self.fonts = self.theme['fonts']
@@ -391,11 +397,11 @@ class ChatWindow:
             if elapsed < 0:
                 self._connection_time_var.set('')
             elif elapsed < 60:
-                self._connection_time_var.set(f'已连接 {int(elapsed)}s')
+                self._connection_time_var.set(f'◷ 已连接 {int(elapsed):02d}s')
             else:
                 minutes = int(elapsed // 60)
                 seconds = int(elapsed % 60)
-                self._connection_time_var.set(f'已连接 {minutes}m{seconds}s')
+                self._connection_time_var.set(f'◷ 已连接 {minutes}:{seconds:02d}')
         self._connection_time_timer = self.window.after(1000, self._update_connection_time)
 
     def _permission_card_style(self):
@@ -467,6 +473,24 @@ class ChatWindow:
             'pulse_border_off_color': '#FCFFFB',
         }
 
+    def _draw_sparkle(self, canvas, x, y, r, color, tag, *, width=1):
+        """四角星（光芒）：长十字 + 短斜叉，营造闪烁的星光。"""
+        canvas.create_line(x - r, y, x + r, y, fill=color, width=width, tags=tag)
+        canvas.create_line(x, y - r, x, y + r, fill=color, width=width, tags=tag)
+        d = max(1, int(r * 0.5))
+        canvas.create_line(x - d, y - d, x + d, y + d, fill=color, width=1, tags=tag)
+        canvas.create_line(x - d, y + d, x + d, y - d, fill=color, width=1, tags=tag)
+
+    def _draw_scroll_flourish(self, canvas, x, y, direction, color, tag):
+        """线端卷草花纹：一段向上的小弧 + 一颗收尾圆点，模拟金线卷曲。"""
+        d = direction
+        canvas.create_arc(
+            x - 9, y - 9, x + 9, y + 9,
+            start=20 if d > 0 else 160, extent=140 if d > 0 else -140,
+            style=tk.ARC, outline=color, width=1, tags=tag,
+        )
+        canvas.create_oval(x - 1 + d * 8, y - 7, x + 1 + d * 8, y - 5, fill=color, outline='', tags=tag)
+
     def _paint_header_ornament(self, event=None):
         canvas = self._chat_header_canvas
         if canvas is None:
@@ -476,16 +500,47 @@ class ChatWindow:
         if width <= 2 or height <= 2:
             return
 
+        gold = self.colors['gold']
+        gold_bright = self.colors['gold_bright']
+        gold_deep = self.colors['gold_deep']
+        cx = width // 2
+        cy = height // 2
+
         canvas.delete('ornament')
-        canvas.create_rectangle(0, 0, width, height, fill='#DDEDEA', outline='', tags='ornament')
-        canvas.create_oval(-60, -28, 190, 54, fill='#F5FFFA', outline='', stipple='gray75', tags='ornament')
-        canvas.create_oval(width - 180, -34, width + 46, 56, fill='#ECF8F5', outline='', stipple='gray75', tags='ornament')
-        canvas.create_line(18, height // 2, width - 18, height // 2, fill='#D1AE61', width=1, tags='ornament')
-        canvas.create_line(84, height // 2 + 7, width - 84, height // 2 + 7, fill='#F0D88D', width=1, tags='ornament')
-        canvas.create_arc(width - 58, 5, width - 32, 31, start=80, extent=235, style=tk.ARC, outline='#D1AE61', width=1, tags='ornament')
-        for x, y, size in ((42, height // 2 - 8, 4), (width - 96, height // 2 - 7, 4)):
-            canvas.create_line(x - size, y, x + size, y, fill='#F0D88D', width=1, tags='ornament')
-            canvas.create_line(x, y - size, x, y + size, fill='#F0D88D', width=1, tags='ornament')
+        canvas.create_rectangle(0, 0, width, height, fill=self.colors['bg'], outline='', tags='ornament')
+
+        # —— 朦胧云雾：左右两团柔白雾气 ——
+        canvas.create_oval(-70, -24, 180, height + 16, fill=self.colors['cloud'], outline='', stipple='gray50', tags='ornament')
+        canvas.create_oval(width - 180, -20, width + 70, height + 20, fill=self.colors['mist'], outline='', stipple='gray50', tags='ornament')
+
+        # —— 中央纹章留白：金线从两侧向中心延伸，止于卷草花纹 ——
+        gap = 46
+        canvas.create_line(20, cy, cx - gap, cy, fill=gold, width=1, tags='ornament')
+        canvas.create_line(cx + gap, cy, width - 20, cy, fill=gold, width=1, tags='ornament')
+        canvas.create_line(70, cy + 6, cx - gap - 10, cy + 6, fill=gold_bright, width=1, tags='ornament')
+        canvas.create_line(cx + gap + 10, cy + 6, width - 70, cy + 6, fill=gold_bright, width=1, tags='ornament')
+        self._draw_scroll_flourish(canvas, cx - gap, cy, -1, gold, 'ornament')
+        self._draw_scroll_flourish(canvas, cx + gap, cy, 1, gold, 'ornament')
+
+        # 金线沿途的小星点
+        for x in (44, width - 44):
+            self._draw_sparkle(canvas, x, cy, 4, gold_bright, 'ornament')
+
+        # —— 中央：新月 + 星 + 光芒 ——
+        r = min(11, height // 2 - 3)
+        # 新月（双弧叠出弯月轮廓）
+        canvas.create_arc(cx - r, cy - r, cx + r, cy + r, start=58, extent=244, style=tk.ARC, outline=gold, width=2, tags='ornament')
+        canvas.create_arc(cx - r + 5, cy - r, cx + r + 5, cy + r, start=74, extent=212, style=tk.ARC, outline=gold_deep, width=1, tags='ornament')
+        # 月牙怀中的星
+        self._draw_sparkle(canvas, cx + r - 3, cy - r + 4, 5, gold_bright, 'ornament', width=1)
+        # 自月牙向外发散的细微光芒
+        for ang in (-58, -30, -2, 26):
+            rad = math.radians(ang)
+            x1 = cx + (r + 2) * math.cos(rad)
+            y1 = cy + (r + 2) * math.sin(rad)
+            x2 = cx + (r + 6) * math.cos(rad)
+            y2 = cy + (r + 6) * math.sin(rad)
+            canvas.create_line(x1, y1, x2, y2, fill=gold_bright, width=1, tags='ornament')
 
     def _paint_input_shell(self, event=None):
         canvas = self._input_canvas
@@ -496,14 +551,26 @@ class ChatWindow:
         if width <= 2 or height <= 2:
             return
 
+        gold = self.colors['gold']
+        gold_bright = self.colors['gold_bright']
+
         canvas.delete('input_decor')
         canvas.create_rectangle(0, 0, width, height, fill=self.colors['bg'], outline='', tags='input_decor')
-        canvas.create_rectangle(12, 8, width - 12, height - 8, fill='#F4FBF2', outline='#D1AE61', width=1, tags='input_decor')
-        canvas.create_line(22, height - 17, width - 22, height - 17, fill='#F0D88D', width=1, tags='input_decor')
-        canvas.create_line(24, 16, width - 24, 16, fill='#E5D392', width=1, tags='input_decor')
-        for x, y in ((30, 26), (width - 36, height - 30)):
-            canvas.create_line(x - 4, y, x + 4, y, fill='#D1AE61', width=1, tags='input_decor')
-            canvas.create_line(x, y - 4, x, y + 4, fill='#D1AE61', width=1, tags='input_decor')
+        # 朦胧底纹：输入框上方一抹薄雾
+        canvas.create_oval(width // 2 - 160, -30, width // 2 + 160, 26, fill=self.colors['cloud'], outline='', stipple='gray75', tags='input_decor')
+        # 双层金边
+        canvas.create_rectangle(12, 8, width - 12, height - 8, fill=self.colors['input_bg'], outline=gold, width=1, tags='input_decor')
+        canvas.create_rectangle(15, 11, width - 15, height - 11, outline=gold_bright, width=1, tags='input_decor')
+        # 四角金色卷草花纹
+        c = 12
+        for ox, oy, sx, sy in (
+            (12, 8, 1, 1), (width - 12, 8, -1, 1),
+            (12, height - 8, 1, -1), (width - 12, height - 8, -1, -1),
+        ):
+            canvas.create_line(ox, oy + sy * c, ox, oy, ox + sx * c, oy, fill=gold, width=1, tags='input_decor')
+            canvas.create_oval(ox + sx * (c - 1), oy + sy * (c - 1), ox + sx * (c + 2), oy + sy * (c + 2), fill=gold_bright, outline='', tags='input_decor')
+        # 顶部居中一颗小星点缀
+        self._draw_sparkle(canvas, width // 2, 11, 4, gold_bright, 'input_decor')
         canvas.tag_lower('input_decor')
 
     def _update_input_background(self, event=None):
@@ -803,12 +870,12 @@ class ChatWindow:
         ).pack(fill=tk.X, pady=(4, 0))
         self._chat_header_canvas = tk.Canvas(
             header,
-            height=34,
+            height=46,
             bg=self.colors['bg'],
             highlightthickness=0,
             bd=0,
         )
-        self._chat_header_canvas.pack(fill=tk.X, pady=(8, 0))
+        self._chat_header_canvas.pack(fill=tk.X, pady=(10, 2))
         self._chat_header_canvas.bind('<Configure>', self._paint_header_ornament, add='+')
         tk.Label(
             title_row,
@@ -1079,6 +1146,16 @@ class ChatWindow:
         self.input_box.bind('<Control-V>', self._handle_input_paste, add='+')
         self.input_box.bind('<<Paste>>', self._handle_input_paste, add='+')
 
+        self._status_dot = tk.Canvas(
+            status_row,
+            width=12,
+            height=12,
+            bg=self.colors['bg'],
+            highlightthickness=0,
+            bd=0,
+        )
+        self._status_dot.pack(side=tk.LEFT, padx=(0, 7), pady=(0, 1))
+        self._status_dot_item = self._status_dot.create_oval(2, 2, 10, 10, fill=self.colors['border_strong'], outline='')
         tk.Label(
             status_row,
             textvariable=self.status_var,
@@ -1166,11 +1243,21 @@ class ChatWindow:
 
         def _paint_sidebar_ornament(event):
             width = event.width
+            mid = width // 2
+            gold = self.colors['gold']
+            gold_bright = self.colors['gold_bright']
             ornament.delete('all')
-            ornament.create_line(0, 11, width, 11, fill=self.colors['gold_soft'], width=1)
-            ornament.create_oval(width // 2 - 7, 4, width // 2 + 7, 18, outline=self.colors['gold'], width=1)
-            ornament.create_line(width // 2 - 4, 11, width // 2 + 4, 11, fill=self.colors['gold'], width=1)
-            ornament.create_line(width // 2, 7, width // 2, 15, fill=self.colors['gold'], width=1)
+            # 两侧渐隐金线，向中央纹章收束
+            ornament.create_line(0, 11, mid - 18, 11, fill=self.colors['gold_soft'], width=1)
+            ornament.create_line(mid + 18, 11, width, 11, fill=self.colors['gold_soft'], width=1)
+            ornament.create_line(14, 14, mid - 24, 14, fill=gold_bright, width=1)
+            ornament.create_line(mid + 24, 14, width - 14, 14, fill=gold_bright, width=1)
+            # 中央：新月抱星
+            ornament.create_arc(mid - 8, 3, mid + 8, 19, start=60, extent=240, style=tk.ARC, outline=gold, width=1)
+            self._draw_sparkle(ornament, mid + 4, 8, 4, gold_bright, 'sb_orn')
+            # 线端小星
+            for x in (mid - 18, mid + 18):
+                self._draw_sparkle(ornament, x, 11, 3, gold, 'sb_orn')
 
         ornament.bind('<Configure>', _paint_sidebar_ornament, add='+')
 
@@ -1355,17 +1442,48 @@ class ChatWindow:
             self._history_empty_label.pack(fill=tk.X, padx=6, pady=6)
             return
 
-        for item in self._history_items:
-            self._render_history_item(item)
+        for index, item in enumerate(self._history_items):
+            card = self._render_history_item(item)
+            if card is None:
+                continue
+            # 列表入场错峰：先收起，再按 45ms 步长依次浮现，符合 stagger-sequence
+            try:
+                card.pack_forget()
+            except Exception:
+                pass
+            if self.window is not None:
+                self.window.after(index * 45, lambda c=card: self._reveal_history_card(c))
+            else:
+                self._reveal_history_card(card)
+
+    def _reveal_history_card(self, card):
+        if card is None or not card.winfo_exists():
+            return
+        try:
+            card.pack(fill=tk.X, padx=4, pady=4)
+        except Exception:
+            pass
 
     def _render_history_item(self, item: dict):
         session_id = item.get('session_id') or ''
         is_active = session_id == self._current_session_id()
-        card_bg = '#FBFFFC' if not is_active else '#F6EBCB'
-        border = '#D1AE61' if is_active else '#D7EFE5'
-        card = tk.Frame(self._history_container, bg=border, bd=0, highlightthickness=0, cursor='hand2')
-        inner = tk.Frame(card, bg=card_bg, bd=0, highlightthickness=0)
-        inner.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+
+        # 配色：静止 / 悬停 / 选中 三态，悬停时金边亮起、底色微暖（hover lift 观感）
+        rail_rest = self.colors['gold'] if is_active else '#DCEFE8'
+        rail_hot = self.colors['gold']
+        border_rest = self.colors['gold'] if is_active else '#DCEFE8'
+        border_hot = self.colors['gold_bright']
+        bg_rest = self.colors['gold_soft'] if is_active else self.colors['card_bg']
+        bg_hot = self.colors['gold_soft'] if is_active else self.colors['hover']
+
+        card = tk.Frame(self._history_container, bg=border_rest, bd=0, highlightthickness=0, cursor='hand2')
+        body = tk.Frame(card, bg=bg_rest, bd=0, highlightthickness=0)
+        body.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+        # 左侧强调竖条：选中=金色实条，普通=浅青；是 nav-state-active 的视觉锚点
+        rail = tk.Frame(body, width=4, bg=rail_rest)
+        rail.pack(side=tk.LEFT, fill=tk.Y)
+        inner = tk.Frame(body, bg=bg_rest, bd=0, highlightthickness=0)
+        inner.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         card.pack(fill=tk.X, padx=4, pady=4)
 
         title = item.get('title') or item.get('session_id')
@@ -1373,25 +1491,26 @@ class ChatWindow:
         timestamp = self._format_history_timestamp(item.get('timestamp') or '')
 
         # 标题行：标题 + 删除按钮
-        title_row = tk.Frame(inner, bg=card_bg)
+        title_row = tk.Frame(inner, bg=bg_rest)
         title_row.pack(fill=tk.X, padx=10, pady=(8, 2))
-        tk.Label(
+        title_label = tk.Label(
             title_row,
             text=title,
             font=self.fonts['control'],
-            bg=card_bg,
+            bg=bg_rest,
             fg=self.colors['text_strong'],
             justify='left',
             anchor='w',
-            wraplength=180,
-        ).pack(side=tk.LEFT)
+            wraplength=176,
+        )
+        title_label.pack(side=tk.LEFT)
 
         delete_btn = tk.Label(
             title_row,
             text='✕',
             font=self.fonts['small'],
-            bg=card_bg,
-            fg='#C07B7B',
+            bg=bg_rest,
+            fg='#C7969E',
             cursor='hand2',
             padx=6,
         )
@@ -1402,11 +1521,11 @@ class ChatWindow:
             return 'break'
 
         delete_btn.bind('<Button-1>', handle_delete, add='+')
-        # Tooltip effect on hover
+        # 删除按钮悬停轻微提示
         def _on_delete_enter(_event, btn=delete_btn):
             btn.configure(fg='#D43D3D')
         def _on_delete_leave(_event, btn=delete_btn):
-            btn.configure(fg='#C07B7B')
+            btn.configure(fg='#C7969E')
         delete_btn.bind('<Enter>', _on_delete_enter, add='+')
         delete_btn.bind('<Leave>', _on_delete_leave, add='+')
 
@@ -1420,43 +1539,78 @@ class ChatWindow:
                 self._history_context_menu.grab_release()
             return 'break'
 
+        bg_widgets = [body, inner, title_row, title_label]
         if summary:
-            tk.Label(
+            summary_label = tk.Label(
                 inner,
                 text=summary,
                 font=self.fonts['small'],
-                bg=card_bg,
+                bg=bg_rest,
                 fg=self.colors['muted'],
                 justify='left',
                 anchor='w',
-                wraplength=208,
-            ).pack(fill=tk.X, padx=10)
-        tk.Label(
+                wraplength=204,
+            )
+            summary_label.pack(fill=tk.X, padx=10)
+            bg_widgets.append(summary_label)
+        meta_label = tk.Label(
             inner,
-            text=f'{timestamp}  {session_id[:8]}',
+            text=f'{timestamp}  ·  {session_id[:8]}',
             font=self.fonts['small'],
-            bg=card_bg,
+            bg=bg_rest,
             fg=self.colors['subtext'],
             justify='left',
             anchor='w',
-        ).pack(fill=tk.X, padx=10, pady=(6, 8))
+        )
+        meta_label.pack(fill=tk.X, padx=10, pady=(6, 8))
+        bg_widgets.append(meta_label)
+
+        # 悬停过渡：卡片边框、底色、左条统一缓动，营造"浮起"质感
+        def _apply_card_colors(colors, _card=card, _rail=rail, _bgs=tuple(bg_widgets), _del=delete_btn):
+            try:
+                _card.config(bg=colors['border'])
+                _rail.config(bg=colors['rail'])
+                for w in _bgs:
+                    w.config(bg=colors['bg'])
+                _del.config(bg=colors['bg'])
+            except Exception:
+                pass
+
+        tween = ColorTween(card, _apply_card_colors, duration_ms=170, steps=11)
+        rest_colors = {'border': border_rest, 'rail': rail_rest, 'bg': bg_rest}
+        hot_colors = {'border': border_hot, 'rail': rail_hot, 'bg': bg_hot}
+        tween.set_immediate(rest_colors)
+        card._hover_tween = tween
 
         def handle_click(_event=None, target_session_id=session_id):
             self._resume_history_session(target_session_id)
             return 'break'
 
-        for widget in (card, inner):
-            widget.bind('<Button-1>', handle_click, add='+')
-            widget.bind('<Button-3>', show_context_menu, add='+')
-        for widget in inner.winfo_children():
+        def _pointer_in_card(_card=card):
+            try:
+                px, py = _card.winfo_pointerxy()
+                x0 = _card.winfo_rootx()
+                y0 = _card.winfo_rooty()
+                return (x0 <= px < x0 + _card.winfo_width()) and (y0 <= py < y0 + _card.winfo_height())
+            except Exception:
+                return False
+
+        def _hover_on(_event, _tween=tween, _hot=hot_colors):
+            _tween.animate_to(_hot, duration_ms=170)
+
+        def _hover_off(_event, _tween=tween, _rest=rest_colors):
+            # 仅当指针真正离开整张卡片时复位，避免在子组件间穿梭导致闪烁
+            if not _pointer_in_card():
+                _tween.animate_to(_rest, duration_ms=130)
+
+        all_widgets = [card, body, inner, rail, title_row, *bg_widgets]
+        for widget in all_widgets:
             widget.bind('<Button-1>', handle_click, add='+')
             if widget is not delete_btn:
                 widget.bind('<Button-3>', show_context_menu, add='+')
-            # 递归绑定子组件的子组件（如 title_row 内的 Label）
-            for grandchild in widget.winfo_children():
-                if grandchild is not delete_btn:
-                    grandchild.bind('<Button-1>', handle_click, add='+')
-                    grandchild.bind('<Button-3>', show_context_menu, add='+')
+            widget.bind('<Enter>', _hover_on, add='+')
+            widget.bind('<Leave>', _hover_off, add='+')
+        return card
 
     def _format_history_timestamp(self, value: str) -> str:
         if not value:
@@ -2382,6 +2536,7 @@ class ChatWindow:
                 self._session_connected = True
                 self._connection_start_time = datetime.now()
                 self._update_connection_time()
+                self._refresh_status_dot()
                 target_label = CONNECTION_OPTION_LABELS.get(self._connection_target, self._connection_target)
                 self._append_inline_status(f'已连接：{target_label}')
                 self.status_var.set(self._compose_status_text(f'已连接：{target_label}'))
@@ -2898,6 +3053,43 @@ class ChatWindow:
                 state=tk.NORMAL,
                 text='我插个话...' if busy else '发送',
             )
+        self._refresh_status_dot()
+
+    def _refresh_status_dot(self):
+        """状态灯：忙碌=金色呼吸，已连接=薄荷常亮，未连接=灰。"""
+        if self._status_dot is None or self._status_dot_item is None:
+            return
+        if not self._status_dot.winfo_exists():
+            return
+        if self._status_dot_job is not None:
+            try:
+                self._status_dot.after_cancel(self._status_dot_job)
+            except Exception:
+                pass
+            self._status_dot_job = None
+
+        if self._busy:
+            self._status_dot_phase = 0.0
+            self._pulse_status_dot()
+            return
+        color = self.colors['accent'] if self._session_connected else self.colors['border_strong']
+        try:
+            self._status_dot.itemconfigure(self._status_dot_item, fill=color)
+        except Exception:
+            pass
+
+    def _pulse_status_dot(self):
+        if self._status_dot is None or not self._status_dot.winfo_exists() or not self._busy:
+            return
+        # 正弦呼吸：在暖金与亮金之间柔和往返
+        t = (math.sin(self._status_dot_phase) + 1) / 2
+        try:
+            color = _blend_colors(self.colors['gold'], self.colors['gold_bright'], t)
+            self._status_dot.itemconfigure(self._status_dot_item, fill=color)
+        except Exception:
+            pass
+        self._status_dot_phase += 0.45
+        self._status_dot_job = self._status_dot.after(60, self._pulse_status_dot)
 
     def _append_inline_status(self, text: str):
         if self.text_area is None:
@@ -3524,20 +3716,81 @@ class ChatWindow:
         if parts:
             self._render_summary_status(' | '.join(parts))
 
+    @staticmethod
+    def _hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
+        h = (hex_color or '#000000').lstrip('#')
+        if len(h) == 3:
+            h = ''.join(ch * 2 for ch in h)
+        return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+    def _build_ring_avatar(self, source, ring_color: str, glow_color: str, size: int = 54):
+        """把头像裁成圆形，外圈套一道柔和的金/粉色光环，增添贵族与神圣感。"""
+        scale = 4
+        big = size * scale
+        bg_rgb = self._hex_to_rgb(self.colors['panel'])
+        canvas = Image.new('RGBA', (big, big), bg_rgb + (255,))
+        draw = ImageDraw.Draw(canvas)
+
+        ring_rgb = self._hex_to_rgb(ring_color)
+        glow_rgb = self._hex_to_rgb(glow_color)
+
+        # 外层柔光晕
+        glow_w = max(scale, int(big * 0.055))
+        draw.ellipse(
+            (glow_w, glow_w, big - glow_w - 1, big - glow_w - 1),
+            outline=glow_rgb + (255,), width=glow_w,
+        )
+        # 主金/粉色细环
+        ring_w = max(scale, int(big * 0.032))
+        inset = glow_w + ring_w
+        draw.ellipse(
+            (inset, inset, big - inset - 1, big - inset - 1),
+            outline=ring_rgb + (255,), width=ring_w,
+        )
+
+        # 圆形裁切头像，嵌入环内
+        pad = inset + ring_w + max(scale, int(big * 0.012))
+        inner = big - pad * 2
+        if inner > 0:
+            ava = source.convert('RGBA').resize((inner, inner), Image.Resampling.LANCZOS)
+            mask = Image.new('L', (inner, inner), 0)
+            ImageDraw.Draw(mask).ellipse((0, 0, inner - 1, inner - 1), fill=255)
+            canvas.paste(ava, (pad, pad), mask)
+
+        # 环上点缀三颗小星（星月主题），呼应金色装饰
+        star_r = max(scale, int(big * 0.02))
+        cx = big / 2
+        radius = (big - inset) / 2 - ring_w
+        for ang in (-90, -150, -30):
+            rad = math.radians(ang)
+            px = cx + radius * math.cos(rad)
+            py = cx + radius * math.sin(rad)
+            draw.line((px - star_r, py, px + star_r, py), fill=glow_rgb + (255,), width=scale)
+            draw.line((px, py - star_r, px, py + star_r), fill=glow_rgb + (255,), width=scale)
+
+        result = canvas.convert('RGB').resize((size, size), Image.Resampling.LANCZOS)
+        return ImageTk.PhotoImage(result)
+
     def _get_assistant_avatar(self):
         if self._assistant_avatar is not None or self._avatar_source is None:
             return self._assistant_avatar
 
-        avatar = self._avatar_source.resize((48, 48), Image.Resampling.LANCZOS)
-        self._assistant_avatar = ImageTk.PhotoImage(avatar)
+        self._assistant_avatar = self._build_ring_avatar(
+            self._avatar_source,
+            ring_color=self.colors['gold'],
+            glow_color=self.colors['gold_bright'],
+        )
         return self._assistant_avatar
 
     def _get_user_avatar(self):
         if self._user_avatar is not None or self._user_avatar_source is None:
             return self._user_avatar
 
-        avatar = self._user_avatar_source.resize((48, 48), Image.Resampling.LANCZOS)
-        self._user_avatar = ImageTk.PhotoImage(avatar)
+        self._user_avatar = self._build_ring_avatar(
+            self._user_avatar_source,
+            ring_color='#E2A9BB',
+            glow_color=self.colors['pink_soft'],
+        )
         return self._user_avatar
 
     def _build_message_layout(self, text: str, text_width_chars: int) -> tuple[str, int, bool]:
@@ -3559,11 +3812,11 @@ class ChatWindow:
         is_warn = role == 'warn'
 
         bubble_bg = '#EFF9F0'
-        bubble_border = '#BFE3CA'
+        bubble_border = '#C3E6D0'
         bubble_fg = self.colors['text_strong']
         if is_user:
-            bubble_bg = '#F8E7EC'
-            bubble_border = '#E8BFCA'
+            bubble_bg = '#FAEAEF'
+            bubble_border = '#EAC8D2'
         elif is_error:
             bubble_bg = self.colors['error']
             bubble_border = '#DAB8BE'
@@ -3620,6 +3873,7 @@ class ChatWindow:
             bubble.configure(state=tk.DISABLED)
             bubble.pack(anchor='e')
             container._message_bubble = bubble
+            container._bubble_border = bubble_border
             container._message_text = text
             container._message_plain_text = plain_text
             container._message_is_expanded = not is_collapsible
@@ -3637,6 +3891,7 @@ class ChatWindow:
                 toggle.pack(anchor='e', pady=(6, 0))
                 container._message_toggle = toggle
                 toggle.bind('<Button-1>', lambda _event, item=container: self._toggle_message_expand(item), add='+')
+                self._bind_toggle_hover(toggle)
 
             meta = tk.Frame(content_col, bg=self.colors['panel'])
             meta.pack(anchor='e', pady=(6, 0))
@@ -3695,6 +3950,7 @@ class ChatWindow:
             bubble.configure(state=tk.DISABLED)
             bubble.pack(anchor='w')
             container._message_bubble = bubble
+            container._bubble_border = bubble_border
             container._message_text = text
             container._message_plain_text = plain_text
             container._message_is_expanded = not is_collapsible
@@ -3712,6 +3968,7 @@ class ChatWindow:
                 toggle.pack(anchor='w', pady=(6, 0))
                 container._message_toggle = toggle
                 toggle.bind('<Button-1>', lambda _event, item=container: self._toggle_message_expand(item), add='+')
+                self._bind_toggle_hover(toggle)
 
             meta = tk.Frame(content_col, bg=self.colors['panel'])
             meta.pack(anchor='w', pady=(6, 0))
@@ -3782,10 +4039,52 @@ class ChatWindow:
         self.text_area.insert(tk.END, '\n')
         self.text_area.config(state=tk.DISABLED)
         self._maybe_follow_transcript_end()
+        self._animate_bubble_entrance(card)
 
         if record_history and role in {'user', 'assistant'}:
             self._conversation_history.append({'role': role, 'text': text})
             self._conversation_history = self._conversation_history[-12:]
+
+    def _animate_bubble_entrance(self, card):
+        """新消息登场：气泡描边从金色微光过渡回常态，给一个轻巧的"到达"提示。"""
+        if card is None:
+            return
+        bubble = getattr(card, '_message_bubble', None)
+        final_border = getattr(card, '_bubble_border', None)
+        if bubble is None or final_border is None or not bubble.winfo_exists():
+            return
+        glow = self.colors['gold_bright']
+        tween = ColorTween(
+            bubble,
+            lambda colors: bubble.winfo_exists() and bubble.config(highlightbackground=colors['b']),
+            duration_ms=420,
+            steps=14,
+        )
+        tween.set_immediate({'b': glow})
+        tween.animate_to({'b': final_border}, duration_ms=420)
+        card._entrance_tween = tween
+
+    def _bind_toggle_hover(self, toggle):
+        """折叠/展开链接的悬停反馈：颜色加深 + 下划线，明确它可点。"""
+        rest_fg = self.colors['accent']
+        hot_fg = self.colors['accent_dark']
+        base_font = self.fonts['small']
+        underline_font = (base_font[0], base_font[1], 'underline') if isinstance(base_font, tuple) and len(base_font) >= 2 else base_font
+
+        def _on(_event):
+            try:
+                toggle.config(fg=hot_fg, font=underline_font)
+            except Exception:
+                pass
+
+        def _off(_event):
+            try:
+                toggle.config(fg=rest_fg, font=base_font)
+            except Exception:
+                pass
+
+        toggle.bind('<Enter>', _on, add='+')
+        toggle.bind('<Leave>', _off, add='+')
 
     def _configure_markdown_tags(self, widget: tk.Text):
         if self._markdown_fonts is None:

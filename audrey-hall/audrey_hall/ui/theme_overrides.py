@@ -19,29 +19,33 @@ buttons.primary.image_size = (120, 40)
 
 THEME_OVERRIDES = {
     'colors': {
-        'bg': '#DDEDEA',
-        'panel': '#F8FFFB',
+        # —— 基底与氛围：低饱和、带灰调的青蓝 / 水绿，朦胧如云雾 ——
+        'bg': '#D6E7E4',
+        'panel': '#F9FFFC',
         'card_bg': '#FCFFFB',
-        'card_alt': '#EEF8F1',
+        'card_alt': '#ECF7F0',
         'input_bg': '#F4FBF2',
         'input_border': '#D9C281',
-        'border': '#B8D6CF',
-        'border_strong': '#8EBBB2',
+        'border': '#B6D5CE',
+        'border_strong': '#8DBAB1',
+        # —— 角色主体色：清新柔润的薄荷绿 / 草绿 ——
         'accent': '#8CCFB2',
         'accent_dark': '#4F827B',
         'accent_soft': '#D7EFE5',
+        # —— 点睛暖金：贯穿装饰花纹、星月、光芒、边框 ——
         'gold': '#D1AE61',
-        'gold_bright': '#F0D88D',
+        'gold_bright': '#F2DC95',
         'gold_deep': '#8D6835',
         'gold_soft': '#F6EBCB',
+        # —— 柔化点缀：浅粉（丝带 / 领口） ——
         'pink_soft': '#F6DDE5',
-        'text': '#314C4D',
-        'text_strong': '#22383A',
-        'muted': '#638083',
+        'text': '#2F4A4B',
+        'text_strong': '#21373A',
+        'muted': '#5F7C7F',
         'subtext': '#84989B',
-        'hover': '#EAF7F2',
-        'separator': '#D2E6DF',
-        'tab_bg': '#E4F1ED',
+        'hover': '#E8F6F1',
+        'separator': '#D0E5DE',
+        'tab_bg': '#E2F0EC',
         'tab_active': '#FFF5DB',
         'user': '#F6E5EA',
         'assistant': '#EFF9F0',
@@ -49,6 +53,11 @@ THEME_OVERRIDES = {
         'error': '#F7E2E1',
         'success': '#E2F4DE',
         'info': '#E6F5F3',
+        # —— 朦胧云雾与微光（装饰画布专用） ——
+        'mist': '#E7F4EF',
+        'mist_deep': '#DCEEEA',
+        'cloud': '#F2FBF6',
+        'gold_glow': '#FBF1D2',
     },
     'windows': {
         'chat': {
