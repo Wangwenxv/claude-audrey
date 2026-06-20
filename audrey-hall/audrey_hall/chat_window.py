@@ -277,7 +277,7 @@ class ChatWindow:
     def _switch_connection_target(self, target: str):
         normalized = normalize_connection_target(target)
         if normalized == self._connection_target and self._connection_target_selected and self._session_connected:
-            self.status_var.set(f'已连上{CONNECTION_OPTION_LABELS.get(normalized, normalized)}')
+            self._set_status_and_agent(f'已连上{CONNECTION_OPTION_LABELS.get(normalized, normalized)}', '连接状态', 'READY')
             return
 
         self._set_connection_target(normalized)
@@ -286,12 +286,12 @@ class ChatWindow:
         else:
             label = CONNECTION_OPTION_LABELS.get(normalized, normalized)
             self._append_inline_status(f'已选择思维链：{label}')
-            self.status_var.set(self._compose_status_text(f'已选择思维链：{label}，点击连接后生效'))
+            self._set_status_and_agent(self._compose_status_text(f'已选择思维链：{label}，点击连接后生效'), '连接目标', 'READY')
 
     def _reconnect_session(self, announce: bool = False):
         if not self._connection_target_selected:
             self._append_inline_status('请先选择思维链，再点击连接。')
-            self.status_var.set(self._compose_status_text('请先选择思维链，再点击连接。'))
+            self._set_status_and_agent(self._compose_status_text('请先选择思维链，再点击连接。'), '需要连接', 'ACTION')
             return
         try:
             self.session.close()
@@ -324,19 +324,19 @@ class ChatWindow:
         label = CONNECTION_OPTION_LABELS.get(self._connection_target, self._connection_target)
         if announce:
             self._append_inline_status(f'正在重连：{label}')
-        self.status_var.set(f'正在呼唤{label}...')
+        self._set_status_and_agent(f'正在呼唤{label}...', '正在连接', 'BOOTING')
         self._start_session()
 
     def _start_session(self):
         self._connection_start_time = None
         self._connection_time_var.set('')
-        self.status_var.set(self._compose_status_text('正在连接...'))
+        self._set_status_and_agent(self._compose_status_text('正在连接...'), '正在连接', 'BOOTING')
         try:
             self.session.start()
         except Exception as exc:
             self._connection_start_time = None
             self._connection_time_var.set('')
-            self.status_var.set('呼唤失败')
+            self._set_status_and_agent('呼唤失败', '连接失败', 'ERROR')
             self._append_message('error', f'呼唤助手失败：{exc}')
 
     def _ensure_terminal_view(self):
@@ -1082,6 +1082,13 @@ class ChatWindow:
         self._agent_activity_badge.config(text=badge_text)
         self._agent_activity_meta.config(text=meta)
         self._refresh_agent_activity_visibility()
+
+    def _set_status_and_agent(self, text: str, title: str = '状态更新', badge: str = 'STATUS'):
+        compact = self._task_progress_compact_text(text)
+        if not compact:
+            return
+        self.status_var.set(compact)
+        self._set_agent_activity('status', title, compact, badge)
 
     def show(self):
         if self.window is not None and self.window.winfo_exists():
@@ -2165,7 +2172,7 @@ class ChatWindow:
             self.text_area.config(state=tk.NORMAL)
             self.text_area.delete('1.0', tk.END)
             self.text_area.config(state=tk.DISABLED)
-        self.status_var.set('正在唤醒奥黛丽的助手...')
+        self._set_status_and_agent('正在唤醒奥黛丽的助手...', '正在连接', 'BOOTING')
 
     def _load_session_transcript_preview(self, session_id: str):
         project_dir = self._history_project_dir()
@@ -2382,7 +2389,7 @@ class ChatWindow:
             return
 
         self._refresh_attachment_preview()
-        self.status_var.set(f'已添加 {added_count} 张图片，等待发送。')
+        self._set_status_and_agent(f'已添加 {added_count} 张图片，等待发送。', '图片附件', 'READY')
         if self.input_box is not None:
             self.input_box.focus_set()
 
@@ -2449,7 +2456,7 @@ class ChatWindow:
 
         if added_count > 0:
             self._refresh_attachment_preview()
-            self.status_var.set(f'已从剪贴板添加 {added_count} 张图片。')
+            self._set_status_and_agent(f'已从剪贴板添加 {added_count} 张图片。', '图片附件', 'READY')
             if self.input_box is not None:
                 self.input_box.focus_set()
         return added_count
@@ -2513,9 +2520,9 @@ class ChatWindow:
         self._pending_image_attachments.pop(index)
         self._refresh_attachment_preview()
         if self._pending_image_attachments:
-            self.status_var.set(f'还剩 {len(self._pending_image_attachments)} 张待发送图片。')
+            self._set_status_and_agent(f'还剩 {len(self._pending_image_attachments)} 张待发送图片。', '图片附件', 'READY')
         else:
-            self.status_var.set('图片附件已清空。')
+            self._set_status_and_agent('图片附件已清空。', '图片附件', 'READY')
 
     def _clear_pending_image_attachments(self):
         if not self._pending_image_attachments:
@@ -2569,7 +2576,7 @@ class ChatWindow:
         if not visible_text:
             return False
         if not self._session_connected or self.session.process is None:
-            self.status_var.set(self._compose_status_text('请先选择思维链并点击连接，再发送消息。'))
+            self._set_status_and_agent(self._compose_status_text('请先选择思维链并点击连接，再发送消息。'), '需要连接', 'ACTION')
             self._append_inline_status('请先选择思维链并点击连接，再发送消息。')
             return False
 
@@ -2588,7 +2595,7 @@ class ChatWindow:
 
         self._append_message('user', visible_text)
         self._set_agent_activity('thinking', '奥黛丽正在整理思路', self._task_progress_compact_text(visible_text), 'THINKING')
-        self.status_var.set('奥黛丽 正在思考...')
+        self._set_status_and_agent('奥黛丽 正在思考...', '奥黛丽正在整理思路', 'THINKING')
         self._set_busy(True)
         self._last_busy_event_time = datetime.now()
         self._update_bubble_state('thinking', {'prompt': visible_text})
@@ -2597,7 +2604,7 @@ class ChatWindow:
             self.session.send_user_message(message_content)
         except Exception as exc:
             self._set_busy(False)
-            self.status_var.set('发送失败')
+            self._set_status_and_agent('发送失败', '发送失败', 'ERROR')
             self._clear_bubble_state()
             self._append_message('error', f'发送失败：{exc}')
             return False
@@ -2664,7 +2671,7 @@ class ChatWindow:
         self._refresh_mode_buttons()
         if announce and changed:
             label = MODE_LABELS.get(normalized, normalized)
-            self.status_var.set(f'模式已切换：{label}')
+            self._set_status_and_agent(f'模式已切换：{label}', '模式切换', 'READY')
             self._append_inline_status(f'模式已切换：{label}')
 
     def _apply_permission_mode(self, mode: str):
@@ -2679,7 +2686,7 @@ class ChatWindow:
             return
 
         label = MODE_LABELS[normalized]
-        self.status_var.set(f'正在切换模式：{label}')
+        self._set_status_and_agent(f'正在切换模式：{label}', '模式切换', 'LIVE')
 
     def _handle_mode_command(self, args: str):
         normalized = args.strip()
@@ -2736,7 +2743,7 @@ class ChatWindow:
             return
 
         self._active_model = 'default' if model is None else model
-        self.status_var.set(f'模型已切换：{self._active_model}')
+        self._set_status_and_agent(f'模型已切换：{self._active_model}', '模型切换', 'READY')
         self._append_inline_status(f'模型已切换：{self._active_model}')
 
     def _show_model_picker_card(self):
@@ -2884,7 +2891,7 @@ class ChatWindow:
     def _on_stop(self):
         try:
             self.session.interrupt()
-            self.status_var.set('已请求停止')
+            self._set_status_and_agent('已请求停止', '停止请求', 'STOP')
         except Exception as exc:
             self._append_message('error', f'停止失败：{exc}')
 
@@ -2943,7 +2950,7 @@ class ChatWindow:
                 return
             if text:
                 self._append_message('assistant', text)
-                self.status_var.set(self._compose_status_text('奥黛丽 正在回复...'))
+                self._set_status_and_agent(self._compose_status_text('奥黛丽 正在回复...'), '奥黛丽正在回复', 'LIVE')
                 self._maybe_show_choice_buttons(text)
             return
 
@@ -2968,7 +2975,7 @@ class ChatWindow:
             else:
                 self._render_tool_status_widget(terminal_text)
             self._set_agent_activity('working', f'正在使用工具：{tool_name}', terminal_text, 'LIVE')
-            self.status_var.set(self._compose_status_text(f'🔧 {self._format_main_tool_status(event)}'))
+            self._set_status_and_agent(self._compose_status_text(f'🔧 {self._format_main_tool_status(event)}'), '工具调用', 'LIVE')
             return
 
         if kind == 'thinking':
@@ -2980,7 +2987,7 @@ class ChatWindow:
                 self._render_main_status(reminder_text)
                 return
             self._set_agent_activity('thinking', '奥黛丽正在整理思路', self._compose_status_text('奥黛丽 正在思考...'), 'THINKING')
-            self.status_var.set(self._compose_status_text('奥黛丽 正在思考...'))
+            self._set_status_and_agent(self._compose_status_text('奥黛丽 正在思考...'), '奥黛丽正在整理思路', 'THINKING')
             return
 
         if kind == 'status':
@@ -3004,9 +3011,8 @@ class ChatWindow:
                 self._update_connection_time()
                 self._refresh_status_dot()
                 target_label = CONNECTION_OPTION_LABELS.get(self._connection_target, self._connection_target)
-                self._append_inline_status(f'已连接：{target_label}')
                 self._set_agent_activity('idle', '连接已建立', f'当前思维链：{target_label}', 'READY')
-                self.status_var.set(self._compose_status_text(f'已连接：{target_label}'))
+                self._set_status_and_agent(self._compose_status_text(f'已连接：{target_label}'), '连接已建立', 'READY')
 
             # 连接断开：清除计时器并重置 UI 状态，防止永久锁死
             if status == 'disconnected':
@@ -3056,7 +3062,7 @@ class ChatWindow:
         if kind == 'tool_use_summary':
             summary = event.get('summary') or ''
             if summary:
-                self._append_message('tool_result', summary, record_history=False)
+                self._set_agent_activity('summary', '工具结果摘要', summary, 'SUMMARY')
             return
 
         if kind == 'tool_progress':
@@ -3137,10 +3143,10 @@ class ChatWindow:
             self._refresh_history_sidebar()
             if event.get('ok'):
                 self._set_agent_activity('idle', '本轮工作完成', '奥黛丽已经回到待命状态。', 'DONE')
-                self.status_var.set(self._compose_status_text('本轮对话完成'))
+                self._set_status_and_agent(self._compose_status_text('本轮对话完成'), '本轮工作完成', 'DONE')
             else:
                 self._set_agent_activity('error', '工作流中断', event.get('text') or 'Claude Code 返回错误', 'ERROR')
-                self.status_var.set(self._compose_status_text('Claude Code 返回错误'))
+                self._set_status_and_agent(self._compose_status_text('Claude Code 返回错误'), '工作流中断', 'ERROR')
                 text = event.get('text') or '执行失败'
                 self._append_message('error', text)
             return
@@ -3149,7 +3155,7 @@ class ChatWindow:
             # CLI 产生的 JSON 解析警告等日志事件，之前被静默丢弃
             text = event.get('text') or ''
             if text:
-                self._append_inline_status(f'[CLI] {text}')
+                self._set_agent_activity('log', 'CLI 日志', text, 'LOG')
             return
 
         if kind == 'error':
@@ -3158,9 +3164,9 @@ class ChatWindow:
             self._clear_tool_status_widget()
             self._clear_inline_status()
             if event.get('request_subtype') == 'set_permission_mode':
-                self.status_var.set(self._compose_status_text('模式切换失败'))
+                self._set_status_and_agent(self._compose_status_text('模式切换失败'), '模式切换失败', 'ERROR')
             else:
-                self.status_var.set(self._compose_status_text('Claude Code 发生错误'))
+                self._set_status_and_agent(self._compose_status_text('Claude Code 发生错误'), '工作流中断', 'ERROR')
             self._clear_bubble_state()
             error_text = event.get('text') or '未知错误'
             if event.get('request_subtype') == 'set_permission_mode':
@@ -3180,7 +3186,7 @@ class ChatWindow:
         # 该工具已被“总是允许” -> 直接放行，不再打扰
         if tool_name in self._auto_allow_tools:
             self.session.respond_permission(request_id, True)
-            self._append_inline_status(f'已自动允许工具调用：{tool_name}')
+            self._set_agent_activity('permission', '已自动允许工具调用', str(tool_name), 'AUTO')
             self._update_bubble_state(
                 'working',
                 {
@@ -3606,19 +3612,11 @@ class ChatWindow:
         tween.animate_to({'f': final_color}, duration_ms=duration_ms)
 
     def _append_inline_status(self, text: str):
-        if self.text_area is None:
-            compact = self._task_progress_compact_text(text)
-            if compact:
-                self._set_status_var_text(compact)
+        compact = self._task_progress_compact_text(text)
+        if not compact:
             return
-        self._capture_transcript_follow_state()
-        self._status_fade_seq += 1
-        fade_tag = f'status_fade_{self._status_fade_seq}'
-        self.text_area.config(state=tk.NORMAL)
-        self.text_area.insert(tk.END, f'[状态] {text}\n\n', ('status', fade_tag))
-        self.text_area.config(state=tk.DISABLED)
-        self._fade_in_status_tag(fade_tag, self.colors['muted'])
-        self._maybe_follow_transcript_end()
+        self._set_status_var_text(compact)
+        self._set_agent_activity('status', '状态更新', compact, 'STATUS')
 
     def _set_status_var_text(self, text: str):
         if text == self._last_status_var_text:
@@ -3649,28 +3647,16 @@ class ChatWindow:
 
     def _flush_inline_status_render(self):
         self._inline_status_job = None
-        if self.text_area is None:
-            return
         compact = self._pending_inline_status_text
         if not compact:
             return
-        ranges = self.text_area.tag_ranges('inline_status')
-        self._status_fade_seq += 1
-        fade_tag = f'status_fade_{self._status_fade_seq}'
-        self.text_area.config(state=tk.NORMAL)
-        if len(ranges) >= 2:
-            self.text_area.delete(ranges[0], ranges[-1])
-        self.text_area.insert(tk.END, f'[状态] {compact}\n\n', ('status', 'inline_status', fade_tag))
-        self.text_area.config(state=tk.DISABLED)
-        self._fade_in_status_tag(fade_tag, self.colors['muted'])
-        self._maybe_follow_transcript_end()
+        self._set_agent_activity('status', '状态更新', compact, 'STATUS')
 
     # ── 统一状态管理 ─────────────────────────────────────────────
-    # 所有状态更新通过 _set_status 写入，确保 status_var 只由一处管理，
-    # 文本区中只保留一条内嵌状态行（统一标签 'inline_status'）。
+    # 状态更新同步到底栏和上方 Agent 工作台，transcript 只保留会话与交互卡片。
 
     def _set_status(self, text: str, tag: str = 'main'):
-        """统一状态入口。tag 用于去重，'inline_status' 用于文本区定位。"""
+        """统一状态入口。tag 用于去重和 Agent 标题/徽标映射。"""
         compact = self._compose_status_text(text)
         if not compact:
             return
@@ -3684,9 +3670,18 @@ class ChatWindow:
         self._last_status_texts[tag] = compact
 
         self._set_status_var_text(compact)
-        if self.text_area is None:
-            return
-        self._schedule_inline_status_render(compact)
+        title = {
+            'main': '状态更新',
+            'task': '任务进度',
+            'summary': '系统摘要',
+            'thinking': '思考进度',
+        }.get(tag, '状态更新')
+        badge = {
+            'task': 'TASK',
+            'summary': 'SUMMARY',
+            'thinking': 'THINKING',
+        }.get(tag, 'STATUS')
+        self._set_agent_activity(tag, title, compact, badge)
 
     def _clear_inline_status(self):
         """清除文本区中的内嵌状态行并重置去重缓存。"""
@@ -3731,10 +3726,9 @@ class ChatWindow:
         return description or summary
 
     def _render_task_tool_event(self, tool_name: str, text: str):
-        tool_key = 'tool:' + str(tool_name or '').strip().lower()
         compact = self._task_progress_compact_text(text)
         if compact:
-            self._upsert_task_widget(tool_key, compact, done=False)
+            self._set_agent_activity('working', f'正在使用工具：{tool_name}', compact, 'LIVE')
 
     def _ensure_tool_status_font(self):
         if self._tool_status_font is None:
@@ -3750,98 +3744,13 @@ class ChatWindow:
         return title, detail, footer
 
     def _render_tool_status_widget(self, text: str):
-        if self.text_area is None:
-            return
         compact = self._task_progress_compact_text(text)
         if not compact:
             return
-        self._ensure_tool_status_font()
-        existing = self._tool_status_widget
-        if existing is not None:
-            self._remove_tool_status_widget(existing)
-            existing = None
-        if existing is None:
-            title, detail, footer = self._split_agent_status_text(compact)
-            card = create_card(
-                self.text_area,
-                self.theme,
-                bg='card_alt',
-                border='border_strong',
-            )
-            header = tk.Frame(card, bg=self.colors['card_alt'])
-            header.pack(fill=tk.X, padx=12, pady=(10, 4))
-
-            dot = tk.Canvas(header, width=13, height=13, bg=self.colors['card_alt'], highlightthickness=0, bd=0)
-            dot.create_oval(3, 3, 10, 10, fill=self.colors['accent_dark'], outline='')
-            dot.pack(side=tk.LEFT, padx=(0, 7), pady=(2, 0))
-
-            tk.Label(
-                header,
-                text='Agent 正在工作',
-                font=self.fonts['control'],
-                bg=self.colors['card_alt'],
-                fg=self.colors['text_strong'],
-                anchor='w',
-            ).pack(side=tk.LEFT)
-            tk.Label(
-                header,
-                text='LIVE',
-                font=self.fonts['small'],
-                bg=self.colors['accent_soft'],
-                fg=self.colors['accent_dark'],
-                padx=7,
-                pady=1,
-            ).pack(side=tk.RIGHT)
-
-            tk.Label(
-                card,
-                text=title,
-                font=self.fonts['base'],
-                bg=self.colors['card_alt'],
-                fg=self.colors['text_strong'],
-                justify='left',
-                anchor='w',
-                wraplength=max(240, self._transcript_width - 140),
-                padx=12,
-                pady=0,
-            ).pack(fill=tk.X)
-            label = tk.Label(
-                card,
-                text=detail,
-                font=self._tool_status_font,
-                bg=self.colors['panel'],
-                fg=self.colors['muted'],
-                justify='left',
-                anchor='w',
-                wraplength=max(240, self._transcript_width - 140),
-                padx=10,
-                pady=7,
-            )
-            label.pack(fill=tk.X, padx=12, pady=(7, 8))
-            if footer:
-                tk.Label(
-                    card,
-                    text=footer,
-                    font=self.fonts['small'],
-                    bg=self.colors['card_alt'],
-                    fg=self.colors['subtext'],
-                    justify='left',
-                    anchor='w',
-                    padx=12,
-                    pady=0,
-                ).pack(fill=tk.X, pady=(0, 10))
-            self.text_area.config(state=tk.NORMAL)
-            self.text_area.insert(tk.END, '\n')
-            self.text_area.window_create(tk.END, window=card, padx=18, pady=5)
-            self.text_area.insert(tk.END, '\n')
-            self.text_area.config(state=tk.DISABLED)
-            existing = {'card': card, 'label': label}
-            self._tool_status_widget = existing
-        existing['label'].config(
-            text=self._split_agent_status_text(compact)[1],
-            wraplength=max(240, self._transcript_width - 140),
-        )
-        self._maybe_follow_transcript_end()
+        title, detail, footer = self._split_agent_status_text(compact)
+        if footer:
+            detail = f'{detail} | {footer}'
+        self._set_agent_activity('working', title, detail, 'LIVE')
 
     def _remove_tool_status_widget(self, widget):
         if not widget:
@@ -3869,7 +3778,7 @@ class ChatWindow:
         final_text = text
         if done:
             final_text = f'{text} (已结束)'
-        self._upsert_task_widget(task_key, final_text, done=done)
+        self._set_agent_activity('task', '子代理任务', final_text, 'DONE' if done else 'RUNNING')
         return True
 
     def _ensure_task_widget_fonts(self):
@@ -3882,74 +3791,10 @@ class ChatWindow:
         self._task_widget_done_font = done_font
 
     def _upsert_task_widget(self, task_key: str, text: str, *, done: bool):
-        if self.text_area is None:
-            return
         compact = self._task_progress_compact_text(text)
         if not compact:
             return
-        self._ensure_task_widget_fonts()
-        existing = self._task_widgets.get(task_key)
-        if existing is None:
-            card = create_card(
-                self.text_area,
-                self.theme,
-                bg='card_alt',
-                border='accent_soft',
-            )
-            header = tk.Frame(card, bg=self.colors['card_alt'])
-            header.pack(fill=tk.X, padx=12, pady=(8, 0))
-            tk.Label(
-                header,
-                text='子代理任务',
-                font=self.fonts['small'],
-                bg=self.colors['card_alt'],
-                fg=self.colors['accent_dark'],
-                anchor='w',
-            ).pack(side=tk.LEFT)
-            tk.Label(
-                header,
-                text='RUNNING',
-                font=self.fonts['small'],
-                bg=self.colors['accent_soft'],
-                fg=self.colors['accent_dark'],
-                padx=6,
-                pady=1,
-            ).pack(side=tk.RIGHT)
-            label = tk.Label(
-                card,
-                text='',
-                font=self._task_widget_font,
-                bg=self.colors['card_alt'],
-                fg=self.colors['text'],
-                justify='left',
-                anchor='w',
-                wraplength=max(240, self._transcript_width - 120),
-                padx=12,
-                pady=8,
-            )
-            label.pack(fill=tk.X)
-            self.text_area.config(state=tk.NORMAL)
-            self.text_area.insert(tk.END, '\n')
-            self.text_area.window_create(tk.END, window=card, padx=18, pady=4)
-            self.text_area.insert(tk.END, '\n')
-            self.text_area.config(state=tk.DISABLED)
-            existing = {'card': card, 'label': label, 'badge': header.winfo_children()[-1]}
-            self._task_widgets[task_key] = existing
-        label = existing['label']
-        label.config(
-            text=compact,
-            font=self._task_widget_done_font if done else self._task_widget_font,
-            fg=self.colors['subtext'] if done else self.colors['text'],
-            wraplength=max(240, self._transcript_width - 120),
-        )
-        badge = existing.get('badge')
-        if badge is not None and badge.winfo_exists():
-            badge.config(
-                text='DONE' if done else 'RUNNING',
-                bg=self.colors['success'] if done else self.colors['accent_soft'],
-                fg=self.colors['accent_dark'],
-            )
-        self._maybe_follow_transcript_end()
+        self._set_agent_activity('task', '子代理任务', compact, 'DONE' if done else 'RUNNING')
 
     def _render_summary_status(self, text: str):
         compact = self._task_progress_compact_text(text)
@@ -4300,7 +4145,7 @@ class ChatWindow:
     def _handle_session_state(self, event: dict):
         state = self._task_progress_compact_text(event.get('state'))
         if state == 'running':
-            self.status_var.set(self._compose_status_text('会话运行中...'))
+            self._set_status_and_agent(self._compose_status_text('会话运行中...'), '会话状态', 'LIVE')
             return
         if state == 'idle':
             self._render_main_status('当前轮次已空闲')
