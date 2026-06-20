@@ -70,10 +70,29 @@ public partial class MainWindow : Window
                 StatusText.Text = GetString(evt, "status_text") ?? StatusText.Text;
                 SelectComboByTagSafe(ModeCombo, GetString(evt, "mode"));
                 SelectComboByTagSafe(ConnectionCombo, GetString(evt, "connection_target"));
+                UpdateAgentActivity(new AgentActivity
+                {
+                    Phase = "idle",
+                    Title = "等待连接",
+                    Detail = GetString(evt, "status_text") ?? "请选择思维链后点击连接。",
+                    Badge = "READY",
+                    Mode = ModeLabel(GetString(evt, "mode")),
+                    Chain = ConnectionLabel(GetString(evt, "connection_target")),
+                });
                 break;
             case "status.update":
                 var status = GetString(evt, "text") ?? string.Empty;
                 StatusText.Text = status;
+                UpdateAgentActivity(new AgentActivity
+                {
+                    Phase = GetString(evt, "phase") ?? "status",
+                    Title = GetString(evt, "title") ?? status,
+                    Detail = GetString(evt, "detail") ?? status,
+                    Badge = GetString(evt, "badge") ?? "LIVE",
+                    Mode = ModeLabel(GetString(evt, "mode")),
+                    Chain = ConnectionLabel(GetString(evt, "connection_target")),
+                    Timestamp = GetString(evt, "timestamp") ?? DateTime.Now.ToString("HH:mm:ss"),
+                });
                 break;
             case "session.state":
                 SessionLabel.Text = GetString(evt, "label") ?? "当前会话：新对话";
@@ -99,12 +118,46 @@ public partial class MainWindow : Window
                 var toolName = GetString(evt, "tool_name") ?? "未知工具";
                 PermissionText.Text = $"请求执行工具：{toolName}";
                 PermissionPanel.Visibility = Visibility.Visible;
+                UpdateAgentActivity(new AgentActivity
+                {
+                    Phase = "permission",
+                    Title = "等待你授予工具权限",
+                    Detail = toolName,
+                    Badge = "NEEDS ACTION",
+                    Mode = ModeLabel(GetString(evt, "mode")),
+                    Chain = ConnectionLabel(GetString(evt, "connection_target")),
+                });
                 break;
             case "error":
                 AppendMessage("error", GetString(evt, "text") ?? "未知错误", "message", "错误", null);
                 StatusText.Text = "发生错误";
+                UpdateAgentActivity(new AgentActivity
+                {
+                    Phase = "error",
+                    Title = "工作流中断",
+                    Detail = GetString(evt, "text") ?? "未知错误",
+                    Badge = "ERROR",
+                });
                 break;
         }
+    }
+
+    private void UpdateAgentActivity(AgentActivity activity)
+    {
+        var phase = activity.Phase.Trim().ToLowerInvariant();
+        if (phase == "idle" || phase == "done")
+        {
+            AgentActivityPanel.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        AgentActivityPanel.Visibility = Visibility.Visible;
+        AgentActivityTitle.Text = string.IsNullOrWhiteSpace(activity.Title) ? "Agent 正在工作" : activity.Title;
+        AgentActivityDetail.Text = string.IsNullOrWhiteSpace(activity.Detail) ? "正在处理当前请求" : activity.Detail;
+        AgentActivityBadgeText.Text = string.IsNullOrWhiteSpace(activity.Badge) ? "LIVE" : activity.Badge;
+        AgentActivityTime.Text = string.IsNullOrWhiteSpace(activity.Timestamp) ? DateTime.Now.ToString("HH:mm:ss") : activity.Timestamp;
+        AgentActivityMode.Text = string.IsNullOrWhiteSpace(activity.Mode) ? string.Empty : $"模式：{activity.Mode}";
+        AgentActivityChain.Text = string.IsNullOrWhiteSpace(activity.Chain) ? string.Empty : $"思维链：{activity.Chain}";
     }
 
     private void AppendMessage(string role, string text, string kind, string? author, string? timestamp, string? streamKey = null)
@@ -456,6 +509,28 @@ public partial class MainWindow : Window
             "tool" => "工具",
             "error" => "错误",
             _ => role ?? "奥黛丽",
+        };
+    }
+
+    private static string ModeLabel(string? mode)
+    {
+        return mode switch
+        {
+            "default" => "默认陪伴",
+            "acceptEdits" => "更改权限",
+            "bypassPermissions" => "全部权限",
+            _ => mode ?? string.Empty,
+        };
+    }
+
+    private static string ConnectionLabel(string? target)
+    {
+        return target switch
+        {
+            "project" => "本项目 Claude",
+            "system" => "本地 Claude",
+            "auto" => "自动选择",
+            _ => string.Empty,
         };
     }
 }

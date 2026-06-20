@@ -157,7 +157,13 @@ class WpfChatBridge:
             return
         self._started = True
         self._starting_session = True
-        self._send_status('正在唤醒奥黛丽的助手...')
+        self._send_status(
+            '正在唤醒奥黛丽的助手...',
+            phase='starting',
+            title='正在唤醒奥黛丽的助手',
+            detail=f'准备连接 {self._connection_label(self._connection_target)}',
+            badge='BOOTING',
+        )
 
         def _start_session():
             try:
@@ -275,7 +281,13 @@ class WpfChatBridge:
                 self._log(f'session ready id={self._active_session_id}')
                 self._started = True
                 self._starting_session = False
-                self._send_status(f'已连接：{self._connection_label(self._connection_target)}')
+                self._send_status(
+                    f'已连接：{self._connection_label(self._connection_target)}',
+                    phase='done',
+                    title='连接已建立',
+                    detail=f'当前思维链：{self._connection_label(self._connection_target)}',
+                    badge='READY',
+                )
                 self._append_stream_message('status', f'深红星辰已经建立连接：思维链-{self._connection_label(self._connection_target)}', stream_key='ready')
                 self._send_history_items()
             elif isinstance(text, str) and text:
@@ -318,7 +330,13 @@ class WpfChatBridge:
 
         if kind == 'thinking':
             thinking_text = self._with_token_suffix('奥黛丽 正在思考...', event)
-            self._send_status(thinking_text)
+            self._send_status(
+                thinking_text,
+                phase='thinking',
+                title='奥黛丽正在整理思路',
+                detail=thinking_text,
+                badge='THINKING',
+            )
             self._append_stream_message('status', thinking_text, stream_key='thinking')
             return
 
@@ -326,7 +344,13 @@ class WpfChatBridge:
             tool_name = event.get('tool_name') or '工具'
             summary = event.get('summary') or ''
             tool_text = self._format_tool_line(tool_name, summary, event)
-            self._send_status(f'正在使用工具：{tool_name}')
+            self._send_status(
+                f'正在使用工具：{tool_name}',
+                phase='working',
+                title=f'正在使用工具：{tool_name}',
+                detail=tool_text,
+                badge='LIVE',
+            )
             self._append_stream_message('tool', tool_text, stream_key=f'tool:{str(tool_name).strip().lower()}')
             self._update_bubble_state(
                 'working',
@@ -352,6 +376,8 @@ class WpfChatBridge:
                     'request_id': request_id,
                     'tool_name': tool_name,
                     'input': event.get('input') or {},
+                    'mode': self._active_permission_mode,
+                    'connection_target': self._connection_target,
                 }
             )
             self._update_bubble_state(
@@ -368,7 +394,13 @@ class WpfChatBridge:
             self._busy = False
             ok = bool(event.get('ok'))
             if ok:
-                self._send_status('本轮对话完成')
+                self._send_status(
+                    '本轮对话完成',
+                    phase='done',
+                    title='本轮工作完成',
+                    detail=event.get('text') or '奥黛丽已经回到待命状态。',
+                    badge='DONE',
+                )
                 self._update_bubble_state('done', {'result': event.get('text') or ''})
                 self._send_history_items()
             else:
@@ -647,7 +679,15 @@ class WpfChatBridge:
             }
         )
 
-    def _send_status(self, text: str):
+    def _send_status(
+        self,
+        text: str,
+        *,
+        phase: str = 'status',
+        title: str = '',
+        detail: str = '',
+        badge: str = 'LIVE',
+    ):
         if text == self._last_status_bar_text:
             return
         self._last_status_bar_text = text
@@ -655,6 +695,12 @@ class WpfChatBridge:
             {
                 'type': 'status.update',
                 'text': text,
+                'phase': phase,
+                'title': title or text,
+                'detail': detail or text,
+                'badge': badge,
+                'mode': self._active_permission_mode,
+                'connection_target': self._connection_target,
                 'timestamp': datetime.now().strftime('%H:%M:%S'),
             }
         )

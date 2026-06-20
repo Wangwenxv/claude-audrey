@@ -43,8 +43,18 @@ def create_tray(app, version):
         """打开设置窗口"""
         show_settings_dialog(app.root, app, version)
 
-    def on_chat(icon, item):
-        """打开 AI 对话窗口"""
+    def on_tk_chat(icon, item):
+        """打开 Tk AI 对话窗口"""
+        if hasattr(app, "show_tk_chat_window"):
+            app.root.after(0, lambda: app.show_tk_chat_window(app.root, version))
+            return
+        app.root.after(0, lambda: app.show_chat_window(app.root, version))
+
+    def on_wpf_chat(icon, item):
+        """打开 WPF AI 对话窗口"""
+        if hasattr(app, "show_wpf_chat_window"):
+            app.root.after(0, lambda: app.show_wpf_chat_window(app.root, version))
+            return
         app.root.after(0, lambda: app.show_chat_window(app.root, version))
 
     def on_quit(icon):
@@ -68,7 +78,13 @@ def create_tray(app, version):
                 on_toggle_click_through,
                 checked=lambda it: app_instance.click_through,
             ),
-            pystray.MenuItem("与奥黛丽聊聊", on_chat),
+            pystray.MenuItem(
+                "与奥黛丽聊聊",
+                pystray.Menu(
+                    pystray.MenuItem("Tk 经典窗口", on_tk_chat),
+                    pystray.MenuItem("WPF 原生窗口", on_wpf_chat),
+                ),
+            ),
             pystray.MenuItem("设置", on_settings),
             pystray.MenuItem("退出", on_quit),
         )

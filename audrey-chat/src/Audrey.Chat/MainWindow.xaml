@@ -43,6 +43,12 @@
       <Setter Property="BorderBrush" Value="#D8E8E4" />
     </Style>
 
+    <Style x:Key="AgentMetricText" TargetType="TextBlock">
+      <Setter Property="Foreground" Value="#6D8184" />
+      <Setter Property="FontSize" Value="12" />
+      <Setter Property="Margin" Value="0,0,16,0" />
+    </Style>
+
     <DataTemplate DataType="{x:Type models:ChatMessage}">
       <Grid Margin="0,8">
         <Grid.ColumnDefinitions>
@@ -258,6 +264,7 @@
         <Grid Grid.Column="2">
           <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
@@ -296,7 +303,81 @@
             </StackPanel>
           </Grid>
 
-          <Border Grid.Row="1"
+          <Border x:Name="AgentActivityPanel"
+                  Grid.Row="1"
+                  Visibility="Collapsed"
+                  Margin="0,0,0,12"
+                  Padding="14"
+                  Background="#F7FBFA"
+                  BorderBrush="#A8CEC7"
+                  BorderThickness="1"
+                  CornerRadius="18">
+            <Grid>
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+              </Grid.ColumnDefinitions>
+              <Border Width="38"
+                      Height="38"
+                      Background="#E7F3F0"
+                      CornerRadius="19"
+                      Margin="0,0,12,0">
+                <Grid>
+                  <Ellipse Width="10" Height="10" Fill="#3D6667" HorizontalAlignment="Center" VerticalAlignment="Center" />
+                  <Ellipse Width="22" Height="22" Stroke="#A8CEC7" StrokeThickness="1" HorizontalAlignment="Center" VerticalAlignment="Center" />
+                </Grid>
+              </Border>
+              <StackPanel Grid.Column="1">
+                <DockPanel>
+                  <TextBlock Text="Agent 正在工作"
+                             FontWeight="SemiBold"
+                             Foreground="{StaticResource AudreyText}" />
+                  <TextBlock x:Name="AgentActivityTime"
+                             DockPanel.Dock="Right"
+                             Margin="12,0,0,0"
+                             FontSize="12"
+                             Foreground="#8B9B9D" />
+                </DockPanel>
+                <TextBlock x:Name="AgentActivityTitle"
+                           Margin="0,5,0,0"
+                           FontSize="14"
+                           FontWeight="SemiBold"
+                           Foreground="#253A3D"
+                           TextWrapping="Wrap" />
+                <Border Margin="0,8,0,0"
+                        Padding="10,7"
+                        Background="#FFFDF8"
+                        BorderBrush="#D8E8E4"
+                        BorderThickness="1"
+                        CornerRadius="10">
+                  <TextBlock x:Name="AgentActivityDetail"
+                             FontFamily="Consolas"
+                             FontSize="12"
+                             Foreground="#52676A"
+                             TextWrapping="Wrap" />
+                </Border>
+                <StackPanel Orientation="Horizontal" Margin="0,9,0,0">
+                  <TextBlock x:Name="AgentActivityMode" Style="{StaticResource AgentMetricText}" />
+                  <TextBlock x:Name="AgentActivityChain" Style="{StaticResource AgentMetricText}" />
+                </StackPanel>
+              </StackPanel>
+              <Border x:Name="AgentActivityBadge"
+                      Grid.Column="2"
+                      VerticalAlignment="Top"
+                      Padding="8,3"
+                      Background="#E7F3F0"
+                      CornerRadius="9">
+                <TextBlock x:Name="AgentActivityBadgeText"
+                           Text="LIVE"
+                           FontSize="11"
+                           FontWeight="SemiBold"
+                           Foreground="#3D6667" />
+              </Border>
+            </Grid>
+          </Border>
+
+          <Border Grid.Row="2"
                   Padding="14"
                   Background="{StaticResource AudreyPanel}"
                   BorderBrush="#D8E8E4"
@@ -334,7 +415,7 @@
           </Border>
 
           <Border x:Name="PermissionPanel"
-                  Grid.Row="2"
+                  Grid.Row="3"
                   Visibility="Collapsed"
                   Margin="0,12,0,0"
                   Padding="14"
@@ -361,7 +442,7 @@
             </DockPanel>
           </Border>
 
-          <Grid Grid.Row="3" Margin="0,12,0,0">
+          <Grid Grid.Row="4" Margin="0,12,0,0">
             <Grid.ColumnDefinitions>
               <ColumnDefinition Width="*" />
               <ColumnDefinition Width="Auto" />

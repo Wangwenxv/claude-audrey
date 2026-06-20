@@ -198,6 +198,9 @@ class ChatWindow:
         self._terminal_view = None
         self._terminal_view_visible = False
         self._terminal_button = None
+        self._top_controls_frame = None
+        self._top_controls_toggle_button = None
+        self._top_controls_collapsed = False
         self._terminal_sync_job = None
         self._inline_status_job = None
         self._pending_inline_status_text = None
@@ -211,6 +214,15 @@ class ChatWindow:
         self._input_shell_min_height = 96
         self._input_shell_max_height = 220
         self._chat_header_canvas = None
+        self._agent_activity_frame = None
+        self._agent_activity_title = None
+        self._agent_activity_detail = None
+        self._agent_activity_badge = None
+        self._agent_activity_meta = None
+        self._agent_activity_packed = True
+        self._agent_activity_collapsed = True
+        self._agent_activity_toggle_button = None
+        self._agent_activity_body_widgets = []
         self._status_dot = None
         self._status_dot_item = None
         self._status_dot_job = None
@@ -560,12 +572,21 @@ class ChatWindow:
             return
         fill = fill or getattr(shell, '_bubble_fill', self.colors['panel'])
         outline = outline or getattr(shell, '_bubble_outline', self.colors['border'])
+        side = getattr(shell, '_bubble_side', 'w')
         width = shell.winfo_width() or int(shell.cget('width'))
         height = shell.winfo_height() or int(shell.cget('height'))
         if width <= 2 or height <= 2:
             return
         shell.delete('bubble_shell')
-        self._draw_rounded_rect(shell, 1, 1, width - 1, height - 1, 14, fill=fill, outline=outline, width=1, tags='bubble_shell')
+        tail = 9
+        if side == 'e':
+            x1, x2 = 1, width - tail - 1
+            tail_points = (x2 - 1, 16, width - 2, 22, x2 - 1, 28)
+        else:
+            x1, x2 = tail + 1, width - 1
+            tail_points = (x1 + 1, 16, 2, 22, x1 + 1, 28)
+        self._draw_rounded_rect(shell, x1, 1, x2, height - 1, 16, fill=fill, outline=outline, width=1, tags='bubble_shell')
+        shell.create_polygon(tail_points, fill=fill, outline=outline, tags='bubble_shell')
         shell.tag_lower('bubble_shell')
         shell._bubble_fill = fill
         shell._bubble_outline = outline
@@ -575,10 +596,21 @@ class ChatWindow:
             bg=fill,
             highlightbackground=outline,
             highlightcolor=outline,
-            highlightthickness=1,
+            highlightthickness=0,
             bd=0,
         )
-        bubble.pack(anchor=anchor)
+        side = 'e' if anchor == 'e' else 'w'
+        row = tk.Frame(parent, bg=self.colors['panel'])
+        row.pack(anchor=anchor)
+        tail = tk.Canvas(row, width=9, height=18, bg=self.colors['panel'], highlightthickness=0, bd=0)
+        if side == 'e':
+            bubble.pack(side=tk.LEFT)
+            tail.create_polygon(0, 4, 8, 9, 0, 14, fill=fill, outline=outline)
+            tail.pack(side=tk.LEFT, padx=(0, 1), pady=(12, 0))
+        else:
+            tail.create_polygon(9, 4, 1, 9, 9, 14, fill=fill, outline=outline)
+            tail.pack(side=tk.LEFT, padx=(1, 0), pady=(12, 0))
+            bubble.pack(side=tk.LEFT)
         return None
 
     def _resize_bubble_shell(self, container):
@@ -587,12 +619,15 @@ class ChatWindow:
         if shell is None or bubble is None or not shell.winfo_exists() or not bubble.winfo_exists():
             return
         bubble.update_idletasks()
-        width = max(80, bubble.winfo_reqwidth() + 8)
+        tail = 9
+        width = max(80, bubble.winfo_reqwidth() + 8 + tail)
         height = max(34, bubble.winfo_reqheight() + 8)
         shell.configure(width=width, height=height)
         window_id = getattr(shell, '_bubble_window', None)
         if window_id is not None:
-            shell.itemconfigure(window_id, width=width - 8, height=height - 8)
+            side = getattr(shell, '_bubble_side', 'w')
+            shell.coords(window_id, 4 if side == 'e' else 13, 4)
+            shell.itemconfigure(window_id, width=width - 8 - tail, height=height - 8)
         self._paint_bubble_shell(shell)
 
     def _paint_header_ornament(self, event=None):
@@ -763,7 +798,7 @@ class ChatWindow:
             was_at_bottom = yview[1] >= 0.99
         except Exception:
             pass
-        msg_char_width = self._pixels_to_chars(self._transcript_width - 60)
+        msg_char_width = self._pixels_to_chars(min(500, max(320, int(self._transcript_width * 0.68))))
         char_width_changed = msg_char_width != self._last_message_char_width
         live_widgets = []
         for widget in self._message_widgets:
@@ -798,14 +833,14 @@ class ChatWindow:
             try:
                 label = item.get('label')
                 if label is not None and label.winfo_exists():
-                    label.config(wraplength=max(240, self._transcript_width - 60))
+                    label.config(wraplength=max(240, self._transcript_width - 120))
             except Exception:
                 pass
         try:
             if self._tool_status_widget is not None:
                 label = self._tool_status_widget.get('label')
                 if label is not None and label.winfo_exists():
-                    label.config(wraplength=max(240, self._transcript_width - 60))
+                    label.config(wraplength=max(240, self._transcript_width - 140))
         except Exception:
             pass
         self._last_message_char_width = msg_char_width
@@ -896,6 +931,157 @@ class ChatWindow:
                 'detail': '',
             },
         )
+
+    def _toggle_top_controls(self):
+        self._top_controls_collapsed = not self._top_controls_collapsed
+        self._refresh_top_controls_visibility()
+
+    def _refresh_top_controls_visibility(self):
+        if self._top_controls_frame is None:
+            return
+        if self._top_controls_collapsed:
+            self._top_controls_frame.pack_forget()
+            if self._top_controls_toggle_button is not None:
+                self._top_controls_toggle_button.config(text='展开控制')
+            return
+        self._top_controls_frame.pack(fill=tk.X)
+        if self._top_controls_toggle_button is not None:
+            self._top_controls_toggle_button.config(text='收起控制')
+
+    def _create_agent_activity_panel(self, parent):
+        panel = create_card(
+            parent,
+            self.theme,
+            bg='card_alt',
+            border='border_strong',
+        )
+        panel.pack(fill=tk.X, pady=(0, 8))
+        panel.configure(bg=self.colors['card_alt'])
+        self._agent_activity_frame = panel
+
+        header = tk.Frame(panel, bg=self.colors['card_alt'])
+        header.pack(fill=tk.X, padx=14, pady=(12, 4))
+
+        dot = tk.Canvas(header, width=18, height=18, bg=self.colors['card_alt'], highlightthickness=0, bd=0)
+        dot.create_oval(4, 4, 14, 14, fill=self.colors['accent_dark'], outline='')
+        dot.create_oval(1, 1, 17, 17, outline=self.colors['accent_soft'], width=1)
+        dot.pack(side=tk.LEFT, padx=(0, 8))
+
+        tk.Label(
+            header,
+            text='Agent 工作台',
+            font=self.fonts['control'],
+            bg=self.colors['card_alt'],
+            fg=self.colors['text_strong'],
+            anchor='w',
+        ).pack(side=tk.LEFT)
+
+        self._agent_activity_badge = tk.Label(
+            header,
+            text='READY',
+            font=self.fonts['small'],
+            bg=self.colors['accent_soft'],
+            fg=self.colors['accent_dark'],
+            padx=8,
+            pady=2,
+        )
+        self._agent_activity_badge.pack(side=tk.RIGHT)
+        self._agent_activity_toggle_button = tk.Button(
+            header,
+            text='收起',
+            command=self._toggle_agent_activity,
+            font=self.fonts['small'],
+            bg=self.colors['card_alt'],
+            fg=self.colors['muted'],
+            activebackground=self.colors['hover'],
+            activeforeground=self.colors['text'],
+            relief=tk.FLAT,
+            bd=0,
+            cursor='hand2',
+            padx=8,
+            pady=1,
+        )
+        self._agent_activity_toggle_button.pack(side=tk.RIGHT, padx=(0, 8))
+
+        self._agent_activity_title = tk.Label(
+            panel,
+            text='',
+            font=self.fonts['base'],
+            bg=self.colors['card_alt'],
+            fg=self.colors['text_strong'],
+            justify='left',
+            anchor='w',
+            padx=14,
+        )
+        self._agent_activity_title.pack(fill=tk.X, pady=(2, 0))
+
+        detail_shell = tk.Frame(panel, bg=self.colors['panel'], highlightbackground=self.colors['border'], highlightthickness=1, bd=0)
+        detail_shell.pack(fill=tk.X, padx=14, pady=(8, 8))
+        self._agent_activity_detail = tk.Label(
+            detail_shell,
+            text='',
+            font=('Consolas', 9),
+            bg=self.colors['panel'],
+            fg=self.colors['muted'],
+            justify='left',
+            anchor='w',
+            padx=10,
+            pady=7,
+        )
+        self._agent_activity_detail.pack(fill=tk.X)
+
+        self._agent_activity_meta = tk.Label(
+            panel,
+            text='',
+            font=self.fonts['small'],
+            bg=self.colors['card_alt'],
+            fg=self.colors['subtext'],
+            justify='left',
+            anchor='w',
+            padx=14,
+        )
+        self._agent_activity_meta.pack(fill=tk.X, pady=(0, 12))
+        self._agent_activity_body_widgets = [detail_shell, self._agent_activity_meta]
+        self._set_agent_activity('idle', '待命', '请选择思维链并点击连接，或继续当前对话。', 'READY')
+
+    def _toggle_agent_activity(self):
+        self._agent_activity_collapsed = not self._agent_activity_collapsed
+        self._refresh_agent_activity_visibility()
+
+    def _refresh_agent_activity_visibility(self):
+        if self._agent_activity_toggle_button is not None:
+            self._agent_activity_toggle_button.config(text='展开' if self._agent_activity_collapsed else '收起')
+        if not self._agent_activity_body_widgets:
+            return
+        detail_shell = self._agent_activity_body_widgets[0]
+        meta_label = self._agent_activity_body_widgets[1]
+        if self._agent_activity_collapsed:
+            detail_shell.pack_forget()
+            meta_label.pack_forget()
+            return
+        detail_shell.pack(fill=tk.X, padx=14, pady=(8, 8), after=self._agent_activity_title)
+        meta_label.pack(fill=tk.X, pady=(0, 12), after=detail_shell)
+
+    def _set_agent_activity(self, phase: str, title: str, detail: str = '', badge: str = 'LIVE'):
+        if self._agent_activity_title is None or self._agent_activity_detail is None:
+            return
+        title_text = self._task_progress_compact_text(title) or 'Agent 正在工作'
+        detail_text = self._task_progress_compact_text(detail) or title_text
+        badge_text = self._task_progress_compact_text(badge) or 'LIVE'
+        meta = ' | '.join(
+            part for part in (
+                f'模式：{self._format_mode_status()}',
+                f'思维链：{self._format_connection_status()}',
+                datetime.now().strftime('%H:%M:%S'),
+            )
+            if part
+        )
+        wraplength = max(260, self._transcript_width - 80)
+        self._agent_activity_title.config(text=title_text, wraplength=wraplength)
+        self._agent_activity_detail.config(text=detail_text, wraplength=wraplength)
+        self._agent_activity_badge.config(text=badge_text)
+        self._agent_activity_meta.config(text=meta)
+        self._refresh_agent_activity_visibility()
 
     def show(self):
         if self.window is not None and self.window.winfo_exists():
@@ -998,6 +1184,18 @@ class ChatWindow:
             fg=self.colors['muted'],
             anchor='w',
         ).pack(fill=tk.X, pady=(4, 0))
+        self._top_controls_toggle_button = create_button(
+            title_row,
+            text='收起控制',
+            command=self._toggle_top_controls,
+            theme=self.theme,
+            variant='secondary',
+            font=self.fonts['small'],
+            style_overrides=self._aurora_button_style(),
+            padx=8,
+            pady=4,
+        )
+        self._top_controls_toggle_button.pack(side=tk.RIGHT, pady=(0, 4))
         self._chat_header_canvas = tk.Canvas(
             header,
             height=46,
@@ -1013,17 +1211,20 @@ class ChatWindow:
             font=self.fonts['small'],
             bg=self.colors['bg'],
             fg=self.colors['accent'],
-        ).pack(side=tk.RIGHT, pady=(0, 4))
+        ).pack(side=tk.RIGHT, padx=(0, 10), pady=(0, 4))
 
+        top_controls = tk.Frame(header, bg=self.colors['bg'])
+        top_controls.pack(fill=tk.X)
+        self._top_controls_frame = top_controls
         tk.Label(
-            header,
+            top_controls,
             textvariable=self._session_label_var,
             font=self.fonts['small'],
             bg=self.colors['bg'],
             fg=self.colors['muted'],
         ).pack(anchor='w', pady=(6, 0))
 
-        connection_row = tk.Frame(header, bg=self.colors['bg'])
+        connection_row = tk.Frame(top_controls, bg=self.colors['bg'])
         connection_row.pack(fill=tk.X, pady=(10, 0))
 
         connection_button_row = tk.Frame(connection_row, bg=self.colors['bg'])
@@ -1053,7 +1254,7 @@ class ChatWindow:
         connection_dropdown.pack(side=tk.LEFT, anchor='w')
         self._refresh_connection_buttons()
 
-        mode_row = tk.Frame(header, bg=self.colors['bg'])
+        mode_row = tk.Frame(top_controls, bg=self.colors['bg'])
         mode_row.pack(fill=tk.X, pady=(10, 0))
 
         mode_button_row = tk.Frame(mode_row, bg=self.colors['bg'])
@@ -1071,7 +1272,7 @@ class ChatWindow:
         mode_dropdown.pack(side=tk.LEFT, anchor='w')
         self._refresh_mode_buttons()
 
-        terminal_row = tk.Frame(header, bg=self.colors['bg'])
+        terminal_row = tk.Frame(top_controls, bg=self.colors['bg'])
         terminal_row.pack(fill=tk.X, pady=(10, 0))
         self._terminal_button = create_button(
             terminal_row,
@@ -1094,6 +1295,7 @@ class ChatWindow:
             anchor='w',
         ).pack(side=tk.LEFT, padx=(12, 0))
         self._refresh_terminal_button()
+        self._create_agent_activity_panel(content_frame)
 
         # 先把底部的输入区和按钮行用 side=BOTTOM 占住空间，再让会话区填充剩余
         # 区域。这样无论窗口被压到多小（高 DPI / 小屏），输入框都不会被会话区
@@ -2385,6 +2587,7 @@ class ChatWindow:
                 pass
 
         self._append_message('user', visible_text)
+        self._set_agent_activity('thinking', '奥黛丽正在整理思路', self._task_progress_compact_text(visible_text), 'THINKING')
         self.status_var.set('奥黛丽 正在思考...')
         self._set_busy(True)
         self._last_busy_event_time = datetime.now()
@@ -2764,6 +2967,7 @@ class ChatWindow:
                 self._render_task_tool_event(tool_name, terminal_text)
             else:
                 self._render_tool_status_widget(terminal_text)
+            self._set_agent_activity('working', f'正在使用工具：{tool_name}', terminal_text, 'LIVE')
             self.status_var.set(self._compose_status_text(f'🔧 {self._format_main_tool_status(event)}'))
             return
 
@@ -2775,6 +2979,7 @@ class ChatWindow:
             if reminder_text:
                 self._render_main_status(reminder_text)
                 return
+            self._set_agent_activity('thinking', '奥黛丽正在整理思路', self._compose_status_text('奥黛丽 正在思考...'), 'THINKING')
             self.status_var.set(self._compose_status_text('奥黛丽 正在思考...'))
             return
 
@@ -2800,6 +3005,7 @@ class ChatWindow:
                 self._refresh_status_dot()
                 target_label = CONNECTION_OPTION_LABELS.get(self._connection_target, self._connection_target)
                 self._append_inline_status(f'已连接：{target_label}')
+                self._set_agent_activity('idle', '连接已建立', f'当前思维链：{target_label}', 'READY')
                 self.status_var.set(self._compose_status_text(f'已连接：{target_label}'))
 
             # 连接断开：清除计时器并重置 UI 状态，防止永久锁死
@@ -2844,6 +3050,7 @@ class ChatWindow:
         if kind == 'task_progress':
             self._update_total_tokens_from_task(event)
             self._render_task_progress(event)
+            self._set_agent_activity('task', '子代理任务进行中', self._format_task_progress(event), 'RUNNING')
             return
 
         if kind == 'tool_use_summary':
@@ -2907,6 +3114,8 @@ class ChatWindow:
                     'input': event.get('input') or {},
                 },
             )
+            tool_name = event.get('tool_name') or '未知工具'
+            self._set_agent_activity('permission', '等待你授予工具权限', str(tool_name), 'NEEDS ACTION')
             self._handle_permission_request(event)
             return
 
@@ -2927,8 +3136,10 @@ class ChatWindow:
             self._update_bubble_state('done', {'result': event.get('text') or ''})
             self._refresh_history_sidebar()
             if event.get('ok'):
+                self._set_agent_activity('idle', '本轮工作完成', '奥黛丽已经回到待命状态。', 'DONE')
                 self.status_var.set(self._compose_status_text('本轮对话完成'))
             else:
+                self._set_agent_activity('error', '工作流中断', event.get('text') or 'Claude Code 返回错误', 'ERROR')
                 self.status_var.set(self._compose_status_text('Claude Code 返回错误'))
                 text = event.get('text') or '执行失败'
                 self._append_message('error', text)
@@ -2954,6 +3165,7 @@ class ChatWindow:
             error_text = event.get('text') or '未知错误'
             if event.get('request_subtype') == 'set_permission_mode':
                 error_text = self._translate_permission_mode_error(error_text)
+            self._set_agent_activity('error', '工作流中断', error_text, 'ERROR')
             self._append_message('error', error_text)
 
     def _handle_permission_request(self, event: dict):
@@ -3528,6 +3740,15 @@ class ChatWindow:
         if self._tool_status_font is None:
             self._tool_status_font = tkfont.Font(family='Consolas', size=9)
 
+    def _split_agent_status_text(self, text: str) -> tuple[str, str, str]:
+        parts = [part.strip() for part in str(text or '').split('|') if part.strip()]
+        title = parts[0] if parts else 'Agent'
+        detail = ' | '.join(parts[1:]) if len(parts) > 1 else title
+        if detail == title:
+            detail = '正在处理当前请求'
+        footer = self._build_status_suffix().strip('<>')
+        return title, detail, footer
+
     def _render_tool_status_widget(self, text: str):
         if self.text_area is None:
             return
@@ -3540,35 +3761,85 @@ class ChatWindow:
             self._remove_tool_status_widget(existing)
             existing = None
         if existing is None:
+            title, detail, footer = self._split_agent_status_text(compact)
             card = create_card(
                 self.text_area,
                 self.theme,
-                bg='info',
-                border='gold',
+                bg='card_alt',
+                border='border_strong',
             )
-            label = tk.Label(
-                card,
-                text='',
-                font=self._tool_status_font,
-                bg=self.colors['info'],
+            header = tk.Frame(card, bg=self.colors['card_alt'])
+            header.pack(fill=tk.X, padx=12, pady=(10, 4))
+
+            dot = tk.Canvas(header, width=13, height=13, bg=self.colors['card_alt'], highlightthickness=0, bd=0)
+            dot.create_oval(3, 3, 10, 10, fill=self.colors['accent_dark'], outline='')
+            dot.pack(side=tk.LEFT, padx=(0, 7), pady=(2, 0))
+
+            tk.Label(
+                header,
+                text='Agent 正在工作',
+                font=self.fonts['control'],
+                bg=self.colors['card_alt'],
+                fg=self.colors['text_strong'],
+                anchor='w',
+            ).pack(side=tk.LEFT)
+            tk.Label(
+                header,
+                text='LIVE',
+                font=self.fonts['small'],
+                bg=self.colors['accent_soft'],
                 fg=self.colors['accent_dark'],
+                padx=7,
+                pady=1,
+            ).pack(side=tk.RIGHT)
+
+            tk.Label(
+                card,
+                text=title,
+                font=self.fonts['base'],
+                bg=self.colors['card_alt'],
+                fg=self.colors['text_strong'],
                 justify='left',
                 anchor='w',
-                wraplength=max(240, self._transcript_width - 60),
+                wraplength=max(240, self._transcript_width - 140),
+                padx=12,
+                pady=0,
+            ).pack(fill=tk.X)
+            label = tk.Label(
+                card,
+                text=detail,
+                font=self._tool_status_font,
+                bg=self.colors['panel'],
+                fg=self.colors['muted'],
+                justify='left',
+                anchor='w',
+                wraplength=max(240, self._transcript_width - 140),
                 padx=10,
-                pady=8,
+                pady=7,
             )
-            label.pack(fill=tk.X)
+            label.pack(fill=tk.X, padx=12, pady=(7, 8))
+            if footer:
+                tk.Label(
+                    card,
+                    text=footer,
+                    font=self.fonts['small'],
+                    bg=self.colors['card_alt'],
+                    fg=self.colors['subtext'],
+                    justify='left',
+                    anchor='w',
+                    padx=12,
+                    pady=0,
+                ).pack(fill=tk.X, pady=(0, 10))
             self.text_area.config(state=tk.NORMAL)
             self.text_area.insert(tk.END, '\n')
-            self.text_area.window_create(tk.END, window=card, padx=4, pady=2)
+            self.text_area.window_create(tk.END, window=card, padx=18, pady=5)
             self.text_area.insert(tk.END, '\n')
             self.text_area.config(state=tk.DISABLED)
             existing = {'card': card, 'label': label}
             self._tool_status_widget = existing
         existing['label'].config(
-            text=f'{self._pick_tool_icon(compact)} {compact}',
-            wraplength=max(240, self._transcript_width - 60),
+            text=self._split_agent_status_text(compact)[1],
+            wraplength=max(240, self._transcript_width - 140),
         )
         self._maybe_follow_transcript_end()
 
@@ -3622,36 +3893,62 @@ class ChatWindow:
             card = create_card(
                 self.text_area,
                 self.theme,
-                bg='info',
+                bg='card_alt',
                 border='accent_soft',
             )
+            header = tk.Frame(card, bg=self.colors['card_alt'])
+            header.pack(fill=tk.X, padx=12, pady=(8, 0))
+            tk.Label(
+                header,
+                text='子代理任务',
+                font=self.fonts['small'],
+                bg=self.colors['card_alt'],
+                fg=self.colors['accent_dark'],
+                anchor='w',
+            ).pack(side=tk.LEFT)
+            tk.Label(
+                header,
+                text='RUNNING',
+                font=self.fonts['small'],
+                bg=self.colors['accent_soft'],
+                fg=self.colors['accent_dark'],
+                padx=6,
+                pady=1,
+            ).pack(side=tk.RIGHT)
             label = tk.Label(
                 card,
                 text='',
                 font=self._task_widget_font,
-                bg=self.colors['info'],
-                fg=self.colors['muted'],
+                bg=self.colors['card_alt'],
+                fg=self.colors['text'],
                 justify='left',
                 anchor='w',
-                wraplength=max(240, self._transcript_width - 60),
-                padx=10,
+                wraplength=max(240, self._transcript_width - 120),
+                padx=12,
                 pady=8,
             )
             label.pack(fill=tk.X)
             self.text_area.config(state=tk.NORMAL)
             self.text_area.insert(tk.END, '\n')
-            self.text_area.window_create(tk.END, window=card, padx=4, pady=2)
+            self.text_area.window_create(tk.END, window=card, padx=18, pady=4)
             self.text_area.insert(tk.END, '\n')
             self.text_area.config(state=tk.DISABLED)
-            existing = {'card': card, 'label': label}
+            existing = {'card': card, 'label': label, 'badge': header.winfo_children()[-1]}
             self._task_widgets[task_key] = existing
         label = existing['label']
         label.config(
             text=compact,
             font=self._task_widget_done_font if done else self._task_widget_font,
-            fg=self.colors['subtext'] if done else self.colors['muted'],
-            wraplength=max(240, self._transcript_width - 60),
+            fg=self.colors['subtext'] if done else self.colors['text'],
+            wraplength=max(240, self._transcript_width - 120),
         )
+        badge = existing.get('badge')
+        if badge is not None and badge.winfo_exists():
+            badge.config(
+                text='DONE' if done else 'RUNNING',
+                bg=self.colors['success'] if done else self.colors['accent_soft'],
+                fg=self.colors['accent_dark'],
+            )
         self._maybe_follow_transcript_end()
 
     def _render_summary_status(self, text: str):
@@ -4127,16 +4424,16 @@ class ChatWindow:
         is_error = role == 'error'
         is_warn = role == 'warn'
 
-        bubble_bg = self.colors['assistant']
-        bubble_border = '#B5DFC3'
+        bubble_bg = '#FFFBF7'
+        bubble_border = '#E8D7B8'
         bubble_fg = '#172B2D'
         code_fg = '#654417'
         quote_fg = '#466266'
         marker_fg = '#7A5423'
         if is_user:
-            bubble_bg = self.colors['user']
-            bubble_border = '#EAC8D2'
-            bubble_fg = '#2B171F'
+            bubble_bg = '#DCF3DF'
+            bubble_border = '#B8DCC1'
+            bubble_fg = '#183923'
         elif is_error:
             bubble_bg = self.colors['error']
             bubble_border = '#DAB8BE'
@@ -4153,7 +4450,7 @@ class ChatWindow:
 
         if is_user:
             avatar_col = tk.Frame(row, bg=self.colors['panel'])
-            avatar_col.pack(side=tk.RIGHT, anchor='s', padx=(12, 0))
+            avatar_col.pack(side=tk.RIGHT, anchor='n', padx=(12, 0))
 
             user_avatar = self._get_user_avatar()
             if user_avatar is not None:
@@ -4164,12 +4461,29 @@ class ChatWindow:
                 fallback.pack(anchor='e')
 
             content_col = tk.Frame(row, bg=self.colors['panel'])
-            content_col.pack(side=tk.RIGHT, fill=tk.X, expand=True)
+            content_col.pack(side=tk.RIGHT, anchor='n')
+
+            meta = tk.Frame(content_col, bg=self.colors['panel'])
+            meta.pack(anchor='e', pady=(0, 5))
+            tk.Label(
+                meta,
+                text=timestamp,
+                font=self.fonts['small'],
+                bg=self.colors['panel'],
+                fg=self.colors['subtext'],
+            ).pack(side=tk.LEFT, padx=(0, 10))
+            tk.Label(
+                meta,
+                text='我',
+                font=self.fonts['control'],
+                bg=self.colors['panel'],
+                fg='#9B6874',
+            ).pack(side=tk.LEFT)
 
             bubble_wrap = tk.Frame(content_col, bg=self.colors['panel'])
-            bubble_wrap.pack(anchor='e', fill=tk.X)
+            bubble_wrap.pack(anchor='e')
 
-            text_width_chars = self._pixels_to_chars(520)
+            text_width_chars = self._pixels_to_chars(min(500, max(320, int(self._transcript_width * 0.68))))
             plain_text, text_height, is_collapsible = self._build_message_layout(text, text_width_chars)
             bubble = tk.Text(
                 bubble_wrap,
@@ -4207,6 +4521,7 @@ class ChatWindow:
             container._message_plain_text = plain_text
             container._message_is_expanded = not is_collapsible
             self._bind_message_copy_events(bubble, text)
+            self._resize_bubble_shell(container)
 
             if is_collapsible:
                 toggle = tk.Label(
@@ -4222,26 +4537,6 @@ class ChatWindow:
                 toggle.bind('<Button-1>', lambda _event, item=container: self._toggle_message_expand(item), add='+')
                 self._bind_toggle_hover(toggle)
 
-            flourish = tk.Canvas(content_col, height=16, bg=self.colors['panel'], highlightthickness=0, bd=0)
-            flourish.pack(anchor='e', fill=tk.X, pady=(7, 0))
-            flourish.bind('<Configure>', lambda _e, c=flourish: self._draw_bubble_flourish(c, 'e'), add='+')
-
-            meta = tk.Frame(content_col, bg=self.colors['panel'])
-            meta.pack(anchor='e', pady=(4, 0))
-            tk.Label(
-                meta,
-                text='You',
-                font=self.fonts['control'],
-                bg=self.colors['panel'],
-                fg='#9B6874',
-            ).pack(side=tk.LEFT)
-            tk.Label(
-                meta,
-                text=timestamp,
-                font=self.fonts['small'],
-                bg=self.colors['panel'],
-                fg=self.colors['subtext'],
-            ).pack(side=tk.LEFT, padx=(10, 0))
         else:
             avatar_col = tk.Frame(row, bg=self.colors['panel'])
             avatar_col.pack(side=tk.LEFT, anchor='n', padx=(0, 12))
@@ -4255,12 +4550,32 @@ class ChatWindow:
                 fallback.pack(anchor='n')
 
             content_col = tk.Frame(row, bg=self.colors['panel'])
-            content_col.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            content_col.pack(side=tk.LEFT, anchor='n')
 
-            text_width_chars = self._pixels_to_chars(520)
+            meta = tk.Frame(content_col, bg=self.colors['panel'])
+            meta.pack(anchor='w', pady=(0, 5))
+            tk.Label(
+                meta,
+                text='奥黛丽',
+                font=self.fonts['control'],
+                bg=self.colors['panel'],
+                fg=self.colors['gold_deep'],
+            ).pack(side=tk.LEFT)
+            tk.Label(
+                meta,
+                text=timestamp,
+                font=self.fonts['small'],
+                bg=self.colors['panel'],
+                fg=self.colors['subtext'],
+            ).pack(side=tk.LEFT, padx=(10, 0))
+
+            bubble_wrap = tk.Frame(content_col, bg=self.colors['panel'])
+            bubble_wrap.pack(anchor='w')
+
+            text_width_chars = self._pixels_to_chars(min(500, max(320, int(self._transcript_width * 0.68))))
             plain_text, text_height, is_collapsible = self._build_message_layout(text, text_width_chars)
             bubble = tk.Text(
-                content_col,
+                bubble_wrap,
                 font=self.fonts['base'],
                 bg=bubble_bg,
                 fg=bubble_fg,
@@ -4285,7 +4600,7 @@ class ChatWindow:
             self._configure_markdown_tags(bubble)
             self._insert_markdown_text(bubble, text)
             bubble.configure(state=tk.DISABLED)
-            shell = self._wrap_bubble_in_shell(content_col, bubble, fill=bubble_bg, outline=bubble_border if is_assistant else self.colors['gold_soft'], anchor='w')
+            shell = self._wrap_bubble_in_shell(bubble_wrap, bubble, fill=bubble_bg, outline=bubble_border if is_assistant else self.colors['gold_soft'], anchor='w')
             container._message_bubble = bubble
             container._bubble_shell = shell
             container._bubble_border = bubble_border
@@ -4295,6 +4610,7 @@ class ChatWindow:
             container._message_plain_text = plain_text
             container._message_is_expanded = not is_collapsible
             self._bind_message_copy_events(bubble, text)
+            self._resize_bubble_shell(container)
 
             if is_collapsible:
                 toggle = tk.Label(
@@ -4309,27 +4625,6 @@ class ChatWindow:
                 container._message_toggle = toggle
                 toggle.bind('<Button-1>', lambda _event, item=container: self._toggle_message_expand(item), add='+')
                 self._bind_toggle_hover(toggle)
-
-            flourish = tk.Canvas(content_col, height=16, bg=self.colors['panel'], highlightthickness=0, bd=0)
-            flourish.pack(anchor='w', fill=tk.X, pady=(7, 0))
-            flourish.bind('<Configure>', lambda _e, c=flourish: self._draw_bubble_flourish(c, 'w'), add='+')
-
-            meta = tk.Frame(content_col, bg=self.colors['panel'])
-            meta.pack(anchor='w', pady=(4, 0))
-            tk.Label(
-                meta,
-                text='奥黛丽',
-                font=self.fonts['control'],
-                bg=self.colors['panel'],
-                fg=self.colors['gold_deep'],
-            ).pack(side=tk.LEFT)
-            tk.Label(
-                meta,
-                text=timestamp,
-                font=self.fonts['small'],
-                bg=self.colors['panel'],
-                fg=self.colors['subtext'],
-            ).pack(side=tk.LEFT, padx=(10, 0))
 
         row.update_idletasks()
         container.configure(width=self._transcript_width, height=row.winfo_reqheight())

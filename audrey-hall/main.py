@@ -237,6 +237,21 @@ def main():
             self._close_chat_picker()
             self._show_tk_chat_window(parent, version)
 
+        def show_tk_chat_window(self, parent, version):
+            if threading.current_thread() is not threading.main_thread():
+                self.root.after(0, lambda: self.show_tk_chat_window(parent, version))
+                return
+            self._close_chat_picker()
+            self._show_tk_chat_window(parent, version)
+
+        def show_wpf_chat_window(self, parent, version):
+            if threading.current_thread() is not threading.main_thread():
+                self.root.after(0, lambda: self.show_wpf_chat_window(parent, version))
+                return
+            self._close_chat_picker()
+            if not self._show_wpf_chat_window(version):
+                self._show_tk_chat_window(parent, version)
+
         def _show_chat_picker(self, parent, version):
             if self.chat_picker is not None:
                 try:
