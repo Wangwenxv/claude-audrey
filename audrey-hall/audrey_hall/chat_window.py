@@ -301,10 +301,14 @@ class TimelineRenderer:
         title.pack(side=tk.LEFT, fill=tk.X, expand=True)
         badge = tk.Label(row, text=self._badge_text(item), font=('Consolas', 8), bg=bg, fg=self.owner.colors['muted'], padx=6, pady=0)
         badge.pack(side=tk.RIGHT)
-        detail = tk.Label(body, text=item.get('text') or item.get('detail') or '', font=('Consolas', 9), bg=bg, fg=self.owner.colors['text'], anchor='w', justify='left', wraplength=wraplength)
-        detail.pack(fill=tk.X, padx=(30, 4), pady=(0, 1))
-        meta = tk.Label(body, text=item.get('meta_text') or item.get('timestamp') or '', font=('Consolas', 8), bg=bg, fg=self.owner.colors['muted'], anchor='w', justify='left', wraplength=wraplength)
-        meta.pack(fill=tk.X, padx=(30, 4), pady=(0, 5))
+        detail_text = item.get('text') or item.get('detail') or ''
+        meta_text = item.get('meta_text') or item.get('timestamp') or ''
+        detail = tk.Label(body, text=detail_text, font=('Consolas', 9), bg=bg, fg=self.owner.colors['text'], anchor='w', justify='left', wraplength=wraplength)
+        if detail_text:
+            detail.pack(fill=tk.X, padx=(30, 4), pady=(0, 1))
+        meta = tk.Label(body, text=meta_text, font=('Consolas', 8), bg=bg, fg=self.owner.colors['muted'], anchor='w', justify='left', wraplength=wraplength)
+        if meta_text:
+            meta.pack(fill=tk.X, padx=(30, 4), pady=(0, 5))
         actions = tk.Frame(body, bg=bg)
         buttons = {}
         if item.get('actions'):
@@ -339,9 +343,17 @@ class TimelineRenderer:
                 bundle['badge_text'] = badge_text
             if bundle.get('detail_text') != detail_text:
                 labels['detail'].config(text=detail_text)
+                if detail_text and not labels['detail'].winfo_manager():
+                    labels['detail'].pack(fill=tk.X, padx=(30, 4), pady=(0, 1))
+                elif not detail_text and labels['detail'].winfo_manager():
+                    labels['detail'].pack_forget()
                 bundle['detail_text'] = detail_text
             if bundle.get('meta_text') != meta_text:
                 labels['meta'].config(text=meta_text)
+                if meta_text and not labels['meta'].winfo_manager():
+                    labels['meta'].pack(fill=tk.X, padx=(30, 4), pady=(0, 5))
+                elif not meta_text and labels['meta'].winfo_manager():
+                    labels['meta'].pack_forget()
                 bundle['meta_text'] = meta_text
             labels['detail'].config(wraplength=self._terminal_wraplength())
             labels['meta'].config(wraplength=self._terminal_wraplength())
@@ -500,6 +512,7 @@ class ChatWindow:
         self._last_streaming_text_key = ''
         self._terminal_tool_input_texts = {}
         self._terminal_tool_block_keys = {}
+        self._turn_terminal_summaries = {}
         self._using_conversation_events = False
 
         self.theme = get_theme()
@@ -1827,30 +1840,6 @@ class ChatWindow:
         )
         upload_button.pack(side=tk.LEFT, padx=(0, 8))
 
-        model_button = create_button(
-            action_group_secondary,
-            text='模型',
-            command=self._show_model_picker_card,
-            theme=self.theme,
-            variant='secondary',
-            width=10,
-            font=self.fonts['control'],
-            style_overrides=self._aurora_button_style(),
-        )
-        model_button.pack(side=tk.LEFT, padx=(0, 8))
-
-        mode_button = create_button(
-            action_group_secondary,
-            text='模式',
-            command=self._show_mode_picker_card,
-            theme=self.theme,
-            variant='secondary',
-            width=10,
-            font=self.fonts['control'],
-            style_overrides=self._aurora_button_style(),
-        )
-        mode_button.pack(side=tk.LEFT, padx=(0, 8))
-
         self.send_button = create_button(
             action_group_primary,
             text='发送',
@@ -2482,6 +2471,7 @@ class ChatWindow:
         self._processed_conversation_events.clear()
         self._last_streaming_text_key = ''
         self._using_conversation_events = False
+        self._turn_terminal_summaries.clear()
         self._last_message_char_width = None
         self._last_status_texts.clear()
         self._last_thinking_tokens = None
@@ -3070,45 +3060,25 @@ class ChatWindow:
         self._append_inline_status(f'模型已切换：{self._active_model}')
 
     def _show_model_picker_card(self):
-        card = create_card(
-            self.text_area,
-            self.theme,
-            bg='assistant',
-            border='accent',
+        actions = []
+        for choice in MODEL_QUICK_CHOICES:
+            actions.append(
+                {
+                    'label': choice,
+                    'variant': 'primary' if choice == self._active_model else 'secondary',
+                    'command': lambda selected=choice: self._handle_model_choice(selected),
+                }
+            )
+        self._timeline_append(
+            {
+                'kind': 'status_card',
+                'state': 'waiting',
+                'title': '/model',
+                'text': 'select model for following Claude Code turns',
+                'meta_text': f'current model: {self._active_model}; usage: /model <name>',
+                'actions': actions,
+            }
         )
-        tk.Label(
-            card,
-            text='选择模型',
-            font=self.fonts['control'],
-            bg=self.colors['assistant'],
-            fg=self.colors['text'],
-            anchor='w',
-        ).pack(fill=tk.X, padx=10, pady=(8, 4))
-        tk.Label(
-            card,
-            text='点击按钮切换，或直接输入 /model <模型名>',
-            font=self.fonts['small'],
-            bg=self.colors['assistant'],
-            fg=self.colors['muted'],
-            anchor='w',
-        ).pack(fill=tk.X, padx=10, pady=(0, 8))
-
-        rows = [MODEL_QUICK_CHOICES[index : index + 2] for index in range(0, len(MODEL_QUICK_CHOICES), 2)]
-        for row_choices in rows:
-            row = tk.Frame(card, bg=self.colors['assistant'])
-            row.pack(fill=tk.X, padx=10, pady=(0, 8))
-            for choice in row_choices:
-                create_button(
-                    row,
-                    text=choice,
-                    command=lambda selected=choice: self._handle_model_choice(selected, card),
-                    theme=self.theme,
-                    variant='secondary',
-                    font=self.fonts['control'],
-                    padx=10,
-                ).pack(side=tk.LEFT, padx=(0, 8))
-
-        self._insert_inline_card(card)
 
     def _show_mode_picker_card(self):
         actions = []
@@ -3124,18 +3094,14 @@ class ChatWindow:
             {
                 'kind': 'status_card',
                 'state': 'waiting',
-                'title': '选择运行模式',
-                'text': '请选择奥黛丽接下来处理工具和文件改动的方式。',
-                'meta_text': f'当前模式：{self._format_mode_status()}',
+                'title': '/mode',
+                'text': 'select permission mode for following Claude Code turns',
+                'meta_text': f'current mode: {self._format_mode_status()}; usage: /mode <name>',
                 'actions': actions,
             }
         )
 
-    def _handle_model_choice(self, selected: str, card):
-        try:
-            card.destroy()
-        except Exception:
-            pass
+    def _handle_model_choice(self, selected: str):
         self._apply_model_selection(None if selected == 'default' else selected)
 
     def _handle_btw_command(self, args: str):
@@ -3553,6 +3519,85 @@ class ChatWindow:
         text = event.get('text') or event.get('summary') or ''
         return (event_type, turn_id, request_id, tool_use_id, text[:80])
 
+    def _ensure_turn_summary(self, turn_id: str) -> dict:
+        summary = self._turn_terminal_summaries.get(turn_id)
+        if summary is None:
+            summary = {
+                'started_at': time.time(),
+                'seen_tools': set(),
+                'searches': 0,
+                'reads': 0,
+                'writes': 0,
+                'commands': 0,
+                'tasks': 0,
+                'other': 0,
+            }
+            self._turn_terminal_summaries[turn_id] = summary
+        return summary
+
+    def _classify_summary_tool(self, tool_name: str) -> str:
+        lowered = str(tool_name or '').strip().lower()
+        if lowered.startswith(('grep', 'glob', 'websearch', 'webfetch', 'lsp')):
+            return 'searches'
+        if lowered.startswith(('read', 'ls', 'listmcpresources')):
+            return 'reads'
+        if lowered.startswith(('write', 'edit', 'notebookedit')):
+            return 'writes'
+        if lowered.startswith(('bash', 'powershell', 'tmux')):
+            return 'commands'
+        if lowered.startswith(('task', 'agent', 'todowrite')):
+            return 'tasks'
+        return 'other'
+
+    def _record_summary_tool(self, turn_id: str, tool_name: str, identity: str | None = None):
+        summary = self._ensure_turn_summary(turn_id)
+        seen_tools = summary.get('seen_tools')
+        if isinstance(seen_tools, set) and identity:
+            if identity in seen_tools:
+                return
+            seen_tools.add(identity)
+        category = self._classify_summary_tool(tool_name)
+        summary[category] = int(summary.get(category) or 0) + 1
+
+    def _plural(self, count: int, singular: str, plural: str) -> str:
+        return singular if count == 1 else plural
+
+    def _turn_summary_text(self, turn_id: str, *, done: bool = False) -> str:
+        summary = self._ensure_turn_summary(turn_id)
+        elapsed = max(0, int(time.time() - float(summary.get('started_at') or time.time())))
+        parts = [f'Thought for {elapsed}s' if done else f'Thinking for {elapsed}s']
+        searches = int(summary.get('searches') or 0)
+        reads = int(summary.get('reads') or 0)
+        writes = int(summary.get('writes') or 0)
+        commands = int(summary.get('commands') or 0)
+        tasks = int(summary.get('tasks') or 0)
+        other = int(summary.get('other') or 0)
+        if searches:
+            parts.append(f"searched for {searches} {self._plural(searches, 'pattern', 'patterns')}")
+        if reads:
+            parts.append(f"read {reads} {self._plural(reads, 'file', 'files')}")
+        if writes:
+            parts.append(f"wrote {writes} {self._plural(writes, 'file', 'files')}")
+        if commands:
+            parts.append(f"ran {commands} {self._plural(commands, 'command', 'commands')}")
+        if tasks:
+            parts.append(f"used {tasks} {self._plural(tasks, 'agent task', 'agent tasks')}")
+        if other:
+            parts.append(f"used {other} other {self._plural(other, 'tool', 'tools')}")
+        return ', '.join(parts) + ' (过程视图展开)'
+
+    def _render_turn_summary(self, turn_id: str, *, done: bool = False):
+        self._timeline_upsert(
+            f'thought:{turn_id}',
+            {
+                'kind': 'thinking_card',
+                'state': 'done' if done else 'running',
+                'title': self._turn_summary_text(turn_id, done=done),
+                'text': '',
+                'meta_text': '',
+            },
+        )
+
     def _handle_conversation_event(self, event: dict):
         event_type = event.get('event_type')
         turn_id = event.get('turn_id') or 'turn'
@@ -3563,6 +3608,8 @@ class ChatWindow:
             self._processed_conversation_events.add(identity)
 
         if event_type == 'turn_request_started':
+            self._ensure_turn_summary(turn_id)
+            self._render_turn_summary(turn_id)
             self._timeline_upsert(
                 f'status:{turn_id}',
                 {
@@ -3607,23 +3654,7 @@ class ChatWindow:
             return
 
         if event_type in {'thinking_started', 'thinking_delta', 'thinking_tokens', 'thinking_completed'}:
-            key = f'thinking:{turn_id}'
-            token_text = ''
-            estimated = event.get('estimated_tokens')
-            if isinstance(estimated, int):
-                token_text = f'output tokens: {self._format_token_count(estimated)}'
-            if event_type == 'thinking_completed':
-                token_text = self._compose_arrow_tokens(input_tokens=event.get('input_tokens'), output_tokens=event.get('output_tokens')) or 'thinking block sealed'
-            self._timeline_upsert(
-                key,
-                {
-                    'kind': 'thinking_card',
-                    'state': 'done' if event_type == 'thinking_completed' else 'running',
-                    'title': 'thinking',
-                    'text': token_text or 'streaming hidden reasoning block',
-                    'meta_text': 'main transcript shows phase and token count; full raw stream stays in process view',
-                },
-            )
+            self._render_turn_summary(turn_id, done=event_type == 'thinking_completed')
             return
 
         if event_type in {'tool_input_started', 'tool_input_delta', 'tool_use_started', 'tool_progress'}:
@@ -3636,6 +3667,7 @@ class ChatWindow:
             else:
                 tool_id = self._terminal_tool_block_keys.get(block_key) or f'{turn_id}:{block_index}:{tool_name}'
             key = f'tool:{tool_id}'
+            visible_key = f'activity:{turn_id}'
             current = self._timeline_store._by_key.get(key) or {}
             detail = event.get('summary') or current.get('text') or self._summarize_working_input(tool_name, event.get('input') or {})
             title = self._format_tool_title(tool_name)
@@ -3649,13 +3681,15 @@ class ChatWindow:
                 detail = detail or 'building tool input json'
                 title = f'tool-input: {tool_name}'
             elif event_type == 'tool_use_started':
+                self._record_summary_tool(turn_id, tool_name, str(tool_id))
+                self._render_turn_summary(turn_id)
                 detail = detail or 'tool execution queued'
                 title = f'tool-use: {tool_name}'
             if event_type == 'tool_progress':
                 detail = self._format_tool_progress(event)
                 title = f'tool-use: {tool_name}'
             self._timeline_upsert(
-                key,
+                visible_key,
                 {
                     'kind': 'tool_card',
                     'state': 'running',
@@ -3670,8 +3704,9 @@ class ChatWindow:
             summary = event.get('summary') or ''
             if summary:
                 preview_lines = summary.splitlines()
-                preview = preview_lines[0] if preview_lines else '工具已返回结果。'
-                self._timeline_append(
+                preview = preview_lines[0] if preview_lines else 'tool result received'
+                self._timeline_upsert(
+                    f'activity:{turn_id}',
                     {
                         'kind': 'tool_result_card',
                         'state': 'done',
@@ -3683,11 +3718,14 @@ class ChatWindow:
             return
 
         if event_type == 'task_progress':
+            task_key = event.get('task_id') or event.get('tool_use_id') or self._format_task_progress(event) or turn_id
+            self._record_summary_tool(turn_id, 'Task', f'task:{task_key}')
+            self._render_turn_summary(turn_id)
             text = self._format_task_progress(event)
             task_key = event.get('task_id') or event.get('tool_use_id') or text or turn_id
             status = str(event.get('status') or 'running').lower()
             self._timeline_upsert(
-                f'task:{task_key}',
+                f'activity:{turn_id}',
                 {
                     'kind': 'task_card',
                     'state': 'done' if status in {'completed', 'failed', 'stopped'} else 'running',
@@ -3714,10 +3752,12 @@ class ChatWindow:
             return
 
         if event_type == 'turn_completed':
+            self._render_turn_summary(turn_id, done=True)
             self._timeline_upsert(f'status:{turn_id}', {'kind': 'summary_card', 'state': 'done', 'title': 'turn-complete', 'text': 'assistant turn closed; Audrey is idle'})
             return
 
         if event_type == 'turn_failed':
+            self._render_turn_summary(turn_id, done=True)
             self._timeline_append({'kind': 'error_card', 'state': 'error', 'title': 'turn-failed', 'text': event.get('text') or 'Claude Code 返回错误。'})
 
     def _format_tool_title(self, tool_name: str) -> str:
@@ -5331,6 +5371,7 @@ class ChatWindow:
         self._turn_thinking_user_closed = False
         self._terminal_tool_input_texts.clear()
         self._terminal_tool_block_keys.clear()
+        self._turn_terminal_summaries.clear()
 
     def _insert_terminal_event(self, role: str, text: str):
         text = (text or '').strip()

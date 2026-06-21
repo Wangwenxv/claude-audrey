@@ -107,6 +107,51 @@ Tk 主窗口采用等价策略：
 
 这使主对话区接近 Claude Code 的“局部补丁”体验：流式输出在原地增长，工具输入在原行变化，滚动只在用户本来贴底时跟随。
 
+### 6. Thought 摘要行
+
+Claude Code 会把 thinking 和工具活动折叠成类似下面的单行摘要：
+
+```text
+Thought for 3s, read 1 file (ctrl+o to expand)
+Thought for 6s, searched for 1 pattern, read 1 file (ctrl+o to expand)
+```
+
+Audrey Hall 主对话框采用同类机制：
+
+- 每轮 `turn_request_started` 创建一个 `thought:<turn_id>` 摘要块。
+- `thinking_*` 事件只更新这条摘要行，不再额外生成单独 thinking 卡片。
+- `tool_use_started` 按工具名累计类别计数：search、read、write、command、agent task、other。
+- `task_progress` 使用 task id / tool use id 去重，避免进度事件重复累计。
+- `turn_completed` / `turn_failed` 把摘要从 `Thinking for Ns` 定格为 `Thought for Ns`。
+- Audrey Hall 没有 Claude Code 的 `ctrl+o` transcript 快捷键，因此提示使用 `过程视图展开`。
+
+这一层负责“用户可读的活动概览”；完整 stdout、stderr、JSON、长工具输出仍在 `过程视图` 中查看。
+
+### 7. Ink 组件复用边界
+
+Claude Code 的主屏组件不能直接嵌入 Audrey Hall 主窗口：
+
+- Claude Code 是 TypeScript + React/Ink + Yoga layout，最终输出 ANSI diff 到 stdout。
+- Audrey Hall 是 Python + Tkinter，主对话框是 `Text.window_create()` 嵌入 Tk widget。
+- Ink 的 `<Messages />`、`AssistantToolUseMessage`、`CollapsedReadSearchContent` 等组件依赖 React reconciler、Ink context、terminal frame diff、主题和快捷键系统，不能作为 Tk widget 直接挂载。
+
+因此实际复用方式是“复用组件语义，而不是复用组件实例”：
+
+- 主屏只保留一条 `thought:<turn_id>` 摘要行，显示 `Thought for Ns, read/searched...`。
+- 主屏只保留一条 `activity:<turn_id>` 当前活动行，工具输入、工具执行、工具结果、子任务进度都原地更新它。
+- 详细工具 JSON、长结果、原始 stdout/stderr 留在 `过程视图`，等价于 Claude Code 的 transcript / `ctrl+o` 展开层。
+- 这样主屏与 Claude Code 一样避免工具调用刷屏，同时用户仍能在需要时查看完整过程。
+
+### 8. 终端指令选择器
+
+底部按钮台不再放 `模型`、`模式` 两个按钮。入口改为终端指令：
+
+- 输入 `/model`：主 transcript 出现 `/model` 终端选项块，可选择 `default`、`sonnet`、`opus`、`haiku` 等模型。
+- 输入 `/mode`：主 transcript 出现 `/mode` 终端选项块，可选择 `default`、`acceptEdits`、`bypassPermissions`、`plan` 对应模式。
+- 输入 `/model <name>` 或 `/mode <name>`：仍直接执行切换，不展示选项块。
+
+这样控制入口更接近 Claude Code 的命令式交互，同时减少按钮台噪声。
+
 ## 当前保留项
 
 普通聊天气泡继续保留，因为用户明确允许“聊天气泡可以延续”。这也符合产品目标：
