@@ -1083,7 +1083,7 @@ class ChatWindow:
             was_at_bottom = yview[1] >= 0.99
         except Exception:
             pass
-        msg_char_width = self._pixels_to_chars(min(500, max(320, int(self._transcript_width * 0.68))))
+        msg_char_width = self._pixels_to_chars(max(240, int(self._transcript_width)))
         char_width_changed = msg_char_width != self._last_message_char_width
         live_widgets = []
         for widget in self._message_widgets:
@@ -1537,13 +1537,10 @@ class ChatWindow:
             fg=self.colors['muted'],
         ).pack(anchor='w', pady=(6, 0))
 
-        connection_row = tk.Frame(top_controls, bg=self.colors['bg'])
-        connection_row.pack(fill=tk.X, pady=(10, 0))
-
-        connection_button_row = tk.Frame(connection_row, bg=self.colors['bg'])
-        connection_button_row.pack(fill=tk.X)
+        controls_row = tk.Frame(top_controls, bg=self.colors['bg'])
+        controls_row.pack(fill=tk.X, pady=(10, 0))
         reconnect_button = create_button(
-            connection_button_row,
+            controls_row,
             text='连接',
             command=lambda: self._reconnect_session(announce=True),
             theme=self.theme,
@@ -1555,7 +1552,7 @@ class ChatWindow:
         )
         reconnect_button.pack(side=tk.RIGHT)
         connection_dropdown = create_dropdown(
-            connection_button_row,
+            controls_row,
             theme=self.theme,
             label='连接目标',
             value_getter=lambda: self._connection_var.get(),
@@ -1564,16 +1561,11 @@ class ChatWindow:
             font=self.fonts['small'],
             width=240,
         )
-        connection_dropdown.pack(side=tk.LEFT, anchor='w')
+        connection_dropdown.pack(side=tk.LEFT, anchor='w', padx=(0, 10))
         self._refresh_connection_buttons()
 
-        mode_row = tk.Frame(top_controls, bg=self.colors['bg'])
-        mode_row.pack(fill=tk.X, pady=(10, 0))
-
-        mode_button_row = tk.Frame(mode_row, bg=self.colors['bg'])
-        mode_button_row.pack(fill=tk.X)
         mode_dropdown = create_dropdown(
-            mode_button_row,
+            controls_row,
             theme=self.theme,
             label='当前模式',
             value_getter=lambda: self._mode_var.get(),
@@ -1582,13 +1574,11 @@ class ChatWindow:
             font=self.fonts['small'],
             width=300,
         )
-        mode_dropdown.pack(side=tk.LEFT, anchor='w')
+        mode_dropdown.pack(side=tk.LEFT, anchor='w', padx=(0, 10))
         self._refresh_mode_buttons()
 
-        terminal_row = tk.Frame(top_controls, bg=self.colors['bg'])
-        terminal_row.pack(fill=tk.X, pady=(10, 0))
         self._terminal_button = create_button(
-            terminal_row,
+            controls_row,
             text='打开过程视图',
             command=self._toggle_terminal_view,
             theme=self.theme,
@@ -1599,14 +1589,6 @@ class ChatWindow:
             pady=5,
         )
         self._terminal_button.pack(side=tk.LEFT)
-        tk.Label(
-            terminal_row,
-            text='过程视图承载过程流与原始输出，主界面只保留对话。',
-            font=self.fonts['small'],
-            bg=self.colors['bg'],
-            fg=self.colors['muted'],
-            anchor='w',
-        ).pack(side=tk.LEFT, padx=(12, 0))
         self._refresh_terminal_button()
         self._agent_activity_packed = False
 
@@ -1617,14 +1599,10 @@ class ChatWindow:
         button_row.pack(side=tk.BOTTOM, fill=tk.X, pady=(self.window_theme['button_gap'], 0))
         status_row = tk.Frame(button_row, bg=self.colors['bg'])
         status_row.pack(fill=tk.X)
-        action_row_primary = tk.Frame(button_row, bg=self.colors['bg'])
-        action_row_primary.pack(fill=tk.X, pady=(8, 0))
-        action_row_secondary = tk.Frame(button_row, bg=self.colors['bg'])
-        action_row_secondary.pack(fill=tk.X, pady=(8, 0))
-        action_group_primary = tk.Frame(action_row_primary, bg=self.colors['bg'])
-        action_group_primary.pack(side=tk.RIGHT)
-        action_group_secondary = tk.Frame(action_row_secondary, bg=self.colors['bg'])
-        action_group_secondary.pack(side=tk.RIGHT)
+        action_row = tk.Frame(button_row, bg=self.colors['bg'])
+        action_row.pack(fill=tk.X, pady=(8, 0))
+        action_group = tk.Frame(action_row, bg=self.colors['bg'])
+        action_group.pack(side=tk.RIGHT)
 
         composer = tk.Frame(content_frame, bg=self.colors['bg'])
         composer.pack(side=tk.BOTTOM, fill=tk.X, pady=(self.window_theme['composer_gap'], 0))
@@ -1817,7 +1795,7 @@ class ChatWindow:
         ).pack(side=tk.LEFT)
 
         self.stop_button = create_button(
-            action_group_primary,
+            action_group,
             text='中止对话',
             command=self._on_stop,
             theme=self.theme,
@@ -1829,7 +1807,7 @@ class ChatWindow:
         self.stop_button.pack(side=tk.LEFT, padx=(0, 8))
 
         upload_button = create_button(
-            action_group_secondary,
+            action_group,
             text='上传图片',
             command=self._handle_image_upload,
             theme=self.theme,
@@ -1841,7 +1819,7 @@ class ChatWindow:
         upload_button.pack(side=tk.LEFT, padx=(0, 8))
 
         self.send_button = create_button(
-            action_group_primary,
+            action_group,
             text='发送',
             command=self._on_send,
             theme=self.theme,
@@ -1853,7 +1831,7 @@ class ChatWindow:
         self.send_button.pack(side=tk.LEFT, padx=(0, 8))
 
         clear_button = create_button(
-            action_group_secondary,
+            action_group,
             text='清除对话',
             command=self._clear_conversation,
             theme=self.theme,
@@ -2204,18 +2182,19 @@ class ChatWindow:
             anchor='w',
             wraplength=176,
         )
-        title_label.pack(side=tk.LEFT)
+        title_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         delete_btn = tk.Label(
             title_row,
-            text='✕',
-            font=self.fonts['small'],
+            text='×',
+            font=self.fonts['control'],
             bg=bg_rest,
-            fg='#C7969E',
+            fg='#B93D3D',
             cursor='hand2',
-            padx=6,
+            padx=8,
+            pady=1,
         )
-        delete_btn.pack(side=tk.RIGHT)
+        delete_btn.pack(side=tk.RIGHT, padx=(8, 0))
 
         def handle_delete(_event=None, sid=session_id):
             self._delete_session(sid)
@@ -2226,7 +2205,7 @@ class ChatWindow:
         def _on_delete_enter(_event, btn=delete_btn):
             btn.configure(fg='#D43D3D')
         def _on_delete_leave(_event, btn=delete_btn):
-            btn.configure(fg='#C7969E')
+            btn.configure(fg='#B93D3D')
         delete_btn.bind('<Enter>', _on_delete_enter, add='+')
         delete_btn.bind('<Leave>', _on_delete_leave, add='+')
 
@@ -2855,7 +2834,7 @@ class ChatWindow:
             self._append_inline_status('图片附件暂不支持 /model、/mode、/btw、/raw 这类本地命令。')
             return
 
-        if text and intent.get('intent') != 'normal' and self._handle_local_command(text, intent=intent):
+        if text and intent.get('intent') not in {'normal', 'side_question_confirm'} and self._handle_local_command(text, intent=intent):
             self.input_box.delete('1.0', tk.END)
             self._resize_input_to_content()
             return
@@ -4795,14 +4774,14 @@ class ChatWindow:
         is_warn = role == 'warn'
 
         bubble_bg = '#FFFBF7'
-        bubble_border = '#E8D7B8'
+        bubble_border = self.colors['gold']
         bubble_fg = '#172B2D'
         code_fg = '#654417'
         quote_fg = '#466266'
         marker_fg = '#7A5423'
         if is_user:
             bubble_bg = '#DCF3DF'
-            bubble_border = '#B8DCC1'
+            bubble_border = self.colors['gold']
             bubble_fg = '#183923'
         elif is_error:
             bubble_bg = self.colors['error']
@@ -4853,7 +4832,7 @@ class ChatWindow:
             bubble_wrap = tk.Frame(content_col, bg=self.colors['panel'])
             bubble_wrap.pack(anchor='e')
 
-            text_width_chars = self._pixels_to_chars(min(500, max(320, int(self._transcript_width * 0.68))))
+            text_width_chars = self._pixels_to_chars(max(240, int(self._transcript_width * 0.70)))
             plain_text, text_height, is_collapsible = self._build_message_layout(text, text_width_chars)
             bubble = tk.Text(
                 bubble_wrap,
@@ -4865,8 +4844,9 @@ class ChatWindow:
                 height=text_height,
                 padx=14,
                 pady=10,
-                highlightbackground=bubble_bg,
-                highlightthickness=0,
+                highlightbackground=bubble_border,
+                highlightcolor=bubble_border,
+                highlightthickness=1,
                 bd=0,
                 relief=tk.FLAT,
                 cursor='arrow',
@@ -4942,7 +4922,7 @@ class ChatWindow:
             bubble_wrap = tk.Frame(content_col, bg=self.colors['panel'])
             bubble_wrap.pack(anchor='w')
 
-            text_width_chars = self._pixels_to_chars(min(500, max(320, int(self._transcript_width * 0.68))))
+            text_width_chars = self._pixels_to_chars(max(240, int(self._transcript_width * 0.70)))
             plain_text, text_height, is_collapsible = self._build_message_layout(text, text_width_chars)
             bubble = tk.Text(
                 bubble_wrap,
@@ -4954,8 +4934,9 @@ class ChatWindow:
                 height=text_height,
                 padx=14,
                 pady=10,
-                highlightbackground=bubble_bg,
-                highlightthickness=0,
+                highlightbackground=bubble_border,
+                highlightcolor=bubble_border,
+                highlightthickness=1,
                 bd=0,
                 relief=tk.FLAT,
                 cursor='arrow',
@@ -4970,7 +4951,7 @@ class ChatWindow:
             self._configure_markdown_tags(bubble)
             self._insert_markdown_text(bubble, text)
             bubble.configure(state=tk.DISABLED)
-            shell = self._wrap_bubble_in_shell(bubble_wrap, bubble, fill=bubble_bg, outline=bubble_border if is_assistant else self.colors['gold_soft'], anchor='w')
+            shell = self._wrap_bubble_in_shell(bubble_wrap, bubble, fill=bubble_bg, outline=bubble_border, anchor='w')
             container._message_bubble = bubble
             container._bubble_shell = shell
             container._bubble_border = bubble_border
