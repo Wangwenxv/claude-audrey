@@ -39,6 +39,9 @@ def main():
             self.root = master
             self.pets = []
             self.chat_window = None
+            self.wpf_chat_bridge = None
+            self.wpf_chat_process = None
+            self.chat_picker = None
             self.claude_hook_state = ClaudeHookState()
             self.claude_hook_server = ClaudeHookServer(self.claude_hook_state)
             self._visible = True
@@ -216,10 +219,155 @@ def main():
                 except Exception:
                     pass
                 self.chat_window = None
+            if self.wpf_chat_bridge is not None:
+                try:
+                    self.wpf_chat_bridge.close()
+                except Exception:
+                    pass
+                self.wpf_chat_bridge = None
+                self.wpf_chat_process = None
             for pet in self.pets:
                 pet._request_quit = True
 
         def show_chat_window(self, parent, version):
+            if threading.current_thread() is not threading.main_thread():
+                self.root.after(0, lambda: self.show_chat_window(parent, version))
+                return
+
+            self._close_chat_picker()
+            self._show_tk_chat_window(parent, version)
+
+        def show_tk_chat_window(self, parent, version):
+            if threading.current_thread() is not threading.main_thread():
+                self.root.after(0, lambda: self.show_tk_chat_window(parent, version))
+                return
+            self._close_chat_picker()
+            self._show_tk_chat_window(parent, version)
+
+        def show_wpf_chat_window(self, parent, version):
+            if threading.current_thread() is not threading.main_thread():
+                self.root.after(0, lambda: self.show_wpf_chat_window(parent, version))
+                return
+            self._close_chat_picker()
+            if not self._show_wpf_chat_window(version):
+                self._show_tk_chat_window(parent, version)
+
+        def _show_chat_picker(self, parent, version):
+            if self.chat_picker is not None:
+                try:
+                    if self.chat_picker.winfo_exists():
+                        self.chat_picker.lift()
+                        self.chat_picker.focus_force()
+                        return
+                except Exception:
+                    pass
+                self.chat_picker = None
+
+            picker = tk.Toplevel(parent)
+            self.chat_picker = picker
+            picker.title('选择聊天窗口')
+            picker.resizable(False, False)
+            picker.transient(parent)
+            picker.configure(bg='#F8F6F0')
+            picker.protocol('WM_DELETE_WINDOW', lambda: self._close_chat_picker())
+
+            frame = tk.Frame(picker, bg='#F8F6F0', padx=18, pady=18)
+            frame.pack(fill=tk.BOTH, expand=True)
+
+            tk.Label(
+                frame,
+                text='与奥黛丽聊聊',
+                font=('Microsoft YaHei UI', 15, 'bold'),
+                bg='#F8F6F0',
+                fg='#24383C',
+            ).pack(anchor='w')
+            tk.Label(
+                frame,
+                text='请选择这次使用的聊天窗口：',
+                font=('Microsoft YaHei UI', 10),
+                bg='#F8F6F0',
+                fg='#667C80',
+            ).pack(anchor='w', pady=(8, 16))
+
+            button_row = tk.Frame(frame, bg='#F8F6F0')
+            button_row.pack(fill=tk.X)
+
+            tk.Button(
+                button_row,
+                text='经典 Tk',
+                width=14,
+                command=lambda: self._choose_chat_variant('tk', parent, version),
+                bg='#FFFDF8',
+                fg='#24383C',
+                relief=tk.FLAT,
+                highlightbackground='#D6B36A',
+                highlightthickness=1,
+                padx=8,
+                pady=10,
+                cursor='hand2',
+            ).pack(side=tk.LEFT)
+
+            tk.Button(
+                button_row,
+                text='原生 WPF(EXE)',
+                width=16,
+                command=lambda: self._choose_chat_variant('wpf', parent, version),
+                bg='#EEF6F3',
+                fg='#24383C',
+                relief=tk.FLAT,
+                highlightbackground='#A8CEC7',
+                highlightthickness=1,
+                padx=8,
+                pady=10,
+                cursor='hand2',
+            ).pack(side=tk.LEFT, padx=(10, 0))
+
+            tk.Label(
+                frame,
+                text='Tk 更稳定；WPF 版仍在优化性能与展示流。',
+                font=('Microsoft YaHei UI', 9),
+                bg='#F8F6F0',
+                fg='#8A9C9E',
+            ).pack(anchor='w', pady=(14, 0))
+
+            picker.update_idletasks()
+            try:
+                parent_x = parent.winfo_rootx()
+                parent_y = parent.winfo_rooty()
+                parent_w = max(parent.winfo_width(), parent.winfo_reqwidth())
+                parent_h = max(parent.winfo_height(), parent.winfo_reqheight())
+                picker_w = picker.winfo_width()
+                picker_h = picker.winfo_height()
+                x = parent_x + max(0, (parent_w - picker_w) // 2)
+                y = parent_y + max(0, (parent_h - picker_h) // 2)
+                picker.geometry(f'+{x}+{y}')
+            except Exception:
+                pass
+            picker.lift()
+            picker.focus_force()
+            picker.grab_set()
+
+        def _close_chat_picker(self):
+            if self.chat_picker is None:
+                return
+            try:
+                self.chat_picker.grab_release()
+            except Exception:
+                pass
+            try:
+                self.chat_picker.destroy()
+            except Exception:
+                pass
+            self.chat_picker = None
+
+        def _choose_chat_variant(self, variant, parent, version):
+            self._close_chat_picker()
+            if variant == 'wpf':
+                if self._show_wpf_chat_window(version):
+                    return
+            self._show_tk_chat_window(parent, version)
+
+        def _show_tk_chat_window(self, parent, version):
             from audrey_hall.chat_window import ChatWindow
 
             if self.chat_window is not None and self.chat_window.window is not None:
@@ -232,6 +380,34 @@ def main():
 
             self.chat_window = ChatWindow(parent, self, version)
             self.chat_window.show()
+
+        def _show_wpf_chat_window(self, version):
+            try:
+                self._ensure_wpf_chat_bridge(version)
+                return self.wpf_chat_bridge.show()
+            except Exception:
+                return False
+
+        def _ensure_wpf_chat_bridge(self, version):
+            from audrey_hall.chat_bridge import WpfChatBridge
+            from audrey_hall.chat_process import ChatProcessManager
+
+            if self.wpf_chat_process is None:
+                self.wpf_chat_process = ChatProcessManager(
+                    self.root,
+                    lambda command: self.wpf_chat_bridge.handle_command(command)
+                    if self.wpf_chat_bridge is not None
+                    else None,
+                )
+            if self.wpf_chat_bridge is None:
+                self.wpf_chat_bridge = WpfChatBridge(self, version, self.wpf_chat_process)
+
+        def preheat_chat_window(self, version):
+            try:
+                self._ensure_wpf_chat_bridge(version)
+                self.wpf_chat_process.preheat()
+            except Exception:
+                pass
 
     # 先创建 app 实例（在后台线程之前）
     try:

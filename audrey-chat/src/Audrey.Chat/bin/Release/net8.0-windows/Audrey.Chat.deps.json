@@ -1,0 +1,23 @@
+{
+  "runtimeTarget": {
+    "name": ".NETCoreApp,Version=v8.0",
+    "signature": ""
+  },
+  "compilationOptions": {},
+  "targets": {
+    ".NETCoreApp,Version=v8.0": {
+      "Audrey.Chat/1.0.0": {
+        "runtime": {
+          "Audrey.Chat.dll": {}
+        }
+      }
+    }
+  },
+  "libraries": {
+    "Audrey.Chat/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    }
+  }
+}

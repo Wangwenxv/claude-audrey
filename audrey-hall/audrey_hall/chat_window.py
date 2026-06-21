@@ -1,6 +1,7 @@
 import base64
 import io
 import json
+import math
 import os
 import queue
 import re
@@ -12,7 +13,7 @@ from tkinter import filedialog
 from datetime import datetime
 from pathlib import Path
 
-from PIL import Image, ImageTk
+from PIL import Image, ImageDraw, ImageTk
 
 try:
     from PIL import ImageGrab
@@ -26,6 +27,7 @@ from .claude_agent import (
 )
 from .terminal_view import TerminalViewWindow
 from .ui import create_button, create_card, create_dropdown, get_theme
+from .ui.components import ColorTween, _blend_colors, _ease_out_cubic
 from .utils import resource_path
 
 
@@ -74,9 +76,12 @@ EVENT_POLL_INTERVAL_MS = 100
 EVENT_DRAIN_BUDGET_MS = 12
 EVENT_BATCH_LIMIT = 80
 INLINE_STATUS_DEBOUNCE_MS = 120
+STREAM_RENDER_INTERVAL_MS = 33
 MAX_COLLAPSED_MESSAGE_LINES = 12
 MAX_INLINE_TOOL_RESULT_CHARS = 12000
 MAX_INLINE_TOOL_RESULT_LINES = 120
+MAX_TOOL_STATUS_DETAIL_CHARS = 160
+UNSELECTED_CONNECTION_LABEL = '请选择思维链'
 CONNECTION_TARGET_CHOICES = [
     ('auto', '自动抉择'),
     ('project', '奥黛丽agent'),
@@ -113,6 +118,281 @@ def _normalize_permission_mode(mode: str | None) -> str:
     return PERMISSION_MODE_ALIASES.get(normalized.lower(), normalized)
 
 
+class ChatTimelineStore:
+    def __init__(self):
+        self._items = []
+        self._by_key = {}
+
+    def clear(self):
+        self._items = []
+        self._by_key = {}
+
+    def append(self, item: dict) -> dict:
+        item = dict(item)
+        item.setdefault('id', f"timeline-{len(self._items) + 1}-{int(time.time() * 1000)}")
+        self._items.append(item)
+        key = item.get('key')
+        if key:
+            self._by_key[key] = item
+        return item
+
+    def upsert(self, key: str, item: dict) -> tuple[dict, bool]:
+        if key in self._by_key:
+            existing = self._by_key[key]
+            existing.update(item)
+            existing['key'] = key
+            return existing, False
+        item = dict(item)
+        item['key'] = key
+        return self.append(item), True
+
+    def complete(self, key: str, patch: dict) -> dict | None:
+        item = self._by_key.get(key)
+        if item is None:
+            return None
+        item.update(patch)
+        item.setdefault('state', 'done')
+        return item
+
+
+class TimelineRenderer:
+    def __init__(self, owner):
+        self.owner = owner
+        self.widgets = {}
+
+    def clear(self):
+        for bundle in self.widgets.values():
+            job = bundle.get('flush_job') if isinstance(bundle, dict) else None
+            if job is not None:
+                try:
+                    self.owner.window.after_cancel(job)
+                except Exception:
+                    pass
+        self.widgets = {}
+
+    def render(self, item: dict):
+        kind = item.get('kind')
+        item_id = item.get('id')
+        if kind in {'user_message', 'assistant_message'}:
+            role = 'user' if kind == 'user_message' else 'assistant'
+            self.owner._append_message(role, item.get('text') or '')
+            return
+        if kind == 'streaming_assistant_message':
+            self._upsert_streaming_message(item)
+            return
+        self._upsert_card(item_id, item)
+
+    def _upsert_streaming_message(self, item: dict):
+        item_id = item.get('id')
+        bundle = self.widgets.get(item_id)
+        text = item.get('text') or '...'
+        if bundle is None:
+            card = self.owner._create_message_widget('assistant', text)
+            self.owner._capture_transcript_follow_state()
+            self.owner.text_area.config(state=tk.NORMAL)
+            self.owner.text_area.insert(tk.END, '\n')
+            self.owner.text_area.window_create(tk.END, window=card, padx=4, pady=4)
+            self.owner.text_area.insert(tk.END, '\n')
+            self.owner.text_area.config(state=tk.DISABLED)
+            self.widgets[item_id] = {'card': card, 'text': text, 'kind': item.get('kind')}
+            self.owner._maybe_follow_transcript_end()
+            return
+        if bundle.get('text') == text:
+            return
+        if item.get('state') == 'done':
+            flush_job = bundle.get('flush_job')
+            if flush_job is not None and self.owner.window is not None:
+                try:
+                    self.owner.window.after_cancel(flush_job)
+                except Exception:
+                    pass
+                bundle['flush_job'] = None
+            self._flush_streaming_message(item_id, text)
+            return
+        bundle['pending_text'] = text
+        if bundle.get('flush_job') is not None:
+            return
+        if self.owner.window is None:
+            self._flush_streaming_message(item_id, text)
+            return
+        bundle['flush_job'] = self.owner.window.after(
+            STREAM_RENDER_INTERVAL_MS,
+            lambda key=item_id: self._flush_streaming_message(key),
+        )
+
+    def _flush_streaming_message(self, item_id: str, forced_text: str | None = None):
+        bundle = self.widgets.get(item_id)
+        if bundle is None:
+            return
+        bundle['flush_job'] = None
+        text = forced_text if forced_text is not None else bundle.get('pending_text')
+        if not isinstance(text, str) or bundle.get('text') == text:
+            return
+        bundle['text'] = text
+        bundle['pending_text'] = None
+        self.owner._update_message_widget_text(bundle.get('card'), text)
+
+    def _upsert_card(self, item_id: str, item: dict):
+        bundle = self.widgets.get(item_id)
+        if bundle is None:
+            card, labels, buttons = self._create_card(item)
+            self.widgets[item_id] = {'card': card, 'labels': labels, 'buttons': buttons, 'kind': item.get('kind')}
+            self.owner._insert_inline_card(card)
+            return
+        self._update_card(bundle, item)
+
+    def _timeline_colors(self, kind: str) -> tuple[str, str]:
+        tokens = self.owner.chat_theme.get('timeline', {})
+        if kind == 'permission_card':
+            return '#F8FBFA', tokens.get('permission_border', self.owner.colors['gold'])
+        if kind == 'question_card':
+            return '#F8FBFA', tokens.get('question_border', self.owner.colors['gold'])
+        if kind in {'tool_card', 'task_card'}:
+            return '#F8FBFA', tokens.get('tool_border', self.owner.colors['border_strong'])
+        if kind == 'thinking_card':
+            return '#F8FBFA', tokens.get('thinking_border', self.owner.colors['gold_bright'])
+        if kind == 'error_card':
+            return '#FFF7F7', tokens.get('error_border', '#DAB8BE')
+        if kind in {'tool_result_card', 'summary_card'}:
+            return '#FDFEFD', tokens.get('result_border', self.owner.colors['border'])
+        return '#F8FBFA', tokens.get('status_border', self.owner.colors['border'])
+
+    def _terminal_prefix(self, kind: str, state: str) -> str:
+        if state == 'error' or kind == 'error_card':
+            return '!'
+        if kind == 'thinking_card':
+            return '*'
+        if kind in {'tool_card', 'task_card'}:
+            return '>'
+        if kind == 'tool_result_card':
+            return '⎿'
+        if kind in {'permission_card', 'question_card'}:
+            return '?'
+        if kind == 'summary_card' or state == 'done':
+            return '✓'
+        return '•'
+
+    def _terminal_block_width(self) -> int:
+        return max(360, self.owner._transcript_width - 32)
+
+    def _terminal_wraplength(self) -> int:
+        return max(260, self._terminal_block_width() - 56)
+
+    def _badge_text(self, item: dict) -> str:
+        state = str(item.get('state') or 'running').upper()
+        return {'STREAMING': 'LIVE', 'RUNNING': 'RUNNING', 'WAITING': 'ACTION', 'DONE': 'DONE', 'ERROR': 'ERROR'}.get(state, state)
+
+    def _create_card(self, item: dict):
+        kind = item.get('kind') or 'status_card'
+        _bg, accent = self._timeline_colors(kind)
+        bg = self.owner.colors['panel']
+        state = str(item.get('state') or 'running').lower()
+        block_width = self._terminal_block_width()
+        wraplength = self._terminal_wraplength()
+        card = tk.Frame(self.owner.text_area, bg=bg, bd=0, highlightthickness=0, width=block_width)
+        body = tk.Frame(card, bg=bg, bd=0, highlightthickness=0, width=block_width)
+        body.pack(fill=tk.X, expand=True, padx=0, pady=1)
+        row = tk.Frame(body, bg=bg)
+        row.pack(fill=tk.X, padx=4, pady=(5, 1))
+        prefix = tk.Label(row, text=self._terminal_prefix(kind, state), font=('Consolas', 11, 'bold'), bg=bg, fg=accent, width=2, anchor='w')
+        prefix.pack(side=tk.LEFT, anchor='n')
+        title_text = item.get('title') or '状态更新'
+        title = tk.Label(row, text=title_text, font=('Consolas', 10, 'bold'), bg=bg, fg=self.owner.colors['text_strong'], anchor='w', justify='left')
+        title.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        badge = tk.Label(row, text=self._badge_text(item), font=('Consolas', 8), bg=bg, fg=self.owner.colors['muted'], padx=6, pady=0)
+        badge.pack(side=tk.RIGHT)
+        detail_text = item.get('text') or item.get('detail') or ''
+        meta_text = item.get('meta_text') or item.get('timestamp') or ''
+        detail = tk.Label(body, text=detail_text, font=('Consolas', 9), bg=bg, fg=self.owner.colors['text'], anchor='w', justify='left', wraplength=wraplength)
+        if detail_text:
+            detail.pack(fill=tk.X, padx=(30, 4), pady=(0, 1))
+        meta = tk.Label(body, text=meta_text, font=('Consolas', 8), bg=bg, fg=self.owner.colors['muted'], anchor='w', justify='left', wraplength=wraplength)
+        if meta_text:
+            meta.pack(fill=tk.X, padx=(30, 4), pady=(0, 5))
+        actions = tk.Frame(body, bg=bg)
+        buttons = {}
+        if item.get('actions'):
+            actions.pack(fill=tk.X, padx=(30, 4), pady=(0, 7))
+            for action in item.get('actions') or []:
+                label = action.get('label') or '确定'
+                buttons[label] = create_button(
+                    actions,
+                    text=label,
+                    command=action.get('command'),
+                    theme=self.owner.theme,
+                    variant=action.get('variant') or 'secondary',
+                    font=self.owner.fonts['control'],
+                    padx=12,
+                    pady=5,
+                )
+                buttons[label].pack(side=tk.LEFT, padx=(0, 8), pady=(0, 2))
+        return card, {'prefix': prefix, 'title': title, 'badge': badge, 'detail': detail, 'meta': meta}, buttons
+
+    def _update_card(self, bundle: dict, item: dict):
+        labels = bundle.get('labels') or {}
+        try:
+            title_text = item.get('title') or '状态更新'
+            badge_text = self._badge_text(item)
+            detail_text = item.get('text') or item.get('detail') or ''
+            meta_text = item.get('meta_text') or item.get('timestamp') or ''
+            if bundle.get('title_text') != title_text:
+                labels['title'].config(text=title_text)
+                bundle['title_text'] = title_text
+            if bundle.get('badge_text') != badge_text:
+                labels['badge'].config(text=badge_text)
+                bundle['badge_text'] = badge_text
+            if bundle.get('detail_text') != detail_text:
+                labels['detail'].config(text=detail_text)
+                if detail_text and not labels['detail'].winfo_manager():
+                    labels['detail'].pack(fill=tk.X, padx=(30, 4), pady=(0, 1))
+                elif not detail_text and labels['detail'].winfo_manager():
+                    labels['detail'].pack_forget()
+                bundle['detail_text'] = detail_text
+            if bundle.get('meta_text') != meta_text:
+                labels['meta'].config(text=meta_text)
+                if meta_text and not labels['meta'].winfo_manager():
+                    labels['meta'].pack(fill=tk.X, padx=(30, 4), pady=(0, 5))
+                elif not meta_text and labels['meta'].winfo_manager():
+                    labels['meta'].pack_forget()
+                bundle['meta_text'] = meta_text
+            labels['detail'].config(wraplength=self._terminal_wraplength())
+            labels['meta'].config(wraplength=self._terminal_wraplength())
+            prefix = labels.get('prefix')
+            if prefix is not None:
+                prefix.config(text=self._terminal_prefix(item.get('kind') or 'status_card', str(item.get('state') or 'running').lower()))
+            if item.get('state') in {'done', 'error'}:
+                for button in (bundle.get('buttons') or {}).values():
+                    button.config(state=tk.DISABLED)
+        except Exception:
+            pass
+
+
+class CommandIntentController:
+    def __init__(self, owner):
+        self.owner = owner
+
+    def detect(self, text: str) -> dict:
+        stripped = (text or '').strip()
+        lowered = stripped.lower()
+        if lowered.startswith('/model'):
+            return {'intent': 'model_select', 'confidence': 1.0, 'args': stripped[6:].strip()}
+        if lowered.startswith('/mode'):
+            return {'intent': 'mode_select', 'confidence': 1.0, 'args': stripped[5:].strip()}
+        if lowered.startswith('/btw'):
+            return {'intent': 'side_question', 'confidence': 1.0, 'args': stripped[4:].strip()}
+        if lowered.startswith('/raw'):
+            return {'intent': 'raw_toggle', 'confidence': 1.0, 'args': ''}
+        if any(cue in stripped for cue in ('切换模型', '换成 opus', '用 sonnet', '用 opus')):
+            return {'intent': 'model_select', 'confidence': 0.7, 'args': ''}
+        if any(cue in stripped for cue in ('计划模式', '自动模式', '允许改文件', '全权限')):
+            return {'intent': 'mode_select', 'confidence': 0.7, 'args': ''}
+        if self.owner._busy:
+            return {'intent': 'side_question_confirm', 'confidence': 0.8, 'args': stripped}
+        if stripped.startswith('/'):
+            return {'intent': 'local_help', 'confidence': 1.0, 'args': stripped}
+        return {'intent': 'normal', 'confidence': 1.0, 'args': stripped}
+
+
 class ChatWindow:
     def __init__(self, parent, app, version):
         self.parent = parent
@@ -146,7 +426,9 @@ class ChatWindow:
         self._tool_status_widget = None
         self._tool_status_font = None
         self._auto_follow_transcript = True
-        self.status_var = tk.StringVar(value='正在唤醒奥黛丽的助手...')
+        self._transcript_programmatic_update = False
+        self._transcript_follow_generation = 0
+        self.status_var = tk.StringVar(value='请选择思维链后点击连接。')
         self._event_queue = queue.Queue()
         self._busy = False
         self._auto_allow_tools = set()  # 用户选择“总是允许”的工具名
@@ -157,6 +439,8 @@ class ChatWindow:
         self._active_model = 'default'
         self._active_permission_mode = 'default'
         self._connection_target = 'auto'
+        self._connection_target_selected = False
+        self._session_connected = False
         self._main_status_text = ''
         self._task_progress_text = ''
         self._current_total_tokens = None
@@ -181,6 +465,7 @@ class ChatWindow:
         self._session_label_var = tk.StringVar(value='当前会话：新对话')
         self._history_items = []
         self._history_container = None
+        self._history_canvas = None
         self._history_empty_label = None
         self._history_context_menu = None
         self._connection_start_time = None
@@ -189,6 +474,9 @@ class ChatWindow:
         self._terminal_view = None
         self._terminal_view_visible = False
         self._terminal_button = None
+        self._top_controls_frame = None
+        self._top_controls_toggle_button = None
+        self._top_controls_collapsed = False
         self._terminal_sync_job = None
         self._inline_status_job = None
         self._pending_inline_status_text = None
@@ -198,6 +486,34 @@ class ChatWindow:
         self._markdown_fonts = None
         self._pending_image_attachments = []
         self._attachment_preview_frame = None
+        self._input_window_id = None
+        self._input_shell_min_height = 96
+        self._input_shell_max_height = 220
+        self._chat_header_canvas = None
+        self._agent_activity_frame = None
+        self._agent_activity_title = None
+        self._agent_activity_detail = None
+        self._agent_activity_badge = None
+        self._agent_activity_meta = None
+        self._agent_activity_packed = True
+        self._agent_activity_collapsed = True
+        self._agent_activity_toggle_button = None
+        self._agent_activity_body_widgets = []
+        self._status_dot = None
+        self._status_dot_item = None
+        self._status_dot_job = None
+        self._status_dot_phase = 0.0
+        self._status_dot_tween = None
+        self._status_fade_seq = 0  # 状态行淡入用的自增标签序号
+        self._timeline_store = ChatTimelineStore()
+        self._timeline_renderer = TimelineRenderer(self)
+        self._command_intents = CommandIntentController(self)
+        self._processed_conversation_events = set()
+        self._last_streaming_text_key = ''
+        self._terminal_tool_input_texts = {}
+        self._terminal_tool_block_keys = {}
+        self._turn_terminal_summaries = {}
+        self._using_conversation_events = False
 
         self.theme = get_theme()
         self.fonts = self.theme['fonts']
@@ -223,6 +539,8 @@ class ChatWindow:
         )
 
     def _format_connection_status(self):
+        if not self._connection_target_selected:
+            return UNSELECTED_CONNECTION_LABEL
         label = CONNECTION_OPTION_LABELS.get(self._connection_target, self._connection_target)
         return label
 
@@ -230,22 +548,36 @@ class ChatWindow:
         self._connection_var.set(self._format_connection_status())
 
     def _set_connection_target(self, target: str):
+        if not isinstance(target, str) or not target.strip():
+            self._connection_target_selected = False
+            self._refresh_connection_buttons()
+            return
         normalized = normalize_connection_target(target)
-        if normalized != self._connection_target:
+        if normalized != self._connection_target or not self._connection_target_selected:
             self._connection_target = normalized
             self.session.connection_target = normalized
+        self._connection_target_selected = True
         self._refresh_connection_buttons()
 
     def _switch_connection_target(self, target: str):
         normalized = normalize_connection_target(target)
-        if normalized == self._connection_target and self.session.process is not None:
-            self.status_var.set(f'已连上{CONNECTION_OPTION_LABELS.get(normalized, normalized)}')
+        if normalized == self._connection_target and self._connection_target_selected and self._session_connected:
+            self._set_status_and_agent(f'已连上{CONNECTION_OPTION_LABELS.get(normalized, normalized)}', '连接状态', 'READY')
             return
 
         self._set_connection_target(normalized)
-        self._reconnect_session(announce=True)
+        if self._session_connected or self.session.process is not None:
+            self._reconnect_session(announce=True)
+        else:
+            label = CONNECTION_OPTION_LABELS.get(normalized, normalized)
+            self._append_inline_status(f'已选择思维链：{label}')
+            self._set_status_and_agent(self._compose_status_text(f'已选择思维链：{label}，点击连接后生效'), '连接目标', 'READY')
 
     def _reconnect_session(self, announce: bool = False):
+        if not self._connection_target_selected:
+            self._append_inline_status('请先选择思维链，再点击连接。')
+            self._set_status_and_agent(self._compose_status_text('请先选择思维链，再点击连接。'), '需要连接', 'ACTION')
+            return
         try:
             self.session.close()
         except Exception:
@@ -253,6 +585,7 @@ class ChatWindow:
 
         self._event_queue = queue.Queue()
         self._busy = False
+        self._session_connected = False
         self._set_busy(False)
         self._pending_perm_frames = {}
         self._pending_question_cards = {}
@@ -276,18 +609,19 @@ class ChatWindow:
         label = CONNECTION_OPTION_LABELS.get(self._connection_target, self._connection_target)
         if announce:
             self._append_inline_status(f'正在重连：{label}')
-        self.status_var.set(f'正在呼唤{label}...')
+        self._set_status_and_agent(f'正在呼唤{label}...', '正在连接', 'BOOTING')
         self._start_session()
 
     def _start_session(self):
-        self._connection_start_time = datetime.now()
-        self._update_connection_time()
+        self._connection_start_time = None
+        self._connection_time_var.set('')
+        self._set_status_and_agent(self._compose_status_text('正在连接...'), '正在连接', 'BOOTING')
         try:
             self.session.start()
         except Exception as exc:
             self._connection_start_time = None
             self._connection_time_var.set('')
-            self.status_var.set('呼唤失败')
+            self._set_status_and_agent('呼唤失败', '连接失败', 'ERROR')
             self._append_message('error', f'呼唤助手失败：{exc}')
 
     def _ensure_terminal_view(self):
@@ -368,11 +702,11 @@ class ChatWindow:
             if elapsed < 0:
                 self._connection_time_var.set('')
             elif elapsed < 60:
-                self._connection_time_var.set(f'已连接 {int(elapsed)}s')
+                self._connection_time_var.set(f'◷ 已连接 {int(elapsed):02d}s')
             else:
                 minutes = int(elapsed // 60)
                 seconds = int(elapsed % 60)
-                self._connection_time_var.set(f'已连接 {minutes}m{seconds}s')
+                self._connection_time_var.set(f'◷ 已连接 {minutes}:{seconds:02d}')
         self._connection_time_timer = self.window.after(1000, self._update_connection_time)
 
     def _permission_card_style(self):
@@ -426,23 +760,242 @@ class ChatWindow:
 
     def _aurora_button_style(self):
         return {
-            'bg': '#F8FCFB',
+            'bg': 'transparent',
             'fg': '#2E4245',
-            'highlightbackground': '#CFAF5F',
-            'highlightthickness': 0,
-            
-            'hover_bg': '#EDF7F4',
-            'hover_fg': '#1F3033',
-            'hover_border_color': '#F9BE00',
-            'hover_border_thickness': 1,
-            'hover_color': '##F9BE00',
-            
-            'pressed_bg': '#F0E2C8',
-            'pressed_fg': '#1F3033',
-            'pressed_border_color': '#9A7233',
-            
-            'pulse_border_off_color': '#FCF9F0',
+            'highlightbackground': '#8CCFB2',
+            'highlightthickness': 1,
+            'normal_side_border_only': False,
+
+            'hover_bg': 'transparent',
+            'hover_fg': '#D1AE61',
+            'hover_border_color': '#D1AE61',
+            'hover_highlightthickness': 1,
+
+            'pressed_bg': '#D7EFE5',
+            'pressed_fg': '#D1AE61',
+            'pressed_border_color': '#8D6835',
+            'content_pady': 9,
+
+            'pulse_border_off_color': '#D1AE61',
+            'pulse_border_mid_color': '#8CCFB2',
         }
+
+    def _draw_sparkle(self, canvas, x, y, r, color, tag, *, width=1):
+        """四角星（光芒）：长十字 + 短斜叉，营造闪烁的星光。"""
+        canvas.create_line(x - r, y, x + r, y, fill=color, width=width, tags=tag)
+        canvas.create_line(x, y - r, x, y + r, fill=color, width=width, tags=tag)
+        d = max(1, int(r * 0.5))
+        canvas.create_line(x - d, y - d, x + d, y + d, fill=color, width=1, tags=tag)
+        canvas.create_line(x - d, y + d, x + d, y - d, fill=color, width=1, tags=tag)
+
+    def _draw_scroll_flourish(self, canvas, x, y, direction, color, tag):
+        """线端卷草花纹：一段向上的小弧 + 一颗收尾圆点，模拟金线卷曲。"""
+        d = direction
+        canvas.create_arc(
+            x - 9, y - 9, x + 9, y + 9,
+            start=20 if d > 0 else 160, extent=140 if d > 0 else -140,
+            style=tk.ARC, outline=color, width=1, tags=tag,
+        )
+        canvas.create_oval(x - 1 + d * 8, y - 7, x + 1 + d * 8, y - 5, fill=color, outline='', tags=tag)
+
+    def _draw_bubble_flourish(self, canvas, side):
+        """对话框下沿的金色卷草花纹：渐隐双金线 + 收尾卷草 + 点睛星光，
+        让气泡更像一帧考究的信笺。side='w' 左(奥黛丽)，'e' 右(用户)。"""
+        if canvas is None or not canvas.winfo_exists():
+            return
+        width = canvas.winfo_width()
+        height = canvas.winfo_height()
+        if width <= 2 or height <= 2:
+            return
+
+        gold = self.colors['gold']
+        gold_bright = self.colors['gold_bright']
+        gold_soft = self.colors['gold_soft']
+        cy = height // 2
+
+        canvas.delete('bubble_orn')
+        # 锚定端贴气泡一侧，金线向内侧延伸
+        if side == 'e':
+            x0 = width - 6
+            d = -1
+        else:
+            x0 = 6
+            d = 1
+        span = max(40, min(150, width - 16))
+        x1 = x0 + d * span
+        # 渐隐双金线
+        canvas.create_line(x0, cy, x1, cy, fill=gold, width=1, tags='bubble_orn')
+        canvas.create_line(x0 + d * 12, cy + 3, x1 - d * 16, cy + 3, fill=gold_soft, width=1, tags='bubble_orn')
+        # 收尾卷草
+        self._draw_scroll_flourish(canvas, x1, cy, d, gold, 'bubble_orn')
+        # 锚端星光 + 线身小星点
+        self._draw_sparkle(canvas, x0 + d * 3, cy, 3, gold_bright, 'bubble_orn')
+        self._draw_sparkle(canvas, x0 + d * int(span * 0.55), cy, 3, gold, 'bubble_orn')
+
+    def _draw_rounded_rect(self, canvas, x1, y1, x2, y2, radius, *, fill, outline='', width=1, tags=None):
+        radius = max(1, min(int(radius), int((x2 - x1) / 2), int((y2 - y1) / 2)))
+        tag_tuple = tags if tags is not None else ()
+        canvas.create_rectangle(x1 + radius, y1, x2 - radius, y2, fill=fill, outline='', tags=tag_tuple)
+        canvas.create_rectangle(x1, y1 + radius, x2, y2 - radius, fill=fill, outline='', tags=tag_tuple)
+        canvas.create_arc(x1, y1, x1 + radius * 2, y1 + radius * 2, start=90, extent=90, fill=fill, outline='', tags=tag_tuple)
+        canvas.create_arc(x2 - radius * 2, y1, x2, y1 + radius * 2, start=0, extent=90, fill=fill, outline='', tags=tag_tuple)
+        canvas.create_arc(x2 - radius * 2, y2 - radius * 2, x2, y2, start=270, extent=90, fill=fill, outline='', tags=tag_tuple)
+        canvas.create_arc(x1, y2 - radius * 2, x1 + radius * 2, y2, start=180, extent=90, fill=fill, outline='', tags=tag_tuple)
+        if outline:
+            inset = max(0, width // 2)
+            canvas.create_line(x1 + radius, y1 + inset, x2 - radius, y1 + inset, fill=outline, width=width, tags=tag_tuple)
+            canvas.create_line(x2 - inset, y1 + radius, x2 - inset, y2 - radius, fill=outline, width=width, tags=tag_tuple)
+            canvas.create_line(x1 + radius, y2 - inset, x2 - radius, y2 - inset, fill=outline, width=width, tags=tag_tuple)
+            canvas.create_line(x1 + inset, y1 + radius, x1 + inset, y2 - radius, fill=outline, width=width, tags=tag_tuple)
+            canvas.create_arc(x1, y1, x1 + radius * 2, y1 + radius * 2, start=90, extent=90, style=tk.ARC, outline=outline, width=width, tags=tag_tuple)
+            canvas.create_arc(x2 - radius * 2, y1, x2, y1 + radius * 2, start=0, extent=90, style=tk.ARC, outline=outline, width=width, tags=tag_tuple)
+            canvas.create_arc(x2 - radius * 2, y2 - radius * 2, x2, y2, start=270, extent=90, style=tk.ARC, outline=outline, width=width, tags=tag_tuple)
+            canvas.create_arc(x1, y2 - radius * 2, x1 + radius * 2, y2, start=180, extent=90, style=tk.ARC, outline=outline, width=width, tags=tag_tuple)
+
+    def _paint_bubble_shell(self, shell, fill=None, outline=None):
+        if shell is None or not shell.winfo_exists():
+            return
+        fill = fill or getattr(shell, '_bubble_fill', self.colors['panel'])
+        outline = outline or getattr(shell, '_bubble_outline', self.colors['border'])
+        side = getattr(shell, '_bubble_side', 'w')
+        width = shell.winfo_width() or int(shell.cget('width'))
+        height = shell.winfo_height() or int(shell.cget('height'))
+        if width <= 2 or height <= 2:
+            return
+        shell.delete('bubble_shell')
+        tail = 9
+        if side == 'e':
+            x1, x2 = 1, width - tail - 1
+            tail_points = (x2 - 1, 16, width - 2, 22, x2 - 1, 28)
+        else:
+            x1, x2 = tail + 1, width - 1
+            tail_points = (x1 + 1, 16, 2, 22, x1 + 1, 28)
+        self._draw_rounded_rect(shell, x1, 1, x2, height - 1, 16, fill=fill, outline=outline, width=1, tags='bubble_shell')
+        shell.create_polygon(tail_points, fill=fill, outline=outline, tags='bubble_shell')
+        shell.tag_lower('bubble_shell')
+        shell._bubble_fill = fill
+        shell._bubble_outline = outline
+
+    def _wrap_bubble_in_shell(self, parent, bubble, *, fill, outline, anchor):
+        bubble.configure(
+            bg=fill,
+            highlightbackground=outline,
+            highlightcolor=outline,
+            highlightthickness=0,
+            bd=0,
+        )
+        side = 'e' if anchor == 'e' else 'w'
+        row = tk.Frame(parent, bg=self.colors['panel'])
+        row.pack(anchor=anchor)
+        tail = tk.Canvas(row, width=9, height=18, bg=self.colors['panel'], highlightthickness=0, bd=0)
+        if side == 'e':
+            bubble.pack(side=tk.LEFT)
+            tail.create_polygon(0, 4, 8, 9, 0, 14, fill=fill, outline=outline)
+            tail.pack(side=tk.LEFT, padx=(0, 1), pady=(12, 0))
+        else:
+            tail.create_polygon(9, 4, 1, 9, 9, 14, fill=fill, outline=outline)
+            tail.pack(side=tk.LEFT, padx=(1, 0), pady=(12, 0))
+            bubble.pack(side=tk.LEFT)
+        return None
+
+    def _resize_bubble_shell(self, container):
+        shell = getattr(container, '_bubble_shell', None)
+        bubble = getattr(container, '_message_bubble', None)
+        if shell is None or bubble is None or not shell.winfo_exists() or not bubble.winfo_exists():
+            return
+        bubble.update_idletasks()
+        tail = 9
+        width = max(80, bubble.winfo_reqwidth() + 8 + tail)
+        height = max(34, bubble.winfo_reqheight() + 8)
+        shell.configure(width=width, height=height)
+        window_id = getattr(shell, '_bubble_window', None)
+        if window_id is not None:
+            side = getattr(shell, '_bubble_side', 'w')
+            shell.coords(window_id, 4 if side == 'e' else 13, 4)
+            shell.itemconfigure(window_id, width=width - 8 - tail, height=height - 8)
+        self._paint_bubble_shell(shell)
+
+    def _paint_header_ornament(self, event=None):
+        canvas = self._chat_header_canvas
+        if canvas is None:
+            return
+        width = event.width if event is not None else canvas.winfo_width()
+        height = event.height if event is not None else canvas.winfo_height()
+        if width <= 2 or height <= 2:
+            return
+
+        gold = self.colors['gold']
+        gold_bright = self.colors['gold_bright']
+        gold_deep = self.colors['gold_deep']
+        cx = width // 2
+        cy = height // 2
+
+        canvas.delete('ornament')
+        canvas.create_rectangle(0, 0, width, height, fill=self.colors['bg'], outline='', tags='ornament')
+
+        # —— 朦胧云雾：左右两团柔白雾气 ——
+        canvas.create_oval(-70, -24, 180, height + 16, fill=self.colors['cloud'], outline='', stipple='gray50', tags='ornament')
+        canvas.create_oval(width - 180, -20, width + 70, height + 20, fill=self.colors['mist'], outline='', stipple='gray50', tags='ornament')
+
+        # —— 中央纹章留白：金线从两侧向中心延伸，止于卷草花纹 ——
+        gap = 46
+        canvas.create_line(20, cy, cx - gap, cy, fill=gold, width=1, tags='ornament')
+        canvas.create_line(cx + gap, cy, width - 20, cy, fill=gold, width=1, tags='ornament')
+        canvas.create_line(70, cy + 6, cx - gap - 10, cy + 6, fill=gold_bright, width=1, tags='ornament')
+        canvas.create_line(cx + gap + 10, cy + 6, width - 70, cy + 6, fill=gold_bright, width=1, tags='ornament')
+        self._draw_scroll_flourish(canvas, cx - gap, cy, -1, gold, 'ornament')
+        self._draw_scroll_flourish(canvas, cx + gap, cy, 1, gold, 'ornament')
+
+        # 金线沿途的小星点
+        for x in (44, width - 44):
+            self._draw_sparkle(canvas, x, cy, 4, gold_bright, 'ornament')
+
+        # —— 中央：新月 + 星 + 光芒 ——
+        r = min(11, height // 2 - 3)
+        # 新月（双弧叠出弯月轮廓）
+        canvas.create_arc(cx - r, cy - r, cx + r, cy + r, start=58, extent=244, style=tk.ARC, outline=gold, width=2, tags='ornament')
+        canvas.create_arc(cx - r + 5, cy - r, cx + r + 5, cy + r, start=74, extent=212, style=tk.ARC, outline=gold_deep, width=1, tags='ornament')
+        # 月牙怀中的星
+        self._draw_sparkle(canvas, cx + r - 3, cy - r + 4, 5, gold_bright, 'ornament', width=1)
+        # 自月牙向外发散的细微光芒
+        for ang in (-58, -30, -2, 26):
+            rad = math.radians(ang)
+            x1 = cx + (r + 2) * math.cos(rad)
+            y1 = cy + (r + 2) * math.sin(rad)
+            x2 = cx + (r + 6) * math.cos(rad)
+            y2 = cy + (r + 6) * math.sin(rad)
+            canvas.create_line(x1, y1, x2, y2, fill=gold_bright, width=1, tags='ornament')
+
+    def _paint_input_shell(self, event=None):
+        canvas = self._input_canvas
+        if canvas is None:
+            return
+        width = event.width if event is not None else canvas.winfo_width()
+        height = event.height if event is not None else canvas.winfo_height()
+        if width <= 2 or height <= 2:
+            return
+
+        gold = self.colors['gold']
+        gold_bright = self.colors['gold_bright']
+
+        canvas.delete('input_decor')
+        canvas.create_rectangle(0, 0, width, height, fill=self.colors['bg'], outline='', tags='input_decor')
+        # 朦胧底纹：输入框上方一抹薄雾
+        canvas.create_oval(width // 2 - 160, -30, width // 2 + 160, 26, fill=self.colors['cloud'], outline='', stipple='gray75', tags='input_decor')
+        # 双层金边
+        canvas.create_rectangle(12, 8, width - 12, height - 8, fill=self.colors['input_bg'], outline=gold, width=1, tags='input_decor')
+        canvas.create_rectangle(15, 11, width - 15, height - 11, outline=gold_bright, width=1, tags='input_decor')
+        # 四角金色卷草花纹
+        c = 12
+        for ox, oy, sx, sy in (
+            (12, 8, 1, 1), (width - 12, 8, -1, 1),
+            (12, height - 8, 1, -1), (width - 12, height - 8, -1, -1),
+        ):
+            canvas.create_line(ox, oy + sy * c, ox, oy, ox + sx * c, oy, fill=gold, width=1, tags='input_decor')
+            canvas.create_oval(ox + sx * (c - 1), oy + sy * (c - 1), ox + sx * (c + 2), oy + sy * (c + 2), fill=gold_bright, outline='', tags='input_decor')
+        # 顶部居中一颗小星点缀
+        self._draw_sparkle(canvas, width // 2, 11, 4, gold_bright, 'input_decor')
+        canvas.tag_lower('input_decor')
 
     def _update_input_background(self, event=None):
         if self._input_canvas is None or self._input_bg_source is None:
@@ -530,7 +1083,7 @@ class ChatWindow:
             was_at_bottom = yview[1] >= 0.99
         except Exception:
             pass
-        msg_char_width = self._pixels_to_chars(self._transcript_width - 60)
+        msg_char_width = self._pixels_to_chars(max(240, int(self._transcript_width)))
         char_width_changed = msg_char_width != self._last_message_char_width
         live_widgets = []
         for widget in self._message_widgets:
@@ -548,9 +1101,10 @@ class ChatWindow:
                         height=self._calc_text_display_lines(
                             plain_text,
                             msg_char_width,
-                            max_lines=40 if is_expanded else MAX_COLLAPSED_MESSAGE_LINES,
+                            max_lines=None if is_expanded else MAX_COLLAPSED_MESSAGE_LINES,
                         ),
                     )
+                    self._resize_bubble_shell(widget)
                     widget._message_full_line_count = self._calc_text_display_lines(
                         plain_text,
                         msg_char_width,
@@ -564,14 +1118,14 @@ class ChatWindow:
             try:
                 label = item.get('label')
                 if label is not None and label.winfo_exists():
-                    label.config(wraplength=max(240, self._transcript_width - 60))
+                    label.config(wraplength=max(240, self._transcript_width - 120))
             except Exception:
                 pass
         try:
             if self._tool_status_widget is not None:
                 label = self._tool_status_widget.get('label')
                 if label is not None and label.winfo_exists():
-                    label.config(wraplength=max(240, self._transcript_width - 60))
+                    label.config(wraplength=max(240, self._transcript_width - 140))
         except Exception:
             pass
         self._last_message_char_width = msg_char_width
@@ -593,9 +1147,31 @@ class ChatWindow:
         if self.text_area is None or not self._auto_follow_transcript:
             return
         try:
-            self.text_area.see(tk.END)
+            self._transcript_follow_generation += 1
+            generation = self._transcript_follow_generation
+            self._transcript_programmatic_update = True
+            self.text_area.yview_moveto(1.0)
+            self.text_area.after_idle(lambda gen=generation: self._settle_transcript_follow(gen, 0))
+        except Exception:
+            self._transcript_programmatic_update = False
+
+    def _settle_transcript_follow(self, generation: int, step: int):
+        if generation != self._transcript_follow_generation:
+            return
+        if self.text_area is None or not self.text_area.winfo_exists():
+            self._transcript_programmatic_update = False
+            return
+        try:
+            self.text_area.yview_moveto(1.0)
+            if step < 2:
+                self.text_area.after(35, lambda gen=generation, next_step=step + 1: self._settle_transcript_follow(gen, next_step))
+                return
+            self._auto_follow_transcript = self.text_area.yview()[1] >= 0.98
         except Exception:
             pass
+        finally:
+            if generation == self._transcript_follow_generation and step >= 2:
+                self._transcript_programmatic_update = False
 
     def _handle_transcript_scroll_activity(self, _event=None):
         self._capture_transcript_follow_state()
@@ -604,7 +1180,10 @@ class ChatWindow:
         if self.text_area is None:
             return
         try:
-            self._auto_follow_transcript = float(last) >= 0.98
+            if not self._transcript_programmatic_update:
+                self._auto_follow_transcript = float(last) >= 0.98
+            elif float(last) >= 0.98:
+                self._auto_follow_transcript = True
         except Exception:
             pass
         scrollbar = getattr(self, '_transcript_scrollbar', None)
@@ -638,6 +1217,185 @@ class ChatWindow:
             },
         )
 
+    def _toggle_top_controls(self):
+        self._top_controls_collapsed = not self._top_controls_collapsed
+        self._refresh_top_controls_visibility()
+
+    def _refresh_top_controls_visibility(self):
+        if self._top_controls_frame is None:
+            return
+        if self._top_controls_collapsed:
+            self._top_controls_frame.pack_forget()
+            if self._top_controls_toggle_button is not None:
+                self._top_controls_toggle_button.config(text='展开控制')
+            return
+        self._top_controls_frame.pack(fill=tk.X)
+        if self._top_controls_toggle_button is not None:
+            self._top_controls_toggle_button.config(text='收起控制')
+
+    def _create_agent_activity_panel(self, parent):
+        panel = create_card(
+            parent,
+            self.theme,
+            bg='card_alt',
+            border='border_strong',
+        )
+        panel.pack(fill=tk.X, pady=(0, 8))
+        panel.configure(bg=self.colors['card_alt'])
+        self._agent_activity_frame = panel
+
+        header = tk.Frame(panel, bg=self.colors['card_alt'])
+        header.pack(fill=tk.X, padx=14, pady=(12, 4))
+
+        dot = tk.Canvas(header, width=18, height=18, bg=self.colors['card_alt'], highlightthickness=0, bd=0)
+        dot.create_oval(4, 4, 14, 14, fill=self.colors['accent_dark'], outline='')
+        dot.create_oval(1, 1, 17, 17, outline=self.colors['accent_soft'], width=1)
+        dot.pack(side=tk.LEFT, padx=(0, 8))
+
+        tk.Label(
+            header,
+            text='Agent 工作台',
+            font=self.fonts['control'],
+            bg=self.colors['card_alt'],
+            fg=self.colors['text_strong'],
+            anchor='w',
+        ).pack(side=tk.LEFT)
+
+        self._agent_activity_badge = tk.Label(
+            header,
+            text='READY',
+            font=self.fonts['small'],
+            bg=self.colors['accent_soft'],
+            fg=self.colors['accent_dark'],
+            padx=8,
+            pady=2,
+        )
+        self._agent_activity_badge.pack(side=tk.RIGHT)
+        self._agent_activity_toggle_button = tk.Button(
+            header,
+            text='收起',
+            command=self._toggle_agent_activity,
+            font=self.fonts['small'],
+            bg=self.colors['card_alt'],
+            fg=self.colors['muted'],
+            activebackground=self.colors['hover'],
+            activeforeground=self.colors['text'],
+            relief=tk.FLAT,
+            bd=0,
+            cursor='hand2',
+            padx=8,
+            pady=1,
+        )
+        self._agent_activity_toggle_button.pack(side=tk.RIGHT, padx=(0, 8))
+
+        self._agent_activity_title = tk.Label(
+            panel,
+            text='',
+            font=self.fonts['base'],
+            bg=self.colors['card_alt'],
+            fg=self.colors['text_strong'],
+            justify='left',
+            anchor='w',
+            padx=14,
+        )
+        self._agent_activity_title.pack(fill=tk.X, pady=(2, 0))
+
+        detail_shell = tk.Frame(panel, bg=self.colors['panel'], highlightbackground=self.colors['border'], highlightthickness=1, bd=0)
+        detail_shell.pack(fill=tk.X, padx=14, pady=(8, 8))
+        self._agent_activity_detail = tk.Label(
+            detail_shell,
+            text='',
+            font=('Consolas', 9),
+            bg=self.colors['panel'],
+            fg=self.colors['muted'],
+            justify='left',
+            anchor='w',
+            padx=10,
+            pady=7,
+        )
+        self._agent_activity_detail.pack(fill=tk.X)
+
+        self._agent_activity_meta = tk.Label(
+            panel,
+            text='',
+            font=self.fonts['small'],
+            bg=self.colors['card_alt'],
+            fg=self.colors['subtext'],
+            justify='left',
+            anchor='w',
+            padx=14,
+        )
+        self._agent_activity_meta.pack(fill=tk.X, pady=(0, 12))
+        self._agent_activity_body_widgets = [detail_shell, self._agent_activity_meta]
+        self._set_agent_activity('idle', '待命', '请选择思维链并点击连接，或继续当前对话。', 'READY')
+
+    def _toggle_agent_activity(self):
+        self._agent_activity_collapsed = not self._agent_activity_collapsed
+        self._refresh_agent_activity_visibility()
+
+    def _refresh_agent_activity_visibility(self):
+        if self._agent_activity_toggle_button is not None:
+            self._agent_activity_toggle_button.config(text='展开' if self._agent_activity_collapsed else '收起')
+        if not self._agent_activity_body_widgets:
+            return
+        detail_shell = self._agent_activity_body_widgets[0]
+        meta_label = self._agent_activity_body_widgets[1]
+        if self._agent_activity_collapsed:
+            detail_shell.pack_forget()
+            meta_label.pack_forget()
+            return
+        detail_shell.pack(fill=tk.X, padx=14, pady=(8, 8), after=self._agent_activity_title)
+        meta_label.pack(fill=tk.X, pady=(0, 12), after=detail_shell)
+
+    def _set_agent_activity(self, phase: str, title: str, detail: str = '', badge: str = 'LIVE'):
+        if self._agent_activity_title is None or self._agent_activity_detail is None:
+            return
+        title_text = self._task_progress_compact_text(title) or 'Agent 正在工作'
+        detail_text = self._task_progress_compact_text(detail) or title_text
+        badge_text = self._task_progress_compact_text(badge) or 'LIVE'
+        meta = ' | '.join(
+            part for part in (
+                f'模式：{self._format_mode_status()}',
+                f'思维链：{self._format_connection_status()}',
+                datetime.now().strftime('%H:%M:%S'),
+            )
+            if part
+        )
+        wraplength = max(260, self._transcript_width - 80)
+        self._agent_activity_title.config(text=title_text, wraplength=wraplength)
+        self._agent_activity_detail.config(text=detail_text, wraplength=wraplength)
+        self._agent_activity_badge.config(text=badge_text)
+        self._agent_activity_meta.config(text=meta)
+        self._refresh_agent_activity_visibility()
+
+    def _set_status_and_agent(self, text: str, title: str = '状态更新', badge: str = 'STATUS'):
+        compact = self._task_progress_compact_text(text)
+        if not compact:
+            return
+        self.status_var.set(compact)
+        self._set_agent_activity('status', title, compact, badge)
+
+    def _timeline_timestamp(self) -> str:
+        return datetime.now().strftime('%H:%M:%S')
+
+    def _timeline_append(self, item: dict):
+        item.setdefault('timestamp', self._timeline_timestamp())
+        rendered = self._timeline_store.append(item)
+        self._timeline_renderer.render(rendered)
+        return rendered
+
+    def _timeline_upsert(self, key: str, item: dict):
+        item.setdefault('timestamp', self._timeline_timestamp())
+        rendered, _created = self._timeline_store.upsert(key, item)
+        self._timeline_renderer.render(rendered)
+        return rendered
+
+    def _timeline_complete(self, key: str, patch: dict):
+        rendered = self._timeline_store.complete(key, patch)
+        if rendered is not None:
+            self._timeline_renderer.render(rendered)
+        return rendered
+
     def show(self):
         if self.window is not None and self.window.winfo_exists():
             self.window.lift()
@@ -647,7 +1405,6 @@ class ChatWindow:
             return
 
         self._create_window()
-        self._start_session()
         self.window.after(EVENT_POLL_INTERVAL_MS, self._drain_events)
         # 初次把窗口放到桌宠附近；之后由桌宠的 window_snap 逻辑自动附着到本窗口
         # 顶部（与贴靠微信的机制一致），无需窗口反向跟随桌宠。
@@ -722,45 +1479,69 @@ class ChatWindow:
 
         title_row = tk.Frame(header, bg=self.colors['bg'])
         title_row.pack(fill=tk.X)
+        title_text = tk.Frame(title_row, bg=self.colors['bg'])
+        title_text.pack(side=tk.LEFT, fill=tk.X, expand=True)
         tk.Label(
-            title_row,
+            title_text,
             text='与奥黛丽聊聊',
             font=self.fonts['title'],
             bg=self.colors['bg'],
-            fg=self.colors['text'],
-        ).pack(side=tk.LEFT)
+            fg=self.colors['text_strong'],
+            anchor='w',
+        ).pack(fill=tk.X)
+        tk.Label(
+            title_text,
+            text='Audrey Hall x Claude Code',
+            font=self.fonts['small'],
+            bg=self.colors['bg'],
+            fg=self.colors['muted'],
+            anchor='w',
+        ).pack(fill=tk.X, pady=(4, 0))
+        self._top_controls_toggle_button = create_button(
+            title_row,
+            text='收起控制',
+            command=self._toggle_top_controls,
+            theme=self.theme,
+            variant='secondary',
+            font=self.fonts['small'],
+            style_overrides=self._aurora_button_style(),
+            padx=8,
+            pady=4,
+        )
+        self._top_controls_toggle_button.pack(side=tk.RIGHT, pady=(0, 4))
+        self._chat_header_canvas = tk.Canvas(
+            header,
+            height=46,
+            bg=self.colors['bg'],
+            highlightthickness=0,
+            bd=0,
+        )
+        self._chat_header_canvas.pack(fill=tk.X, pady=(10, 2))
+        self._chat_header_canvas.bind('<Configure>', self._paint_header_ornament, add='+')
         tk.Label(
             title_row,
             textvariable=self._connection_time_var,
             font=self.fonts['small'],
             bg=self.colors['bg'],
             fg=self.colors['accent'],
-        ).pack(side=tk.RIGHT, pady=(0, 4))
+        ).pack(side=tk.RIGHT, padx=(0, 10), pady=(0, 4))
 
+        top_controls = tk.Frame(header, bg=self.colors['bg'])
+        top_controls.pack(fill=tk.X)
+        self._top_controls_frame = top_controls
         tk.Label(
-            header,
-            text='Audrey Hall x Claude Code',
-            font=self.fonts['small'],
-            bg=self.colors['bg'],
-            fg=self.colors['muted'],
-        ).pack(anchor='w', pady=(4, 0))
-
-        tk.Label(
-            header,
+            top_controls,
             textvariable=self._session_label_var,
             font=self.fonts['small'],
             bg=self.colors['bg'],
             fg=self.colors['muted'],
         ).pack(anchor='w', pady=(6, 0))
 
-        connection_row = tk.Frame(header, bg=self.colors['bg'])
-        connection_row.pack(fill=tk.X, pady=(10, 0))
-
-        connection_button_row = tk.Frame(connection_row, bg=self.colors['bg'])
-        connection_button_row.pack(fill=tk.X)
+        controls_row = tk.Frame(top_controls, bg=self.colors['bg'])
+        controls_row.pack(fill=tk.X, pady=(10, 0))
         reconnect_button = create_button(
-            connection_button_row,
-            text='再次呼唤',
+            controls_row,
+            text='连接',
             command=lambda: self._reconnect_session(announce=True),
             theme=self.theme,
             variant='secondary',
@@ -771,7 +1552,7 @@ class ChatWindow:
         )
         reconnect_button.pack(side=tk.RIGHT)
         connection_dropdown = create_dropdown(
-            connection_button_row,
+            controls_row,
             theme=self.theme,
             label='连接目标',
             value_getter=lambda: self._connection_var.get(),
@@ -780,16 +1561,11 @@ class ChatWindow:
             font=self.fonts['small'],
             width=240,
         )
-        connection_dropdown.pack(side=tk.LEFT, anchor='w')
+        connection_dropdown.pack(side=tk.LEFT, anchor='w', padx=(0, 10))
         self._refresh_connection_buttons()
 
-        mode_row = tk.Frame(header, bg=self.colors['bg'])
-        mode_row.pack(fill=tk.X, pady=(10, 0))
-
-        mode_button_row = tk.Frame(mode_row, bg=self.colors['bg'])
-        mode_button_row.pack(fill=tk.X)
         mode_dropdown = create_dropdown(
-            mode_button_row,
+            controls_row,
             theme=self.theme,
             label='当前模式',
             value_getter=lambda: self._mode_var.get(),
@@ -798,13 +1574,11 @@ class ChatWindow:
             font=self.fonts['small'],
             width=300,
         )
-        mode_dropdown.pack(side=tk.LEFT, anchor='w')
+        mode_dropdown.pack(side=tk.LEFT, anchor='w', padx=(0, 10))
         self._refresh_mode_buttons()
 
-        terminal_row = tk.Frame(header, bg=self.colors['bg'])
-        terminal_row.pack(fill=tk.X, pady=(10, 0))
         self._terminal_button = create_button(
-            terminal_row,
+            controls_row,
             text='打开过程视图',
             command=self._toggle_terminal_view,
             theme=self.theme,
@@ -815,15 +1589,8 @@ class ChatWindow:
             pady=5,
         )
         self._terminal_button.pack(side=tk.LEFT)
-        tk.Label(
-            terminal_row,
-            text='过程视图承载过程流与原始输出，主界面只保留对话。',
-            font=self.fonts['small'],
-            bg=self.colors['bg'],
-            fg=self.colors['muted'],
-            anchor='w',
-        ).pack(side=tk.LEFT, padx=(12, 0))
         self._refresh_terminal_button()
+        self._agent_activity_packed = False
 
         # 先把底部的输入区和按钮行用 side=BOTTOM 占住空间，再让会话区填充剩余
         # 区域。这样无论窗口被压到多小（高 DPI / 小屏），输入框都不会被会话区
@@ -832,14 +1599,10 @@ class ChatWindow:
         button_row.pack(side=tk.BOTTOM, fill=tk.X, pady=(self.window_theme['button_gap'], 0))
         status_row = tk.Frame(button_row, bg=self.colors['bg'])
         status_row.pack(fill=tk.X)
-        action_row_primary = tk.Frame(button_row, bg=self.colors['bg'])
-        action_row_primary.pack(fill=tk.X, pady=(8, 0))
-        action_row_secondary = tk.Frame(button_row, bg=self.colors['bg'])
-        action_row_secondary.pack(fill=tk.X, pady=(8, 0))
-        action_group_primary = tk.Frame(action_row_primary, bg=self.colors['bg'])
-        action_group_primary.pack(side=tk.RIGHT)
-        action_group_secondary = tk.Frame(action_row_secondary, bg=self.colors['bg'])
-        action_group_secondary.pack(side=tk.RIGHT)
+        action_row = tk.Frame(button_row, bg=self.colors['bg'])
+        action_row.pack(fill=tk.X, pady=(8, 0))
+        action_group = tk.Frame(action_row, bg=self.colors['bg'])
+        action_group.pack(side=tk.RIGHT)
 
         composer = tk.Frame(content_frame, bg=self.colors['bg'])
         composer.pack(side=tk.BOTTOM, fill=tk.X, pady=(self.window_theme['composer_gap'], 0))
@@ -847,9 +1610,12 @@ class ChatWindow:
         self._attachment_preview_frame = tk.Frame(composer, bg=self.colors['bg'])
         self._attachment_preview_frame.pack(fill=tk.X, pady=(0, 6))
 
+        input_shell_height = max(96, self.window_theme['input_height'] * 24 + self.chat_theme['input_pad_y'] * 2)
+        self._input_shell_min_height = input_shell_height
+        self._input_shell_max_height = 220
         input_shell = tk.Canvas(
             composer,
-            height=max(96, self.window_theme['input_height'] * 24 + self.chat_theme['input_pad_y'] * 2),
+            height=input_shell_height,
             bg=self.colors['bg'],
             highlightthickness=0,
             bd=0,
@@ -905,15 +1671,15 @@ class ChatWindow:
         self.text_area.tag_configure('task_progress', foreground=self.colors['muted'])
         # ── 终端风格标签 ──────────────────────────────────────────
         self.text_area.tag_configure(
-            'term_tool', foreground='#3D8884',
+            'term_tool', foreground='#4F827B',
             font=('Consolas', 10, 'bold'),
         )
         self.text_area.tag_configure(
-            'term_tool_detail', foreground='#6B8587',
+            'term_tool_detail', foreground='#638083',
             font=('Consolas', 9),
         )
         self.text_area.tag_configure(
-            'term_result', foreground='#555548',
+            'term_result', foreground='#5C624F',
             font=('Consolas', 9),
         )
         self.text_area.tag_configure(
@@ -921,7 +1687,7 @@ class ChatWindow:
             font=self.fonts['small'],
         )
         self.text_area.tag_configure(
-            'term_prefix', foreground='#A09078',
+            'term_prefix', foreground='#8D6835',
             font=('Consolas', 9),
         )
         self.text_area.tag_configure(
@@ -943,13 +1709,13 @@ class ChatWindow:
         # 思考标题行——可点击切换折叠/展开
         self.text_area.tag_configure(
             'term_thinking_header',
-            foreground='#6B5E4B',
+            foreground='#8D6835',
             font=('Consolas', 9, 'bold'),
             underline=False,
         )
         # 思考内容展开时的文本
         self.text_area.tag_configure(
-            'term_thinking', foreground='#8B7E6B',
+            'term_thinking', foreground='#6F817F',
             font=('Consolas', 9),
         )
         # 绑定点击事件：点击 thinking_toggle 标签区切换折叠
@@ -972,7 +1738,7 @@ class ChatWindow:
             height=self.window_theme['input_height'],
             wrap=tk.WORD,
             font=self.fonts['base'],
-            bg='#E3EFE8',
+            bg=self.colors['input_bg'],
             fg=self.colors['text'],
             relief=tk.FLAT,
             insertbackground=self.colors['accent_dark'],
@@ -989,12 +1755,16 @@ class ChatWindow:
             width=max(1, win_w - self.window_theme['outer_pad'] * 2 - 36),
             height=max(1, int(input_shell.cget('height')) - 28),
         )
+        self._input_window_id = input_window_id
         input_shell.bind(
             '<Configure>',
-            lambda event: input_shell.itemconfigure(
-                input_window_id,
-                width=max(1, event.width - 36),
-                height=max(1, event.height - 28),
+            lambda event: (
+                input_shell.itemconfigure(
+                    input_window_id,
+                    width=max(1, event.width - 36),
+                    height=max(1, event.height - 28),
+                ),
+                self._paint_input_shell(event),
             ),
             add='+',
         )
@@ -1002,7 +1772,20 @@ class ChatWindow:
         self.input_box.bind('<Control-v>', self._handle_input_paste, add='+')
         self.input_box.bind('<Control-V>', self._handle_input_paste, add='+')
         self.input_box.bind('<<Paste>>', self._handle_input_paste, add='+')
+        self.input_box.bind('<KeyRelease>', self._resize_input_to_content, add='+')
+        self.input_box.bind('<<Modified>>', self._handle_input_modified, add='+')
+        self._resize_input_to_content()
 
+        self._status_dot = tk.Canvas(
+            status_row,
+            width=12,
+            height=12,
+            bg=self.colors['bg'],
+            highlightthickness=0,
+            bd=0,
+        )
+        self._status_dot.pack(side=tk.LEFT, padx=(0, 7), pady=(0, 1))
+        self._status_dot_item = self._status_dot.create_oval(2, 2, 10, 10, fill=self.colors['border_strong'], outline='')
         tk.Label(
             status_row,
             textvariable=self.status_var,
@@ -1012,7 +1795,7 @@ class ChatWindow:
         ).pack(side=tk.LEFT)
 
         self.stop_button = create_button(
-            action_group_primary,
+            action_group,
             text='中止对话',
             command=self._on_stop,
             theme=self.theme,
@@ -1024,7 +1807,7 @@ class ChatWindow:
         self.stop_button.pack(side=tk.LEFT, padx=(0, 8))
 
         upload_button = create_button(
-            action_group_secondary,
+            action_group,
             text='上传图片',
             command=self._handle_image_upload,
             theme=self.theme,
@@ -1036,7 +1819,7 @@ class ChatWindow:
         upload_button.pack(side=tk.LEFT, padx=(0, 8))
 
         self.send_button = create_button(
-            action_group_primary,
+            action_group,
             text='发送',
             command=self._on_send,
             theme=self.theme,
@@ -1048,7 +1831,7 @@ class ChatWindow:
         self.send_button.pack(side=tk.LEFT, padx=(0, 8))
 
         clear_button = create_button(
-            action_group_secondary,
+            action_group,
             text='清除对话',
             command=self._clear_conversation,
             theme=self.theme,
@@ -1070,12 +1853,12 @@ class ChatWindow:
     def _build_history_sidebar(self, parent):
         tk.Label(
             parent,
-            text='AURORA HISTORY',
+            text='AURORA SALON',
             font=self.fonts['small'],
             bg=self.colors['panel'],
             fg=self.colors['gold'],
             anchor='w',
-        ).pack(fill=tk.X, padx=12, pady=(12, 4))
+        ).pack(fill=tk.X, padx=14, pady=(14, 4))
         tk.Label(
             parent,
             text='最近会话',
@@ -1083,10 +1866,33 @@ class ChatWindow:
             bg=self.colors['panel'],
             fg=self.colors['text'],
             anchor='w',
-        ).pack(fill=tk.X, padx=12)
+        ).pack(fill=tk.X, padx=14)
+
+        ornament = tk.Canvas(parent, height=22, bg=self.colors['panel'], highlightthickness=0, bd=0)
+        ornament.pack(fill=tk.X, padx=14, pady=(4, 4))
+
+        def _paint_sidebar_ornament(event):
+            width = event.width
+            mid = width // 2
+            gold = self.colors['gold']
+            gold_bright = self.colors['gold_bright']
+            ornament.delete('all')
+            # 两侧渐隐金线，向中央纹章收束
+            ornament.create_line(0, 11, mid - 18, 11, fill=self.colors['gold_soft'], width=1)
+            ornament.create_line(mid + 18, 11, width, 11, fill=self.colors['gold_soft'], width=1)
+            ornament.create_line(14, 14, mid - 24, 14, fill=gold_bright, width=1)
+            ornament.create_line(mid + 24, 14, width - 14, 14, fill=gold_bright, width=1)
+            # 中央：新月抱星
+            ornament.create_arc(mid - 8, 3, mid + 8, 19, start=60, extent=240, style=tk.ARC, outline=gold, width=1)
+            self._draw_sparkle(ornament, mid + 4, 8, 4, gold_bright, 'sb_orn')
+            # 线端小星
+            for x in (mid - 18, mid + 18):
+                self._draw_sparkle(ornament, x, 11, 3, gold, 'sb_orn')
+
+        ornament.bind('<Configure>', _paint_sidebar_ornament, add='+')
 
         toolbar = tk.Frame(parent, bg=self.colors['panel'])
-        toolbar.pack(fill=tk.X, padx=12, pady=(10, 8))
+        toolbar.pack(fill=tk.X, padx=12, pady=(8, 8))
         create_button(
             toolbar,
             text='新建会话',
@@ -1114,6 +1920,7 @@ class ChatWindow:
         list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
 
         canvas = tk.Canvas(list_frame, bg=self.colors['panel'], highlightthickness=0, bd=0)
+        self._history_canvas = canvas
         scrollbar = tk.Scrollbar(list_frame, orient=tk.VERTICAL, command=canvas.yview)
         canvas.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
@@ -1130,6 +1937,25 @@ class ChatWindow:
 
         canvas.bind('<Configure>', _sync_history_width, add='+')
         self._history_container.bind('<Configure>', _sync_history_scroll, add='+')
+
+        def _scroll_history_wheel(event):
+            if self._history_canvas is None:
+                return None
+            try:
+                if getattr(event, 'num', None) == 4:
+                    delta = -1
+                elif getattr(event, 'num', None) == 5:
+                    delta = 1
+                else:
+                    delta = -1 if event.delta > 0 else 1
+                self._history_canvas.yview_scroll(delta, 'units')
+                return 'break'
+            except Exception:
+                return None
+
+        for wheel_event in ('<MouseWheel>', '<Button-4>', '<Button-5>'):
+            canvas.bind(wheel_event, _scroll_history_wheel, add='+')
+            self._history_container.bind(wheel_event, _scroll_history_wheel, add='+')
 
         self._history_empty_label = tk.Label(
             self._history_container,
@@ -1244,7 +2070,31 @@ class ChatWindow:
     def _current_session_id(self) -> str:
         return (self._active_session_id or self._resume_session_id or '').strip()
 
-    def _refresh_history_sidebar(self):
+    def _history_scroll_fraction(self) -> float | None:
+        canvas = self._history_canvas
+        if canvas is None or not canvas.winfo_exists():
+            return None
+        try:
+            first, _last = canvas.yview()
+            return float(first)
+        except Exception:
+            return None
+
+    def _restore_history_scroll_fraction(self, fraction: float | None):
+        if fraction is None:
+            return
+        canvas = self._history_canvas
+        if canvas is None or not canvas.winfo_exists():
+            return
+        try:
+            canvas.update_idletasks()
+            canvas.configure(scrollregion=canvas.bbox('all'))
+            canvas.yview_moveto(max(0.0, min(1.0, float(fraction))))
+        except Exception:
+            pass
+
+    def _refresh_history_sidebar(self, *, preserve_scroll: bool = True):
+        saved_scroll = self._history_scroll_fraction() if preserve_scroll else None
         self._history_items = self._read_recent_sessions()
         if self._history_container is None:
             return
@@ -1264,19 +2114,55 @@ class ChatWindow:
                 wraplength=220,
             )
             self._history_empty_label.pack(fill=tk.X, padx=6, pady=6)
+            self._restore_history_scroll_fraction(saved_scroll)
             return
 
-        for item in self._history_items:
-            self._render_history_item(item)
+        for index, item in enumerate(self._history_items):
+            card = self._render_history_item(item)
+            if card is None:
+                continue
+            # 列表入场错峰：先收起，再按 45ms 步长依次浮现，符合 stagger-sequence
+            try:
+                card.pack_forget()
+            except Exception:
+                pass
+            if self.window is not None:
+                self.window.after(index * 45, lambda c=card: self._reveal_history_card(c))
+            else:
+                self._reveal_history_card(card)
+        if saved_scroll is not None and self.window is not None:
+            self.window.after(len(self._history_items) * 45 + 20, lambda s=saved_scroll: self._restore_history_scroll_fraction(s))
+        else:
+            self._restore_history_scroll_fraction(saved_scroll)
+
+    def _reveal_history_card(self, card):
+        if card is None or not card.winfo_exists():
+            return
+        try:
+            card.pack(fill=tk.X, padx=4, pady=4)
+        except Exception:
+            pass
 
     def _render_history_item(self, item: dict):
         session_id = item.get('session_id') or ''
         is_active = session_id == self._current_session_id()
-        card_bg = '#F8FBFA' if not is_active else '#F3E3BF'
-        border = '#D6B36A' if is_active else '#D8E8E4'
-        card = tk.Frame(self._history_container, bg=border, bd=0, highlightthickness=0, cursor='hand2')
-        inner = tk.Frame(card, bg=card_bg, bd=0, highlightthickness=0)
-        inner.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+
+        # 配色：静止 / 悬停 / 选中 三态，悬停时文字转金，边框做金绿循环呼吸。
+        rail_rest = self.colors['gold'] if is_active else '#DCEFE8'
+        border_rest = self.colors['gold'] if is_active else '#DCEFE8'
+        bg_rest = '#FFFDF4' if is_active else self.colors['card_bg']
+        fg_rest = self.colors['text_strong']
+        summary_fg_rest = self.colors['muted']
+        fg_hot = self.colors['gold']
+
+        card = tk.Frame(self._history_container, bg=border_rest, bd=0, highlightthickness=0, cursor='hand2')
+        body = tk.Frame(card, bg=bg_rest, bd=0, highlightthickness=0)
+        body.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+        # 左侧强调竖条：选中=金色实条，普通=浅青；是 nav-state-active 的视觉锚点
+        rail = tk.Frame(body, width=4, bg=rail_rest)
+        rail.pack(side=tk.LEFT, fill=tk.Y)
+        inner = tk.Frame(body, bg=bg_rest, bd=0, highlightthickness=0)
+        inner.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         card.pack(fill=tk.X, padx=4, pady=4)
 
         title = item.get('title') or item.get('session_id')
@@ -1284,40 +2170,42 @@ class ChatWindow:
         timestamp = self._format_history_timestamp(item.get('timestamp') or '')
 
         # 标题行：标题 + 删除按钮
-        title_row = tk.Frame(inner, bg=card_bg)
+        title_row = tk.Frame(inner, bg=bg_rest)
         title_row.pack(fill=tk.X, padx=10, pady=(8, 2))
-        tk.Label(
+        title_label = tk.Label(
             title_row,
             text=title,
             font=self.fonts['control'],
-            bg=card_bg,
+            bg=bg_rest,
             fg=self.colors['text_strong'],
             justify='left',
             anchor='w',
-            wraplength=180,
-        ).pack(side=tk.LEFT)
+            wraplength=176,
+        )
+        title_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         delete_btn = tk.Label(
             title_row,
-            text='✕',
-            font=self.fonts['small'],
-            bg=card_bg,
-            fg='#C07B7B',
+            text='×',
+            font=self.fonts['control'],
+            bg=bg_rest,
+            fg='#B93D3D',
             cursor='hand2',
-            padx=6,
+            padx=8,
+            pady=1,
         )
-        delete_btn.pack(side=tk.RIGHT)
+        delete_btn.pack(side=tk.RIGHT, padx=(8, 0))
 
         def handle_delete(_event=None, sid=session_id):
             self._delete_session(sid)
             return 'break'
 
         delete_btn.bind('<Button-1>', handle_delete, add='+')
-        # Tooltip effect on hover
+        # 删除按钮悬停轻微提示
         def _on_delete_enter(_event, btn=delete_btn):
             btn.configure(fg='#D43D3D')
         def _on_delete_leave(_event, btn=delete_btn):
-            btn.configure(fg='#C07B7B')
+            btn.configure(fg='#B93D3D')
         delete_btn.bind('<Enter>', _on_delete_enter, add='+')
         delete_btn.bind('<Leave>', _on_delete_leave, add='+')
 
@@ -1331,43 +2219,116 @@ class ChatWindow:
                 self._history_context_menu.grab_release()
             return 'break'
 
+        bg_widgets = [body, inner, title_row, title_label]
         if summary:
-            tk.Label(
+            summary_label = tk.Label(
                 inner,
                 text=summary,
                 font=self.fonts['small'],
-                bg=card_bg,
+                bg=bg_rest,
                 fg=self.colors['muted'],
                 justify='left',
                 anchor='w',
-                wraplength=208,
-            ).pack(fill=tk.X, padx=10)
-        tk.Label(
+                wraplength=204,
+            )
+            summary_label.pack(fill=tk.X, padx=10)
+            bg_widgets.append(summary_label)
+            card._summary_labels = (summary_label,)
+        meta_label = tk.Label(
             inner,
-            text=f'{timestamp}  {session_id[:8]}',
+            text=f'{timestamp}  ·  {session_id[:8]}',
             font=self.fonts['small'],
-            bg=card_bg,
+            bg=bg_rest,
             fg=self.colors['subtext'],
             justify='left',
             anchor='w',
-        ).pack(fill=tk.X, padx=10, pady=(6, 8))
+        )
+        meta_label.pack(fill=tk.X, padx=10, pady=(6, 8))
+        bg_widgets.append(meta_label)
+        if not hasattr(card, '_summary_labels'):
+            card._summary_labels = ()
+
+        # 悬停过渡：卡片底色保持克制，文字转金；边框/左条由独立循环动画驱动。
+        def _apply_card_colors(colors, _card=card, _rail=rail, _bgs=tuple(bg_widgets), _del=delete_btn):
+            try:
+                _card.config(bg=colors['border'])
+                _rail.config(bg=colors['rail'])
+                for w in _bgs:
+                    w.config(bg=colors['bg'])
+                _del.config(bg=colors['bg'])
+                title_label.config(fg=colors['fg'])
+                meta_label.config(fg=colors['meta_fg'])
+                for extra in getattr(card, '_summary_labels', ()):
+                    extra.config(fg=colors['summary_fg'])
+            except Exception:
+                pass
+
+        tween = ColorTween(card, _apply_card_colors, duration_ms=170, steps=11)
+        rest_colors = {'border': border_rest, 'rail': rail_rest, 'bg': bg_rest, 'fg': fg_rest, 'summary_fg': summary_fg_rest, 'meta_fg': self.colors['subtext']}
+        hot_colors = {'border': self.colors['gold'], 'rail': self.colors['gold'], 'bg': bg_rest, 'fg': fg_hot, 'summary_fg': fg_hot, 'meta_fg': fg_hot}
+        tween.set_immediate(rest_colors)
+        card._hover_tween = tween
+        card._pulse_job = None
+        card._pulse_index = 0
 
         def handle_click(_event=None, target_session_id=session_id):
             self._resume_history_session(target_session_id)
             return 'break'
 
-        for widget in (card, inner):
-            widget.bind('<Button-1>', handle_click, add='+')
-            widget.bind('<Button-3>', show_context_menu, add='+')
-        for widget in inner.winfo_children():
+        def _pointer_in_card(_card=card):
+            try:
+                px, py = _card.winfo_pointerxy()
+                x0 = _card.winfo_rootx()
+                y0 = _card.winfo_rooty()
+                return (x0 <= px < x0 + _card.winfo_width()) and (y0 <= py < y0 + _card.winfo_height())
+            except Exception:
+                return False
+
+        def _cancel_card_pulse(_card=card):
+            job = getattr(_card, '_pulse_job', None)
+            if job is not None:
+                try:
+                    _card.after_cancel(job)
+                except Exception:
+                    pass
+                _card._pulse_job = None
+
+        def _run_card_pulse(_card=card, _rail=rail):
+            if not _card.winfo_exists():
+                return
+            try:
+                progress = getattr(_card, '_pulse_index', 0) / 28
+                if progress <= 0.5:
+                    color = _blend_colors(self.colors['gold'], self.colors['accent'], progress * 2)
+                else:
+                    color = _blend_colors(self.colors['accent'], self.colors['gold'], (progress - 0.5) * 2)
+                _card.config(bg=color)
+                _rail.config(bg=color)
+                _card._pulse_index = 0 if getattr(_card, '_pulse_index', 0) >= 28 else getattr(_card, '_pulse_index', 0) + 1
+                _card._pulse_job = _card.after(38, _run_card_pulse)
+            except Exception:
+                _card._pulse_job = None
+
+        def _hover_on(_event, _tween=tween, _hot=hot_colors):
+            _tween.animate_to(_hot, duration_ms=170)
+            if getattr(card, '_pulse_job', None) is None:
+                card._pulse_index = 0
+                _run_card_pulse()
+
+        def _hover_off(_event, _tween=tween, _rest=rest_colors):
+            # 仅当指针真正离开整张卡片时复位，避免在子组件间穿梭导致闪烁
+            if not _pointer_in_card():
+                _cancel_card_pulse()
+                _tween.animate_to(_rest, duration_ms=130)
+
+        all_widgets = [card, body, inner, rail, title_row, *bg_widgets]
+        for widget in all_widgets:
             widget.bind('<Button-1>', handle_click, add='+')
             if widget is not delete_btn:
                 widget.bind('<Button-3>', show_context_menu, add='+')
-            # 递归绑定子组件的子组件（如 title_row 内的 Label）
-            for grandchild in widget.winfo_children():
-                if grandchild is not delete_btn:
-                    grandchild.bind('<Button-1>', handle_click, add='+')
-                    grandchild.bind('<Button-3>', show_context_menu, add='+')
+            widget.bind('<Enter>', _hover_on, add='+')
+            widget.bind('<Leave>', _hover_off, add='+')
+        return card
 
     def _format_history_timestamp(self, value: str) -> str:
         if not value:
@@ -1480,9 +2441,16 @@ class ChatWindow:
     def _reset_transcript_view(self):
         self._conversation_history = []
         self._pending_perm_frames = {}
+        self._pending_question_cards = {}
         self._message_widgets = []
         self._task_widgets = {}
         self._tool_status_widget = None
+        self._timeline_store.clear()
+        self._timeline_renderer.clear()
+        self._processed_conversation_events.clear()
+        self._last_streaming_text_key = ''
+        self._using_conversation_events = False
+        self._turn_terminal_summaries.clear()
         self._last_message_char_width = None
         self._last_status_texts.clear()
         self._last_thinking_tokens = None
@@ -1496,7 +2464,7 @@ class ChatWindow:
             self.text_area.config(state=tk.NORMAL)
             self.text_area.delete('1.0', tk.END)
             self.text_area.config(state=tk.DISABLED)
-        self.status_var.set('正在唤醒奥黛丽的助手...')
+        self._set_status_and_agent('正在唤醒奥黛丽的助手...', '正在连接', 'BOOTING')
 
     def _load_session_transcript_preview(self, session_id: str):
         project_dir = self._history_project_dir()
@@ -1602,6 +2570,40 @@ class ChatWindow:
         added_count = self._add_images_from_clipboard()
         if added_count > 0:
             return 'break'
+        self._schedule_ui(self._resize_input_to_content)
+        return None
+
+    def _handle_input_modified(self, _event=None):
+        if self.input_box is None:
+            return None
+        try:
+            if not self.input_box.edit_modified():
+                return None
+            self.input_box.edit_modified(False)
+        except Exception:
+            pass
+        self._resize_input_to_content()
+        return None
+
+    def _resize_input_to_content(self, _event=None):
+        if self.input_box is None or self._input_canvas is None or self._input_window_id is None:
+            return None
+        try:
+            self.input_box.update_idletasks()
+            line_count = int(float(self.input_box.index('end-1c').split('.')[0]))
+            line_px = max(18, tkfont.Font(font=self.fonts['base']).metrics('linespace'))
+            desired = line_count * line_px + self.chat_theme['input_pad_y'] * 2 + 28
+            desired = max(self._input_shell_min_height, min(self._input_shell_max_height, desired))
+            current = int(float(self._input_canvas.cget('height')))
+            if desired != current:
+                self._input_canvas.configure(height=desired)
+            self._input_canvas.itemconfigure(
+                self._input_window_id,
+                height=max(1, desired - 28),
+            )
+            self._paint_input_shell()
+        except Exception:
+            pass
         return None
 
     def _is_local_only_command(self, text: str) -> bool:
@@ -1679,7 +2681,7 @@ class ChatWindow:
             return
 
         self._refresh_attachment_preview()
-        self.status_var.set(f'已添加 {added_count} 张图片，等待发送。')
+        self._set_status_and_agent(f'已添加 {added_count} 张图片，等待发送。', '图片附件', 'READY')
         if self.input_box is not None:
             self.input_box.focus_set()
 
@@ -1746,7 +2748,7 @@ class ChatWindow:
 
         if added_count > 0:
             self._refresh_attachment_preview()
-            self.status_var.set(f'已从剪贴板添加 {added_count} 张图片。')
+            self._set_status_and_agent(f'已从剪贴板添加 {added_count} 张图片。', '图片附件', 'READY')
             if self.input_box is not None:
                 self.input_box.focus_set()
         return added_count
@@ -1810,9 +2812,9 @@ class ChatWindow:
         self._pending_image_attachments.pop(index)
         self._refresh_attachment_preview()
         if self._pending_image_attachments:
-            self.status_var.set(f'还剩 {len(self._pending_image_attachments)} 张待发送图片。')
+            self._set_status_and_agent(f'还剩 {len(self._pending_image_attachments)} 张待发送图片。', '图片附件', 'READY')
         else:
-            self.status_var.set('图片附件已清空。')
+            self._set_status_and_agent('图片附件已清空。', '图片附件', 'READY')
 
     def _clear_pending_image_attachments(self):
         if not self._pending_image_attachments:
@@ -1826,12 +2828,15 @@ class ChatWindow:
         if not text and not has_attachments:
             return
 
+        intent = self._command_intents.detect(text)
+
         if has_attachments and self._is_local_only_command(text):
             self._append_inline_status('图片附件暂不支持 /model、/mode、/btw、/raw 这类本地命令。')
             return
 
-        if text and self._handle_local_command(text):
+        if text and intent.get('intent') not in {'normal', 'side_question_confirm'} and self._handle_local_command(text, intent=intent):
             self.input_box.delete('1.0', tk.END)
+            self._resize_input_to_content()
             return
 
         if self._busy:
@@ -1841,12 +2846,14 @@ class ChatWindow:
             self._append_inline_status(f'旁路提问：{text}')
             self._handle_btw_command(text)
             self.input_box.delete('1.0', tk.END)
+            self._resize_input_to_content()
             return
 
         display_text = self._build_user_display_text(text)
         message_content = self._build_user_message_content(text)
         if self._submit_prompt(message_content, display_text=display_text):
             self.input_box.delete('1.0', tk.END)
+            self._resize_input_to_content()
             self._clear_pending_image_attachments()
 
     def _submit_prompt(self, message_content: str | list[dict], display_text: str | None = None):
@@ -1862,6 +2869,10 @@ class ChatWindow:
         visible_text = (display_text or '').strip() or prompt_text
         if not visible_text:
             return False
+        if not self._session_connected or self.session.process is None:
+            self._set_status_and_agent(self._compose_status_text('请先选择思维链并点击连接，再发送消息。'), '需要连接', 'ACTION')
+            self._append_inline_status('请先选择思维链并点击连接，再发送消息。')
+            return False
 
         # 新轮次开始前彻底清理上一轮的状态缓存，防止去重逻辑复用旧值
         self._last_status_texts.clear()
@@ -1876,8 +2887,9 @@ class ChatWindow:
             except Exception:
                 pass
 
-        self._append_message('user', visible_text)
-        self.status_var.set('奥黛丽 正在思考...')
+        self._timeline_append({'kind': 'user_message', 'text': visible_text})
+        self._set_agent_activity('thinking', '奥黛丽正在整理思路', self._task_progress_compact_text(visible_text), 'THINKING')
+        self._set_status_and_agent('奥黛丽 正在思考...', '奥黛丽正在整理思路', 'THINKING')
         self._set_busy(True)
         self._last_busy_event_time = datetime.now()
         self._update_bubble_state('thinking', {'prompt': visible_text})
@@ -1886,14 +2898,23 @@ class ChatWindow:
             self.session.send_user_message(message_content)
         except Exception as exc:
             self._set_busy(False)
-            self.status_var.set('发送失败')
+            self._set_status_and_agent('发送失败', '发送失败', 'ERROR')
             self._clear_bubble_state()
             self._append_message('error', f'发送失败：{exc}')
             return False
         return True
 
-    def _handle_local_command(self, text: str) -> bool:
+    def _handle_local_command(self, text: str, intent: dict | None = None) -> bool:
         if not text.startswith('/'):
+            if intent and intent.get('intent') == 'side_question_confirm':
+                self._show_side_question_confirm_card(intent.get('args') or text)
+                return True
+            if intent and intent.get('intent') == 'model_select':
+                self._show_model_picker_card()
+                return True
+            if intent and intent.get('intent') == 'mode_select':
+                self._show_mode_picker_card()
+                return True
             return False
 
         command_text = text[1:].strip()
@@ -1905,37 +2926,29 @@ class ChatWindow:
         args = raw_args.strip()
 
         if command == 'model':
-            self._append_message('user', text, record_history=False)
             self._handle_model_command(args)
             return True
 
         if command == 'mode':
-            self._append_message('user', text, record_history=False)
             self._handle_mode_command(args)
             return True
 
         if command == 'btw':
-            self._append_message('user', text, record_history=False)
             self._handle_btw_command(args)
             return True
 
         if command == 'raw':
-            self._append_message('user', text, record_history=False)
             self._raw_mode = not self._raw_mode
             if self._terminal_view is not None:
                 self._terminal_view.set_show_raw(self._raw_mode)
             state = '开启' if self._raw_mode else '关闭'
-            self._append_inline_status(f'过程视图原始输出模式已{state}')
+            self._timeline_append({'kind': 'status_card', 'state': 'done', 'title': '原始 JSON', 'text': f'过程视图原始输出模式已{state}'})
             return True
 
         if command == 'cost':
             return False
 
-        self._append_message('user', text, record_history=False)
-        self._append_message(
-            'warn',
-            f'当前对话框尚未适配本地命令：/{command}。当前已支持：/model、/mode、/btw、/raw；/cost 将交给 Claude Code 处理。',
-        )
+        self._timeline_append({'kind': 'status_card', 'state': 'done', 'title': '可用本地命令', 'text': f'/{command} 不是本地控件。可用：/model、/mode、/btw、/raw；/cost 会交给 Claude Code。'})
         return True
 
     def _format_mode_status(self):
@@ -1953,7 +2966,7 @@ class ChatWindow:
         self._refresh_mode_buttons()
         if announce and changed:
             label = MODE_LABELS.get(normalized, normalized)
-            self.status_var.set(f'模式已切换：{label}')
+            self._set_status_and_agent(f'模式已切换：{label}', '模式切换', 'READY')
             self._append_inline_status(f'模式已切换：{label}')
 
     def _apply_permission_mode(self, mode: str):
@@ -1968,17 +2981,14 @@ class ChatWindow:
             return
 
         label = MODE_LABELS[normalized]
-        self.status_var.set(f'正在切换模式：{label}')
+        self._set_status_and_agent(f'正在切换模式：{label}', '模式切换', 'LIVE')
 
     def _handle_mode_command(self, args: str):
         normalized = args.strip()
         lowered = normalized.lower()
 
         if not normalized:
-            available = ' | '.join(mode for mode, _ in MODE_CHOICES)
-            self._append_inline_status(
-                f'当前模式：{MODE_LABELS.get(self._active_permission_mode, self._active_permission_mode)}；可用：{available}'
-            )
+            self._show_mode_picker_card()
             return
 
         if lowered in {'help', '-h', '--help', '?'}:
@@ -1991,7 +3001,7 @@ class ChatWindow:
 
         target_mode = PERMISSION_MODE_ALIASES.get(lowered)
         if target_mode is None:
-            self._append_message('warn', '不支持的模式。可用：default、acceptEdits、auto、plan。')
+            self._timeline_append({'kind': 'error_card', 'state': 'error', 'title': '模式不可用', 'text': '可用：default、acceptEdits、auto、plan。'})
             return
 
         self._apply_permission_mode(target_mode)
@@ -2025,55 +3035,52 @@ class ChatWindow:
             return
 
         self._active_model = 'default' if model is None else model
-        self.status_var.set(f'模型已切换：{self._active_model}')
+        self._set_status_and_agent(f'模型已切换：{self._active_model}', '模型切换', 'READY')
         self._append_inline_status(f'模型已切换：{self._active_model}')
 
     def _show_model_picker_card(self):
-        card = create_card(
-            self.text_area,
-            self.theme,
-            bg='assistant',
-            border='accent',
+        actions = []
+        for choice in MODEL_QUICK_CHOICES:
+            actions.append(
+                {
+                    'label': choice,
+                    'variant': 'primary' if choice == self._active_model else 'secondary',
+                    'command': lambda selected=choice: self._handle_model_choice(selected),
+                }
+            )
+        self._timeline_append(
+            {
+                'kind': 'status_card',
+                'state': 'waiting',
+                'title': '/model',
+                'text': 'select model for following Claude Code turns',
+                'meta_text': f'current model: {self._active_model}; usage: /model <name>',
+                'actions': actions,
+            }
         )
-        tk.Label(
-            card,
-            text='选择模型',
-            font=self.fonts['control'],
-            bg=self.colors['assistant'],
-            fg=self.colors['text'],
-            anchor='w',
-        ).pack(fill=tk.X, padx=10, pady=(8, 4))
-        tk.Label(
-            card,
-            text='点击按钮切换，或直接输入 /model <模型名>',
-            font=self.fonts['small'],
-            bg=self.colors['assistant'],
-            fg=self.colors['muted'],
-            anchor='w',
-        ).pack(fill=tk.X, padx=10, pady=(0, 8))
 
-        rows = [MODEL_QUICK_CHOICES[index : index + 2] for index in range(0, len(MODEL_QUICK_CHOICES), 2)]
-        for row_choices in rows:
-            row = tk.Frame(card, bg=self.colors['assistant'])
-            row.pack(fill=tk.X, padx=10, pady=(0, 8))
-            for choice in row_choices:
-                create_button(
-                    row,
-                    text=choice,
-                    command=lambda selected=choice: self._handle_model_choice(selected, card),
-                    theme=self.theme,
-                    variant='secondary',
-                    font=self.fonts['control'],
-                    padx=10,
-                ).pack(side=tk.LEFT, padx=(0, 8))
+    def _show_mode_picker_card(self):
+        actions = []
+        for mode, label in MODE_CHOICES:
+            actions.append(
+                {
+                    'label': label,
+                    'variant': 'primary' if mode == self._active_permission_mode else 'secondary',
+                    'command': lambda selected=mode: self._apply_permission_mode(selected),
+                }
+            )
+        self._timeline_append(
+            {
+                'kind': 'status_card',
+                'state': 'waiting',
+                'title': '/mode',
+                'text': 'select permission mode for following Claude Code turns',
+                'meta_text': f'current mode: {self._format_mode_status()}; usage: /mode <name>',
+                'actions': actions,
+            }
+        )
 
-        self._insert_inline_card(card)
-
-    def _handle_model_choice(self, selected: str, card):
-        try:
-            card.destroy()
-        except Exception:
-            pass
+    def _handle_model_choice(self, selected: str):
         self._apply_model_selection(None if selected == 'default' else selected)
 
     def _handle_btw_command(self, args: str):
@@ -2144,6 +3151,25 @@ class ChatWindow:
 
         self._pending_side_question_labels[request_id] = status_label
 
+    def _show_side_question_confirm_card(self, question: str):
+        compact = (question or '').strip()
+        if not compact:
+            return
+        self._timeline_append(
+            {
+                'kind': 'question_card',
+                'state': 'waiting',
+                'title': '当前奥黛丽还在工作',
+                'text': compact,
+                'meta_text': '要把这句话作为旁路问题发送吗？',
+                'actions': [
+                    {'label': '发送旁路问题', 'variant': 'primary', 'command': lambda q=compact: self._handle_btw_command(q)},
+                    {'label': '排队到下一轮', 'command': lambda q=compact: self._append_inline_status(f'已暂存：{q}')},
+                    {'label': '取消', 'command': lambda: self._append_inline_status('已取消旁路提问')},
+                ],
+            }
+        )
+
     def _update_side_question_result(self, status_label, text: str, is_error: bool):
         if status_label is None:
             return
@@ -2173,7 +3199,7 @@ class ChatWindow:
     def _on_stop(self):
         try:
             self.session.interrupt()
-            self.status_var.set('已请求停止')
+            self._set_status_and_agent('已请求停止', '停止请求', 'STOP')
         except Exception as exc:
             self._append_message('error', f'停止失败：{exc}')
 
@@ -2222,6 +3248,14 @@ class ChatWindow:
         if kind in {'terminal_line', 'stdout_raw_line', 'stderr_raw_line'}:
             return
 
+        if kind == 'conversation_event':
+            self._using_conversation_events = True
+            self._handle_conversation_event(event)
+            return
+
+        if self._using_conversation_events and kind in {'assistant', 'working', 'thinking', 'task_progress', 'tool_use_summary', 'tool_progress'}:
+            return
+
         if kind == 'assistant':
             text = event.get('text') or ''
             self._update_total_tokens(event.get('total_tokens'))
@@ -2232,7 +3266,7 @@ class ChatWindow:
                 return
             if text:
                 self._append_message('assistant', text)
-                self.status_var.set(self._compose_status_text('奥黛丽 正在回复...'))
+                self._set_status_and_agent(self._compose_status_text('奥黛丽 正在回复...'), '奥黛丽正在回复', 'LIVE')
                 self._maybe_show_choice_buttons(text)
             return
 
@@ -2256,7 +3290,8 @@ class ChatWindow:
                 self._render_task_tool_event(tool_name, terminal_text)
             else:
                 self._render_tool_status_widget(terminal_text)
-            self.status_var.set(self._compose_status_text(f'🔧 {tool_name}'))
+            self._set_agent_activity('working', f'正在使用工具：{tool_name}', terminal_text, 'LIVE')
+            self._set_status_and_agent(self._compose_status_text(f'🔧 {self._format_main_tool_status(event)}'), '工具调用', 'LIVE')
             return
 
         if kind == 'thinking':
@@ -2267,7 +3302,8 @@ class ChatWindow:
             if reminder_text:
                 self._render_main_status(reminder_text)
                 return
-            self.status_var.set(self._compose_status_text('奥黛丽 正在思考...'))
+            self._set_agent_activity('thinking', '奥黛丽正在整理思路', self._compose_status_text('奥黛丽 正在思考...'), 'THINKING')
+            self._set_status_and_agent(self._compose_status_text('奥黛丽 正在思考...'), '奥黛丽正在整理思路', 'THINKING')
             return
 
         if kind == 'status':
@@ -2286,14 +3322,17 @@ class ChatWindow:
 
             # 连接成功：重置计时器到实际连上时刻，显示已连接确认
             if status == 'ready':
+                self._session_connected = True
                 self._connection_start_time = datetime.now()
                 self._update_connection_time()
+                self._refresh_status_dot()
                 target_label = CONNECTION_OPTION_LABELS.get(self._connection_target, self._connection_target)
-                self._append_inline_status(f'已连接：{target_label}')
-                self.status_var.set(self._compose_status_text(f'已连接：{target_label}'))
+                self._set_agent_activity('idle', '连接已建立', f'当前思维链：{target_label}', 'READY')
+                self._set_status_and_agent(self._compose_status_text(f'已连接：{target_label}'), '连接已建立', 'READY')
 
             # 连接断开：清除计时器并重置 UI 状态，防止永久锁死
             if status == 'disconnected':
+                self._session_connected = False
                 self._connection_start_time = None
                 self._connection_time_var.set('')
                 if self._connection_time_timer is not None:
@@ -2324,7 +3363,7 @@ class ChatWindow:
                 else:
                     self._render_main_status(text)
                 connection_target = event.get('connection_target')
-                if isinstance(connection_target, str):
+                if isinstance(connection_target, str) and connection_target.strip():
                     self._set_connection_target(connection_target)
                 if status == 'working' and not event.get('tool_name') and source != 'system':
                     self._update_bubble_state('working', {'message': text})
@@ -2333,12 +3372,13 @@ class ChatWindow:
         if kind == 'task_progress':
             self._update_total_tokens_from_task(event)
             self._render_task_progress(event)
+            self._set_agent_activity('task', '子代理任务进行中', self._format_task_progress(event), 'RUNNING')
             return
 
         if kind == 'tool_use_summary':
             summary = event.get('summary') or ''
             if summary:
-                self._append_message('tool_result', summary, record_history=False)
+                self._set_agent_activity('summary', '工具结果摘要', summary, 'SUMMARY')
             return
 
         if kind == 'tool_progress':
@@ -2396,6 +3436,8 @@ class ChatWindow:
                     'input': event.get('input') or {},
                 },
             )
+            tool_name = event.get('tool_name') or '未知工具'
+            self._set_agent_activity('permission', '等待你授予工具权限', str(tool_name), 'NEEDS ACTION')
             self._handle_permission_request(event)
             return
 
@@ -2416,9 +3458,11 @@ class ChatWindow:
             self._update_bubble_state('done', {'result': event.get('text') or ''})
             self._refresh_history_sidebar()
             if event.get('ok'):
-                self.status_var.set(self._compose_status_text('本轮对话完成'))
+                self._set_agent_activity('idle', '本轮工作完成', '奥黛丽已经回到待命状态。', 'DONE')
+                self._set_status_and_agent(self._compose_status_text('本轮对话完成'), '本轮工作完成', 'DONE')
             else:
-                self.status_var.set(self._compose_status_text('Claude Code 返回错误'))
+                self._set_agent_activity('error', '工作流中断', event.get('text') or 'Claude Code 返回错误', 'ERROR')
+                self._set_status_and_agent(self._compose_status_text('Claude Code 返回错误'), '工作流中断', 'ERROR')
                 text = event.get('text') or '执行失败'
                 self._append_message('error', text)
             return
@@ -2427,7 +3471,7 @@ class ChatWindow:
             # CLI 产生的 JSON 解析警告等日志事件，之前被静默丢弃
             text = event.get('text') or ''
             if text:
-                self._append_inline_status(f'[CLI] {text}')
+                self._set_agent_activity('log', 'CLI 日志', text, 'LOG')
             return
 
         if kind == 'error':
@@ -2436,14 +3480,280 @@ class ChatWindow:
             self._clear_tool_status_widget()
             self._clear_inline_status()
             if event.get('request_subtype') == 'set_permission_mode':
-                self.status_var.set(self._compose_status_text('模式切换失败'))
+                self._set_status_and_agent(self._compose_status_text('模式切换失败'), '模式切换失败', 'ERROR')
             else:
-                self.status_var.set(self._compose_status_text('Claude Code 发生错误'))
+                self._set_status_and_agent(self._compose_status_text('Claude Code 发生错误'), '工作流中断', 'ERROR')
             self._clear_bubble_state()
             error_text = event.get('text') or '未知错误'
             if event.get('request_subtype') == 'set_permission_mode':
                 error_text = self._translate_permission_mode_error(error_text)
+            self._set_agent_activity('error', '工作流中断', error_text, 'ERROR')
             self._append_message('error', error_text)
+
+    def _conversation_event_identity(self, event: dict) -> tuple:
+        event_type = event.get('event_type')
+        turn_id = event.get('turn_id')
+        request_id = event.get('request_id')
+        tool_use_id = event.get('tool_use_id')
+        text = event.get('text') or event.get('summary') or ''
+        return (event_type, turn_id, request_id, tool_use_id, text[:80])
+
+    def _ensure_turn_summary(self, turn_id: str) -> dict:
+        summary = self._turn_terminal_summaries.get(turn_id)
+        if summary is None:
+            summary = {
+                'started_at': time.time(),
+                'seen_tools': set(),
+                'searches': 0,
+                'reads': 0,
+                'writes': 0,
+                'commands': 0,
+                'tasks': 0,
+                'other': 0,
+            }
+            self._turn_terminal_summaries[turn_id] = summary
+        return summary
+
+    def _classify_summary_tool(self, tool_name: str) -> str:
+        lowered = str(tool_name or '').strip().lower()
+        if lowered.startswith(('grep', 'glob', 'websearch', 'webfetch', 'lsp')):
+            return 'searches'
+        if lowered.startswith(('read', 'ls', 'listmcpresources')):
+            return 'reads'
+        if lowered.startswith(('write', 'edit', 'notebookedit')):
+            return 'writes'
+        if lowered.startswith(('bash', 'powershell', 'tmux')):
+            return 'commands'
+        if lowered.startswith(('task', 'agent', 'todowrite')):
+            return 'tasks'
+        return 'other'
+
+    def _record_summary_tool(self, turn_id: str, tool_name: str, identity: str | None = None):
+        summary = self._ensure_turn_summary(turn_id)
+        seen_tools = summary.get('seen_tools')
+        if isinstance(seen_tools, set) and identity:
+            if identity in seen_tools:
+                return
+            seen_tools.add(identity)
+        category = self._classify_summary_tool(tool_name)
+        summary[category] = int(summary.get(category) or 0) + 1
+
+    def _plural(self, count: int, singular: str, plural: str) -> str:
+        return singular if count == 1 else plural
+
+    def _turn_summary_text(self, turn_id: str, *, done: bool = False) -> str:
+        summary = self._ensure_turn_summary(turn_id)
+        elapsed = max(0, int(time.time() - float(summary.get('started_at') or time.time())))
+        parts = [f'Thought for {elapsed}s' if done else f'Thinking for {elapsed}s']
+        searches = int(summary.get('searches') or 0)
+        reads = int(summary.get('reads') or 0)
+        writes = int(summary.get('writes') or 0)
+        commands = int(summary.get('commands') or 0)
+        tasks = int(summary.get('tasks') or 0)
+        other = int(summary.get('other') or 0)
+        if searches:
+            parts.append(f"searched for {searches} {self._plural(searches, 'pattern', 'patterns')}")
+        if reads:
+            parts.append(f"read {reads} {self._plural(reads, 'file', 'files')}")
+        if writes:
+            parts.append(f"wrote {writes} {self._plural(writes, 'file', 'files')}")
+        if commands:
+            parts.append(f"ran {commands} {self._plural(commands, 'command', 'commands')}")
+        if tasks:
+            parts.append(f"used {tasks} {self._plural(tasks, 'agent task', 'agent tasks')}")
+        if other:
+            parts.append(f"used {other} other {self._plural(other, 'tool', 'tools')}")
+        return ', '.join(parts) + ' (过程视图展开)'
+
+    def _render_turn_summary(self, turn_id: str, *, done: bool = False):
+        self._timeline_upsert(
+            f'thought:{turn_id}',
+            {
+                'kind': 'thinking_card',
+                'state': 'done' if done else 'running',
+                'title': self._turn_summary_text(turn_id, done=done),
+                'text': '',
+                'meta_text': '',
+            },
+        )
+
+    def _handle_conversation_event(self, event: dict):
+        event_type = event.get('event_type')
+        turn_id = event.get('turn_id') or 'turn'
+        identity = self._conversation_event_identity(event)
+        if event_type in {'assistant_text_completed', 'thinking_completed', 'tool_use_started', 'tool_result', 'permission_requested', 'task_progress'}:
+            if identity in self._processed_conversation_events:
+                return
+            self._processed_conversation_events.add(identity)
+
+        if event_type == 'turn_request_started':
+            self._ensure_turn_summary(turn_id)
+            self._render_turn_summary(turn_id)
+            self._timeline_upsert(
+                f'status:{turn_id}',
+                {
+                    'kind': 'status_card',
+                    'state': 'running',
+                    'title': 'requesting',
+                    'text': 'model stream opened; waiting for first content block',
+                    'meta_text': self._build_status_suffix().strip('<>'),
+                },
+            )
+            return
+
+        if event_type == 'assistant_text_started':
+            key = f'assistant-stream:{turn_id}:{event.get("block_index", 0)}'
+            self._last_streaming_text_key = key
+            self._timeline_upsert(key, {'kind': 'streaming_assistant_message', 'state': 'streaming', 'text': '...'})
+            self._timeline_upsert(
+                f'status:{turn_id}',
+                {'kind': 'status_card', 'state': 'running', 'title': 'responding', 'text': 'assistant text block is streaming'},
+            )
+            return
+
+        if event_type == 'assistant_text_delta':
+            key = f'assistant-stream:{turn_id}:{event.get("block_index", 0)}'
+            current = self._timeline_store._by_key.get(key) or {}
+            text = (current.get('text') or '')
+            if text == '...':
+                text = ''
+            self._timeline_upsert(key, {'kind': 'streaming_assistant_message', 'state': 'streaming', 'text': text + (event.get('text') or '')})
+            return
+
+        if event_type == 'assistant_text_completed':
+            text = event.get('text') or ''
+            key = self._last_streaming_text_key
+            if key:
+                self._timeline_complete(key, {'kind': 'streaming_assistant_message', 'state': 'done', 'text': text})
+            elif text:
+                self._timeline_append({'kind': 'assistant_message', 'text': text})
+            self._update_total_tokens(event.get('total_tokens'))
+            self._update_total_io_tokens(event.get('input_tokens'), event.get('output_tokens'))
+            self._maybe_show_choice_buttons(text)
+            return
+
+        if event_type in {'thinking_started', 'thinking_delta', 'thinking_tokens', 'thinking_completed'}:
+            self._render_turn_summary(turn_id, done=event_type == 'thinking_completed')
+            return
+
+        if event_type in {'tool_input_started', 'tool_input_delta', 'tool_use_started', 'tool_progress'}:
+            tool_name = event.get('tool_name') or '工具'
+            block_index = event.get('block_index', 0)
+            block_key = f'{turn_id}:{block_index}'
+            tool_id = event.get('tool_use_id') or event.get('task_id')
+            if tool_id:
+                self._terminal_tool_block_keys[block_key] = tool_id
+            else:
+                tool_id = self._terminal_tool_block_keys.get(block_key) or f'{turn_id}:{block_index}:{tool_name}'
+            key = f'tool:{tool_id}'
+            visible_key = f'activity:{turn_id}'
+            current = self._timeline_store._by_key.get(key) or {}
+            detail = event.get('summary') or current.get('text') or self._summarize_working_input(tool_name, event.get('input') or {})
+            title = self._format_tool_title(tool_name)
+            if event_type == 'tool_input_delta':
+                partial = event.get('partial_json') or ''
+                previous = self._terminal_tool_input_texts.get(key, '')
+                self._terminal_tool_input_texts[key] = previous + partial
+                detail = self._task_progress_compact_text(self._terminal_tool_input_texts[key]) or 'building tool input json'
+                title = f'tool-input: {tool_name}'
+            elif event_type == 'tool_input_started':
+                detail = detail or 'building tool input json'
+                title = f'tool-input: {tool_name}'
+            elif event_type == 'tool_use_started':
+                self._record_summary_tool(turn_id, tool_name, str(tool_id))
+                self._render_turn_summary(turn_id)
+                detail = detail or 'tool execution queued'
+                title = f'tool-use: {tool_name}'
+            if event_type == 'tool_progress':
+                detail = self._format_tool_progress(event)
+                title = f'tool-use: {tool_name}'
+            self._timeline_upsert(
+                visible_key,
+                {
+                    'kind': 'tool_card',
+                    'state': 'running',
+                    'title': title,
+                    'text': detail or '正在准备工具调用。',
+                    'meta_text': self._build_status_suffix().strip('<>'),
+                },
+            )
+            return
+
+        if event_type == 'tool_result':
+            summary = event.get('summary') or ''
+            if summary:
+                preview_lines = summary.splitlines()
+                preview = preview_lines[0] if preview_lines else 'tool result received'
+                self._timeline_upsert(
+                    f'activity:{turn_id}',
+                    {
+                        'kind': 'tool_result_card',
+                        'state': 'done',
+                        'title': f'tool-result: {len(preview_lines)} lines',
+                        'text': self._task_progress_compact_text(preview),
+                        'meta_text': 'open process view for complete raw output',
+                    }
+                )
+            return
+
+        if event_type == 'task_progress':
+            task_key = event.get('task_id') or event.get('tool_use_id') or self._format_task_progress(event) or turn_id
+            self._record_summary_tool(turn_id, 'Task', f'task:{task_key}')
+            self._render_turn_summary(turn_id)
+            text = self._format_task_progress(event)
+            task_key = event.get('task_id') or event.get('tool_use_id') or text or turn_id
+            status = str(event.get('status') or 'running').lower()
+            self._timeline_upsert(
+                f'activity:{turn_id}',
+                {
+                    'kind': 'task_card',
+                    'state': 'done' if status in {'completed', 'failed', 'stopped'} else 'running',
+                    'title': 'task-agent',
+                    'text': text or '子代理正在处理任务。',
+                    'meta_text': self._build_status_suffix(self._task_usage_total_tokens(event.get('usage'))).strip('<>'),
+                },
+            )
+            return
+
+        if event_type == 'permission_requested':
+            self._handle_permission_request(
+                {
+                    'request_id': event.get('request_id'),
+                    'tool_name': event.get('tool_name'),
+                    'input': event.get('input') or {},
+                    'tool_use_id': event.get('tool_use_id'),
+                }
+            )
+            return
+
+        if event_type == 'post_turn_summary':
+            self._render_post_turn_summary(event)
+            return
+
+        if event_type == 'turn_completed':
+            self._render_turn_summary(turn_id, done=True)
+            self._timeline_upsert(f'status:{turn_id}', {'kind': 'summary_card', 'state': 'done', 'title': 'turn-complete', 'text': 'assistant turn closed; Audrey is idle'})
+            return
+
+        if event_type == 'turn_failed':
+            self._render_turn_summary(turn_id, done=True)
+            self._timeline_append({'kind': 'error_card', 'state': 'error', 'title': 'turn-failed', 'text': event.get('text') or 'Claude Code 返回错误。'})
+
+    def _format_tool_title(self, tool_name: str) -> str:
+        labels = {
+            'Read': '读取文件',
+            'Grep': '搜索内容',
+            'Glob': '匹配文件',
+            'Bash': '执行命令',
+            'PowerShell': '执行命令',
+            'Edit': '修改文件',
+            'Write': '写入文件',
+            'WebFetch': '访问网络',
+            'WebSearch': '搜索网络',
+            'Task': '子代理任务',
+            'Agent': '子代理任务',
+        }
+        return labels.get(str(tool_name or '').strip(), str(tool_name or '工具'))
 
     def _handle_permission_request(self, event: dict):
         tool_name = event.get('tool_name') or '未知工具'
@@ -2457,7 +3767,7 @@ class ChatWindow:
         # 该工具已被“总是允许” -> 直接放行，不再打扰
         if tool_name in self._auto_allow_tools:
             self.session.respond_permission(request_id, True)
-            self._append_inline_status(f'已自动允许工具调用：{tool_name}')
+            self._set_agent_activity('permission', '已自动允许工具调用', str(tool_name), 'AUTO')
             self._update_bubble_state(
                 'working',
                 {
@@ -2635,13 +3945,23 @@ class ChatWindow:
             updated_input['answers'] = answers
             self.session.respond_permission(request_id, True, updated_input=updated_input)
             self._pending_question_cards.pop(request_id, None)
-            status_label.config(text='已提交答案，奥黛丽继续处理中...', fg=self.colors['muted'])
+            status_label.config(text='已回答：' + '；'.join(f'{key}: {value}' for key, value in answers.items()), fg=self.colors['muted'])
+            for child in action_row.winfo_children():
+                try:
+                    child.config(state=tk.DISABLED)
+                except Exception:
+                    pass
             self._append_inline_status('已回答奥黛丽的问题')
 
         def decline_answers():
             self.session.respond_permission(request_id, False)
             self._pending_question_cards.pop(request_id, None)
-            self._destroy_widget(card)
+            status_label.config(text='已拒绝回答，奥黛丽会据此继续处理。', fg=self.colors['accent_dark'])
+            for child in action_row.winfo_children():
+                try:
+                    child.config(state=tk.DISABLED)
+                except Exception:
+                    pass
 
         action_row = tk.Frame(card, bg=self.colors['assistant'])
         action_row.pack(fill=tk.X, padx=10, pady=(0, 10))
@@ -2670,77 +3990,16 @@ class ChatWindow:
         self._pending_question_cards[request_id] = card
 
     def _show_permission_card(self, request_id, tool_name, input_payload):
-        """在对话流中内嵌一张权限确认卡片，不再弹出抢焦点的模态窗。"""
         summary = json.dumps(input_payload, ensure_ascii=False, indent=2)
         if len(summary) > self.chat_theme['permission_summary_max_chars']:
             summary = summary[: self.chat_theme['permission_summary_max_chars']] + ' …'
-        style = self._permission_card_style()
-
-        self.text_area.config(state=tk.NORMAL)
-        self.text_area.insert(tk.END, '\n')
-
-        card = tk.Frame(
-            self.text_area,
-            bg=style['card_border'],
-            bd=0,
-            highlightthickness=0,
-        )
-        card_body = tk.Frame(card, bg=style['card_bg'], bd=0, highlightthickness=0)
-        card_body.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
-
-        accent_bar = tk.Frame(card_body, bg=style['accent_line'], height=3)
-        accent_bar.pack(fill=tk.X)
-
-        header = tk.Frame(card_body, bg=style['card_bg'])
-        header.pack(fill=tk.X, padx=14, pady=(10, 6))
-        tk.Label(
-            header,
-            text='AURORA PERMISSION',
-            font=self.fonts['small'],
-            bg=style['card_bg'],
-            fg=self.colors['gold'],
-            anchor='w',
-        ).pack(anchor='w')
-        tk.Label(
-            header,
-            text=f'请求执行工具：{tool_name}',
-            font=self.fonts['control'],
-            bg=style['card_bg'],
-            fg=style['title_fg'],
-            anchor='w',
-            justify='left',
-        ).pack(anchor='w', pady=(4, 0))
-
-        if input_payload:
-            summary_frame = tk.Frame(card_body, bg=style['summary_bg'])
-            summary_frame.pack(fill=tk.X, padx=14, pady=(0, 10))
-            tk.Label(
-                summary_frame,
-                text=summary,
-                font=self.fonts['small'],
-                bg=style['summary_bg'],
-                fg=style['summary_fg'],
-                anchor='w',
-                justify='left',
-                wraplength=self.chat_theme['permission_wraplength'],
-                padx=12,
-                pady=10,
-            ).pack(fill=tk.X)
-
-        btn_row = tk.Frame(card_body, bg=style['card_bg'])
-        btn_row.pack(fill=tk.X, padx=14, pady=(0, 12))
+        key = f'permission:{request_id}'
 
         def resolve(allow, always=False):
             if always and allow:
                 self._auto_allow_tools.add(tool_name)
             self.session.respond_permission(request_id, allow)
             self._clear_inline_status()
-            frame = self._pending_perm_frames.pop(request_id, None)
-            if frame is not None:
-                try:
-                    frame.destroy()
-                except Exception:
-                    pass
             if allow:
                 txt = f'总是允许工具：{tool_name}' if always else f'已允许工具调用：{tool_name}'
                 self._update_bubble_state(
@@ -2752,47 +4011,23 @@ class ChatWindow:
                 )
             else:
                 txt = f'已拒绝工具调用：{tool_name}'
-            self._render_main_status(txt)
+            self._timeline_complete(key, {'kind': 'permission_card', 'state': 'done', 'title': 'permission-resolved', 'text': txt, 'meta_text': 'permission request handled'})
 
-        create_button(
-            btn_row,
-            text='允许',
-            command=lambda: resolve(True),
-            theme=self.theme,
-            variant='primary',
-            font=self.fonts['control'],
-            style_overrides=style['button_primary'],
-            padx=12,
-            pady=7,
-        ).pack(side=tk.LEFT)
-        create_button(
-            btn_row,
-            text='总是允许',
-            command=lambda: resolve(True, always=True),
-            theme=self.theme,
-            variant='secondary',
-            font=self.fonts['control'],
-            style_overrides=style['button_secondary'],
-            padx=12,
-            pady=7,
-        ).pack(side=tk.LEFT, padx=(8, 0))
-        create_button(
-            btn_row,
-            text='拒绝',
-            command=lambda: resolve(False),
-            theme=self.theme,
-            variant='secondary',
-            font=self.fonts['control'],
-            style_overrides=style['button_danger'],
-            padx=12,
-            pady=7,
-        ).pack(side=tk.LEFT, padx=(8, 0))
-
-        self.text_area.window_create(tk.END, window=card, padx=6, pady=4)
-        self.text_area.insert(tk.END, '\n\n')
-        self.text_area.config(state=tk.DISABLED)
-        self._maybe_follow_transcript_end()
-        self._pending_perm_frames[request_id] = card
+        self._timeline_upsert(
+            key,
+            {
+                'kind': 'permission_card',
+                'state': 'waiting',
+                'title': f'permission-request: {tool_name}',
+                'text': summary,
+                'meta_text': 'choose allow, always allow, or deny; the decision is sent back to Claude Code',
+                'actions': [
+                    {'label': '允许', 'variant': 'primary', 'command': lambda: resolve(True)},
+                    {'label': f'总是允许 {tool_name}', 'command': lambda: resolve(True, always=True)},
+                    {'label': '拒绝', 'command': lambda: resolve(False)},
+                ],
+            },
+        )
 
     def _set_busy(self, busy: bool):
         self._busy = busy
@@ -2803,18 +4038,89 @@ class ChatWindow:
                 state=tk.NORMAL,
                 text='我插个话...' if busy else '发送',
             )
+        self._refresh_status_dot()
+
+    def _refresh_status_dot(self):
+        """状态灯：忙碌=金色呼吸，已连接=薄荷常亮，未连接=灰。"""
+        if self._status_dot is None or self._status_dot_item is None:
+            return
+        if not self._status_dot.winfo_exists():
+            return
+        if self._status_dot_job is not None:
+            try:
+                self._status_dot.after_cancel(self._status_dot_job)
+            except Exception:
+                pass
+            self._status_dot_job = None
+
+        if self._busy:
+            if self._status_dot_tween is not None:
+                self._status_dot_tween.cancel()
+            self._status_dot_phase = 0.0
+            self._pulse_status_dot()
+            return
+        color = self.colors['accent'] if self._session_connected else self.colors['border_strong']
+        self._tween_status_dot_to(color)
+
+    def _tween_status_dot_to(self, color: str):
+        """状态灯颜色缓动过渡，让"忙碌→空闲"的切换不再生硬。"""
+        if self._status_dot is None or self._status_dot_item is None:
+            return
+        if not self._status_dot.winfo_exists():
+            return
+        if self._status_dot_tween is None:
+            self._status_dot_tween = ColorTween(
+                self._status_dot,
+                lambda colors: (
+                    self._status_dot.winfo_exists()
+                    and self._status_dot.itemconfigure(self._status_dot_item, fill=colors['c'])
+                ),
+                duration_ms=260,
+                steps=12,
+            )
+            self._status_dot_tween.set_immediate({'c': color})
+        self._status_dot_tween.animate_to({'c': color}, duration_ms=260)
+
+    def _pulse_status_dot(self):
+        if self._status_dot is None or not self._status_dot.winfo_exists() or not self._busy:
+            return
+        # 正弦呼吸：在暖金与亮金之间柔和往返
+        t = (math.sin(self._status_dot_phase) + 1) / 2
+        try:
+            color = _blend_colors(self.colors['gold'], self.colors['gold_bright'], t)
+            self._status_dot.itemconfigure(self._status_dot_item, fill=color)
+        except Exception:
+            pass
+        self._status_dot_phase += 0.45
+        self._status_dot_job = self._status_dot.after(60, self._pulse_status_dot)
+
+    def _fade_in_status_tag(self, tag_name: str, final_color: str, *, duration_ms: int = 240):
+        """让某段状态文字的前景色从面板色（近乎隐形）柔和淡入到目标色。"""
+        if self.text_area is None or not self.text_area.winfo_exists():
+            return
+        start = self.colors['panel']
+        try:
+            self.text_area.tag_configure(tag_name, foreground=start)
+        except Exception:
+            return
+
+        def _apply(colors, _tag=tag_name):
+            if self.text_area is not None and self.text_area.winfo_exists():
+                try:
+                    self.text_area.tag_configure(_tag, foreground=colors['f'])
+                except Exception:
+                    pass
+
+        tween = ColorTween(self.text_area, _apply, duration_ms=duration_ms, steps=12)
+        tween.set_immediate({'f': start})
+        tween.animate_to({'f': final_color}, duration_ms=duration_ms)
 
     def _append_inline_status(self, text: str):
-        if self.text_area is None:
-            compact = self._task_progress_compact_text(text)
-            if compact:
-                self._set_status_var_text(compact)
+        compact = self._task_progress_compact_text(text)
+        if not compact:
             return
-        self._capture_transcript_follow_state()
-        self.text_area.config(state=tk.NORMAL)
-        self.text_area.insert(tk.END, f'[状态] {text}\n\n', ('status',))
-        self.text_area.config(state=tk.DISABLED)
-        self._maybe_follow_transcript_end()
+        self._set_status_var_text(compact)
+        self._set_agent_activity('status', '状态更新', compact, 'STATUS')
 
     def _set_status_var_text(self, text: str):
         if text == self._last_status_var_text:
@@ -2845,25 +4151,16 @@ class ChatWindow:
 
     def _flush_inline_status_render(self):
         self._inline_status_job = None
-        if self.text_area is None:
-            return
         compact = self._pending_inline_status_text
         if not compact:
             return
-        ranges = self.text_area.tag_ranges('inline_status')
-        self.text_area.config(state=tk.NORMAL)
-        if len(ranges) >= 2:
-            self.text_area.delete(ranges[0], ranges[-1])
-        self.text_area.insert(tk.END, f'[状态] {compact}\n\n', ('status', 'inline_status'))
-        self.text_area.config(state=tk.DISABLED)
-        self._maybe_follow_transcript_end()
+        self._set_agent_activity('status', '状态更新', compact, 'STATUS')
 
     # ── 统一状态管理 ─────────────────────────────────────────────
-    # 所有状态更新通过 _set_status 写入，确保 status_var 只由一处管理，
-    # 文本区中只保留一条内嵌状态行（统一标签 'inline_status'）。
+    # 状态更新同步到底栏和上方 Agent 工作台，transcript 只保留会话与交互卡片。
 
     def _set_status(self, text: str, tag: str = 'main'):
-        """统一状态入口。tag 用于去重，'inline_status' 用于文本区定位。"""
+        """统一状态入口。tag 用于去重和 Agent 标题/徽标映射。"""
         compact = self._compose_status_text(text)
         if not compact:
             return
@@ -2877,9 +4174,18 @@ class ChatWindow:
         self._last_status_texts[tag] = compact
 
         self._set_status_var_text(compact)
-        if self.text_area is None:
-            return
-        self._schedule_inline_status_render(compact)
+        title = {
+            'main': '状态更新',
+            'task': '任务进度',
+            'summary': '系统摘要',
+            'thinking': '思考进度',
+        }.get(tag, '状态更新')
+        badge = {
+            'task': 'TASK',
+            'summary': 'SUMMARY',
+            'thinking': 'THINKING',
+        }.get(tag, 'STATUS')
+        self._set_agent_activity(tag, title, compact, badge)
 
     def _clear_inline_status(self):
         """清除文本区中的内嵌状态行并重置去重缓存。"""
@@ -2924,59 +4230,33 @@ class ChatWindow:
         return description or summary
 
     def _render_task_tool_event(self, tool_name: str, text: str):
-        tool_key = 'tool:' + str(tool_name or '').strip().lower()
         compact = self._task_progress_compact_text(text)
         if compact:
-            self._upsert_task_widget(tool_key, compact, done=False)
+            self._set_agent_activity('working', f'正在使用工具：{tool_name}', compact, 'LIVE')
 
     def _ensure_tool_status_font(self):
         if self._tool_status_font is None:
             self._tool_status_font = tkfont.Font(family='Consolas', size=9)
 
+    def _split_agent_status_text(self, text: str) -> tuple[str, str, str]:
+        parts = [part.strip() for part in str(text or '').split('|') if part.strip()]
+        title = parts[0] if parts else 'Agent'
+        detail = ' | '.join(parts[1:]) if len(parts) > 1 else title
+        if detail == title:
+            detail = '正在处理当前请求'
+        footer = self._build_status_suffix().strip('<>')
+        return title, detail, footer
+
     def _render_tool_status_widget(self, text: str):
-        if self.text_area is None:
-            return
         compact = self._task_progress_compact_text(text)
         if not compact:
             return
-        self._ensure_tool_status_font()
-        existing = self._tool_status_widget
-        if existing is None:
-            card = create_card(
-                self.text_area,
-                self.theme,
-                bg='panel',
-                border='border',
-            )
-            label = tk.Label(
-                card,
-                text='',
-                font=self._tool_status_font,
-                bg=self.colors['panel'],
-                fg='#3D8884',
-                justify='left',
-                anchor='w',
-                wraplength=max(240, self._transcript_width - 60),
-                padx=10,
-                pady=8,
-            )
-            label.pack(fill=tk.X)
-            self.text_area.config(state=tk.NORMAL)
-            self.text_area.insert(tk.END, '\n')
-            self.text_area.window_create(tk.END, window=card, padx=4, pady=2)
-            self.text_area.insert(tk.END, '\n')
-            self.text_area.config(state=tk.DISABLED)
-            existing = {'card': card, 'label': label}
-            self._tool_status_widget = existing
-        existing['label'].config(
-            text=f'{self._pick_tool_icon(compact)} {compact}',
-            wraplength=max(240, self._transcript_width - 60),
-        )
-        self._maybe_follow_transcript_end()
+        title, detail, footer = self._split_agent_status_text(compact)
+        if footer:
+            detail = f'{detail} | {footer}'
+        self._set_agent_activity('working', title, detail, 'LIVE')
 
-    def _clear_tool_status_widget(self):
-        widget = self._tool_status_widget
-        self._tool_status_widget = None
+    def _remove_tool_status_widget(self, widget):
         if not widget:
             return
         card = widget.get('card')
@@ -2985,6 +4265,13 @@ class ChatWindow:
                 card.destroy()
             except Exception:
                 pass
+
+    def _clear_tool_status_widget(self):
+        widget = self._tool_status_widget
+        self._tool_status_widget = None
+        self._remove_tool_status_widget(widget)
+        if self._auto_follow_transcript:
+            self._maybe_follow_transcript_end()
 
     def _render_task_widget(self, event: dict, text: str) -> bool:
         task_key = self._task_widget_key(event)
@@ -2995,7 +4282,7 @@ class ChatWindow:
         final_text = text
         if done:
             final_text = f'{text} (已结束)'
-        self._upsert_task_widget(task_key, final_text, done=done)
+        self._set_agent_activity('task', '子代理任务', final_text, 'DONE' if done else 'RUNNING')
         return True
 
     def _ensure_task_widget_fonts(self):
@@ -3008,48 +4295,10 @@ class ChatWindow:
         self._task_widget_done_font = done_font
 
     def _upsert_task_widget(self, task_key: str, text: str, *, done: bool):
-        if self.text_area is None:
-            return
         compact = self._task_progress_compact_text(text)
         if not compact:
             return
-        self._ensure_task_widget_fonts()
-        existing = self._task_widgets.get(task_key)
-        if existing is None:
-            card = create_card(
-                self.text_area,
-                self.theme,
-                bg='panel',
-                border='border',
-            )
-            label = tk.Label(
-                card,
-                text='',
-                font=self._task_widget_font,
-                bg=self.colors['panel'],
-                fg=self.colors['muted'],
-                justify='left',
-                anchor='w',
-                wraplength=max(240, self._transcript_width - 60),
-                padx=10,
-                pady=8,
-            )
-            label.pack(fill=tk.X)
-            self.text_area.config(state=tk.NORMAL)
-            self.text_area.insert(tk.END, '\n')
-            self.text_area.window_create(tk.END, window=card, padx=4, pady=2)
-            self.text_area.insert(tk.END, '\n')
-            self.text_area.config(state=tk.DISABLED)
-            existing = {'card': card, 'label': label}
-            self._task_widgets[task_key] = existing
-        label = existing['label']
-        label.config(
-            text=compact,
-            font=self._task_widget_done_font if done else self._task_widget_font,
-            fg=self.colors['subtext'] if done else self.colors['muted'],
-            wraplength=max(240, self._transcript_width - 60),
-        )
-        self._maybe_follow_transcript_end()
+        self._set_agent_activity('task', '子代理任务', compact, 'DONE' if done else 'RUNNING')
 
     def _render_summary_status(self, text: str):
         compact = self._task_progress_compact_text(text)
@@ -3353,8 +4602,12 @@ class ChatWindow:
     def _format_main_tool_status(self, event: dict) -> str:
         tool_name = self._task_progress_compact_text(event.get('tool_name')) or '工具'
         summary = self._task_progress_compact_text(event.get('summary'))
+        if not summary:
+            summary = self._summarize_working_input(tool_name, event.get('input') or {})
+        if summary and len(summary) > MAX_TOOL_STATUS_DETAIL_CHARS:
+            summary = summary[:MAX_TOOL_STATUS_DETAIL_CHARS - 3].rstrip() + '...'
         if summary:
-            return f'{tool_name} ({summary})'
+            return f'{tool_name} | {summary}'
         return tool_name
 
     def _summarize_working_input(self, tool_name: str, input_payload: dict) -> str:
@@ -3380,7 +4633,7 @@ class ChatWindow:
             value = input_payload.get(key)
             if isinstance(value, str) and value.strip():
                 val = value.strip()
-                return val[:120] + ('...' if len(val) > 120 else '')
+                return val[:MAX_TOOL_STATUS_DETAIL_CHARS] + ('...' if len(val) > MAX_TOOL_STATUS_DETAIL_CHARS else '')
         return ''
 
     def _handle_sdk_status(self, event: dict):
@@ -3396,7 +4649,7 @@ class ChatWindow:
     def _handle_session_state(self, event: dict):
         state = self._task_progress_compact_text(event.get('state'))
         if state == 'running':
-            self.status_var.set(self._compose_status_text('会话运行中...'))
+            self._set_status_and_agent(self._compose_status_text('会话运行中...'), '会话状态', 'LIVE')
             return
         if state == 'idle':
             self._render_main_status('当前轮次已空闲')
@@ -3425,20 +4678,81 @@ class ChatWindow:
         if parts:
             self._render_summary_status(' | '.join(parts))
 
+    @staticmethod
+    def _hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
+        h = (hex_color or '#000000').lstrip('#')
+        if len(h) == 3:
+            h = ''.join(ch * 2 for ch in h)
+        return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+    def _build_ring_avatar(self, source, ring_color: str, glow_color: str, size: int = 54):
+        """把头像裁成圆形，外圈套一道柔和的金/粉色光环，增添贵族与神圣感。"""
+        scale = 4
+        big = size * scale
+        bg_rgb = self._hex_to_rgb(self.colors['panel'])
+        canvas = Image.new('RGBA', (big, big), bg_rgb + (255,))
+        draw = ImageDraw.Draw(canvas)
+
+        ring_rgb = self._hex_to_rgb(ring_color)
+        glow_rgb = self._hex_to_rgb(glow_color)
+
+        # 外层柔光晕
+        glow_w = max(scale, int(big * 0.055))
+        draw.ellipse(
+            (glow_w, glow_w, big - glow_w - 1, big - glow_w - 1),
+            outline=glow_rgb + (255,), width=glow_w,
+        )
+        # 主金/粉色细环
+        ring_w = max(scale, int(big * 0.032))
+        inset = glow_w + ring_w
+        draw.ellipse(
+            (inset, inset, big - inset - 1, big - inset - 1),
+            outline=ring_rgb + (255,), width=ring_w,
+        )
+
+        # 圆形裁切头像，嵌入环内
+        pad = inset + ring_w + max(scale, int(big * 0.012))
+        inner = big - pad * 2
+        if inner > 0:
+            ava = source.convert('RGBA').resize((inner, inner), Image.Resampling.LANCZOS)
+            mask = Image.new('L', (inner, inner), 0)
+            ImageDraw.Draw(mask).ellipse((0, 0, inner - 1, inner - 1), fill=255)
+            canvas.paste(ava, (pad, pad), mask)
+
+        # 环上点缀三颗小星（星月主题），呼应金色装饰
+        star_r = max(scale, int(big * 0.02))
+        cx = big / 2
+        radius = (big - inset) / 2 - ring_w
+        for ang in (-90, -150, -30):
+            rad = math.radians(ang)
+            px = cx + radius * math.cos(rad)
+            py = cx + radius * math.sin(rad)
+            draw.line((px - star_r, py, px + star_r, py), fill=glow_rgb + (255,), width=scale)
+            draw.line((px, py - star_r, px, py + star_r), fill=glow_rgb + (255,), width=scale)
+
+        result = canvas.convert('RGB').resize((size, size), Image.Resampling.LANCZOS)
+        return ImageTk.PhotoImage(result)
+
     def _get_assistant_avatar(self):
         if self._assistant_avatar is not None or self._avatar_source is None:
             return self._assistant_avatar
 
-        avatar = self._avatar_source.resize((48, 48), Image.Resampling.LANCZOS)
-        self._assistant_avatar = ImageTk.PhotoImage(avatar)
+        self._assistant_avatar = self._build_ring_avatar(
+            self._avatar_source,
+            ring_color=self.colors['gold'],
+            glow_color=self.colors['gold_bright'],
+        )
         return self._assistant_avatar
 
     def _get_user_avatar(self):
         if self._user_avatar is not None or self._user_avatar_source is None:
             return self._user_avatar
 
-        avatar = self._user_avatar_source.resize((48, 48), Image.Resampling.LANCZOS)
-        self._user_avatar = ImageTk.PhotoImage(avatar)
+        self._user_avatar = self._build_ring_avatar(
+            self._user_avatar_source,
+            ring_color='#E2A9BB',
+            glow_color=self.colors['pink_soft'],
+        )
         return self._user_avatar
 
     def _build_message_layout(self, text: str, text_width_chars: int) -> tuple[str, int, bool]:
@@ -3448,7 +4762,7 @@ class ChatWindow:
         visible_lines = self._calc_text_display_lines(
             plain_text,
             text_width_chars,
-            max_lines=MAX_COLLAPSED_MESSAGE_LINES if is_collapsible else 40,
+            max_lines=MAX_COLLAPSED_MESSAGE_LINES if is_collapsible else None,
         )
         return plain_text, visible_lines, is_collapsible
 
@@ -3459,13 +4773,24 @@ class ChatWindow:
         is_error = role == 'error'
         is_warn = role == 'warn'
 
-        bubble_bg = '#EAF6EE'
+        bubble_bg = '#FFFBF7'
+        bubble_border = self.colors['gold']
+        bubble_fg = '#172B2D'
+        code_fg = '#654417'
+        quote_fg = '#466266'
+        marker_fg = '#7A5423'
         if is_user:
-            bubble_bg = '#E8F1FF'
+            bubble_bg = '#DCF3DF'
+            bubble_border = self.colors['gold']
+            bubble_fg = '#183923'
         elif is_error:
             bubble_bg = self.colors['error']
+            bubble_border = '#DAB8BE'
+            bubble_fg = '#3D1118'
         elif is_warn:
             bubble_bg = self.colors['warn']
+            bubble_border = self.colors['gold']
+            bubble_fg = '#382704'
 
         row = tk.Frame(container, bg=self.colors['panel'], width=self._transcript_width)
         row.pack(fill=tk.X)
@@ -3474,35 +4799,53 @@ class ChatWindow:
 
         if is_user:
             avatar_col = tk.Frame(row, bg=self.colors['panel'])
-            avatar_col.pack(side=tk.RIGHT, anchor='s', padx=(12, 0))
+            avatar_col.pack(side=tk.RIGHT, anchor='n', padx=(12, 0))
 
             user_avatar = self._get_user_avatar()
             if user_avatar is not None:
                 tk.Label(avatar_col, image=user_avatar, bg=self.colors['panel'], bd=0).pack(anchor='e')
             else:
-                fallback = tk.Canvas(avatar_col, width=48, height=48, bg='#E8F1FF', highlightthickness=0, bd=0)
+                fallback = tk.Canvas(avatar_col, width=48, height=48, bg='#F8E7EC', highlightthickness=0, bd=0)
                 fallback.create_text(24, 24, text='你', font=self.fonts['title'], fill=self.colors['accent_dark'])
                 fallback.pack(anchor='e')
 
             content_col = tk.Frame(row, bg=self.colors['panel'])
-            content_col.pack(side=tk.RIGHT, fill=tk.X, expand=True)
+            content_col.pack(side=tk.RIGHT, anchor='n')
+
+            meta = tk.Frame(content_col, bg=self.colors['panel'])
+            meta.pack(anchor='e', pady=(0, 5))
+            tk.Label(
+                meta,
+                text=timestamp,
+                font=self.fonts['small'],
+                bg=self.colors['panel'],
+                fg=self.colors['subtext'],
+            ).pack(side=tk.LEFT, padx=(0, 10))
+            tk.Label(
+                meta,
+                text='我',
+                font=self.fonts['control'],
+                bg=self.colors['panel'],
+                fg='#9B6874',
+            ).pack(side=tk.LEFT)
 
             bubble_wrap = tk.Frame(content_col, bg=self.colors['panel'])
-            bubble_wrap.pack(anchor='e', fill=tk.X)
+            bubble_wrap.pack(anchor='e')
 
-            text_width_chars = self._pixels_to_chars(520)
+            text_width_chars = self._pixels_to_chars(max(240, int(self._transcript_width * 0.70)))
             plain_text, text_height, is_collapsible = self._build_message_layout(text, text_width_chars)
             bubble = tk.Text(
                 bubble_wrap,
                 font=self.fonts['base'],
                 bg=bubble_bg,
-                fg=self.colors['text_strong'],
+                fg=bubble_fg,
                 wrap=tk.WORD,
                 width=text_width_chars,
                 height=text_height,
                 padx=14,
                 pady=10,
-                highlightbackground='#C8D8F4',
+                highlightbackground=bubble_border,
+                highlightcolor=bubble_border,
                 highlightthickness=1,
                 bd=0,
                 relief=tk.FLAT,
@@ -3511,15 +4854,24 @@ class ChatWindow:
                 spacing1=4,
                 spacing3=4,
             )
+            bubble._message_text_fg = bubble_fg
+            bubble._message_code_fg = code_fg
+            bubble._message_quote_fg = quote_fg
+            bubble._message_marker_fg = marker_fg
             self._configure_markdown_tags(bubble)
             self._insert_markdown_text(bubble, text)
             bubble.configure(state=tk.DISABLED)
-            bubble.pack(anchor='e')
+            shell = self._wrap_bubble_in_shell(bubble_wrap, bubble, fill=bubble_bg, outline=bubble_border, anchor='e')
             container._message_bubble = bubble
+            container._bubble_shell = shell
+            container._bubble_border = bubble_border
+            container._bubble_bg = bubble_bg
+            container._bubble_fg = bubble_fg
             container._message_text = text
             container._message_plain_text = plain_text
             container._message_is_expanded = not is_collapsible
             self._bind_message_copy_events(bubble, text)
+            self._resize_bubble_shell(container)
 
             if is_collapsible:
                 toggle = tk.Label(
@@ -3533,23 +4885,8 @@ class ChatWindow:
                 toggle.pack(anchor='e', pady=(6, 0))
                 container._message_toggle = toggle
                 toggle.bind('<Button-1>', lambda _event, item=container: self._toggle_message_expand(item), add='+')
+                self._bind_toggle_hover(toggle)
 
-            meta = tk.Frame(content_col, bg=self.colors['panel'])
-            meta.pack(anchor='e', pady=(6, 0))
-            tk.Label(
-                meta,
-                text='You',
-                font=self.fonts['control'],
-                bg=self.colors['panel'],
-                fg=self.colors['muted'],
-            ).pack(side=tk.LEFT)
-            tk.Label(
-                meta,
-                text=timestamp,
-                font=self.fonts['small'],
-                bg=self.colors['panel'],
-                fg=self.colors['subtext'],
-            ).pack(side=tk.LEFT, padx=(10, 0))
         else:
             avatar_col = tk.Frame(row, bg=self.colors['panel'])
             avatar_col.pack(side=tk.LEFT, anchor='n', padx=(0, 12))
@@ -3563,21 +4900,42 @@ class ChatWindow:
                 fallback.pack(anchor='n')
 
             content_col = tk.Frame(row, bg=self.colors['panel'])
-            content_col.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            content_col.pack(side=tk.LEFT, anchor='n')
 
-            text_width_chars = self._pixels_to_chars(520)
+            meta = tk.Frame(content_col, bg=self.colors['panel'])
+            meta.pack(anchor='w', pady=(0, 5))
+            tk.Label(
+                meta,
+                text='奥黛丽',
+                font=self.fonts['control'],
+                bg=self.colors['panel'],
+                fg=self.colors['gold_deep'],
+            ).pack(side=tk.LEFT)
+            tk.Label(
+                meta,
+                text=timestamp,
+                font=self.fonts['small'],
+                bg=self.colors['panel'],
+                fg=self.colors['subtext'],
+            ).pack(side=tk.LEFT, padx=(10, 0))
+
+            bubble_wrap = tk.Frame(content_col, bg=self.colors['panel'])
+            bubble_wrap.pack(anchor='w')
+
+            text_width_chars = self._pixels_to_chars(max(240, int(self._transcript_width * 0.70)))
             plain_text, text_height, is_collapsible = self._build_message_layout(text, text_width_chars)
             bubble = tk.Text(
-                content_col,
+                bubble_wrap,
                 font=self.fonts['base'],
                 bg=bubble_bg,
-                fg=self.colors['text_strong'],
+                fg=bubble_fg,
                 wrap=tk.WORD,
                 width=text_width_chars,
                 height=text_height,
                 padx=14,
                 pady=10,
-                highlightbackground='#CFE2D3' if is_assistant else self.colors['gold_soft'],
+                highlightbackground=bubble_border,
+                highlightcolor=bubble_border,
                 highlightthickness=1,
                 bd=0,
                 relief=tk.FLAT,
@@ -3586,15 +4944,24 @@ class ChatWindow:
                 spacing1=4,
                 spacing3=4,
             )
+            bubble._message_text_fg = bubble_fg
+            bubble._message_code_fg = code_fg
+            bubble._message_quote_fg = quote_fg
+            bubble._message_marker_fg = marker_fg
             self._configure_markdown_tags(bubble)
             self._insert_markdown_text(bubble, text)
             bubble.configure(state=tk.DISABLED)
-            bubble.pack(anchor='w')
+            shell = self._wrap_bubble_in_shell(bubble_wrap, bubble, fill=bubble_bg, outline=bubble_border, anchor='w')
             container._message_bubble = bubble
+            container._bubble_shell = shell
+            container._bubble_border = bubble_border
+            container._bubble_bg = bubble_bg
+            container._bubble_fg = bubble_fg
             container._message_text = text
             container._message_plain_text = plain_text
             container._message_is_expanded = not is_collapsible
             self._bind_message_copy_events(bubble, text)
+            self._resize_bubble_shell(container)
 
             if is_collapsible:
                 toggle = tk.Label(
@@ -3608,23 +4975,7 @@ class ChatWindow:
                 toggle.pack(anchor='w', pady=(6, 0))
                 container._message_toggle = toggle
                 toggle.bind('<Button-1>', lambda _event, item=container: self._toggle_message_expand(item), add='+')
-
-            meta = tk.Frame(content_col, bg=self.colors['panel'])
-            meta.pack(anchor='w', pady=(6, 0))
-            tk.Label(
-                meta,
-                text='奥黛丽',
-                font=self.fonts['control'],
-                bg=self.colors['panel'],
-                fg=self.colors['muted'],
-            ).pack(side=tk.LEFT)
-            tk.Label(
-                meta,
-                text=timestamp,
-                font=self.fonts['small'],
-                bg=self.colors['panel'],
-                fg=self.colors['subtext'],
-            ).pack(side=tk.LEFT, padx=(10, 0))
+                self._bind_toggle_hover(toggle)
 
         row.update_idletasks()
         container.configure(width=self._transcript_width, height=row.winfo_reqheight())
@@ -3646,9 +4997,10 @@ class ChatWindow:
             height=self._calc_text_display_lines(
                 plain_text,
                 char_width,
-                max_lines=MAX_COLLAPSED_MESSAGE_LINES if expanded else 40,
+                max_lines=MAX_COLLAPSED_MESSAGE_LINES if expanded else None,
             )
         )
+        self._resize_bubble_shell(container)
         if toggle is not None and toggle.winfo_exists():
             toggle.config(text='展开全文' if expanded else '收起')
         try:
@@ -3658,6 +5010,27 @@ class ChatWindow:
             pass
         self._maybe_follow_transcript_end()
         return 'break'
+
+    def _update_message_widget_text(self, container, text: str):
+        bubble = getattr(container, '_message_bubble', None)
+        if bubble is None or not bubble.winfo_exists():
+            return
+        text_width_chars = int(bubble.cget('width')) if str(bubble.cget('width')).isdigit() else self._pixels_to_chars(min(500, max(320, int(self._transcript_width * 0.68))))
+        plain_text, text_height, is_collapsible = self._build_message_layout(text, text_width_chars)
+        try:
+            bubble.configure(state=tk.NORMAL, height=text_height)
+            bubble.delete('1.0', tk.END)
+            self._insert_markdown_text(bubble, text)
+            bubble.configure(state=tk.DISABLED)
+            container._message_text = text
+            container._message_plain_text = plain_text
+            container._message_is_expanded = not is_collapsible
+            self._resize_bubble_shell(container)
+            container.update_idletasks()
+            container.configure(height=container.winfo_reqheight())
+        except Exception:
+            pass
+        self._maybe_follow_transcript_end()
 
     def _append_message(self, role: str, text: str, *, record_history: bool = True):
         reminder_text = self._translate_system_reminder(text)
@@ -3678,10 +5051,122 @@ class ChatWindow:
         self.text_area.insert(tk.END, '\n')
         self.text_area.config(state=tk.DISABLED)
         self._maybe_follow_transcript_end()
+        self._animate_bubble_entrance(card)
 
         if record_history and role in {'user', 'assistant'}:
             self._conversation_history.append({'role': role, 'text': text})
             self._conversation_history = self._conversation_history[-12:]
+
+    def _animate_bubble_entrance(self, card):
+        """新消息登场：气泡自面板"浮起"（高度由矮渐展）+ 底色淡入 + 金边微光回落，
+        合成柔和的"淡入 + 入场"观感，而非生硬瞬现。"""
+        if card is None or not card.winfo_exists():
+            return
+        bubble = getattr(card, '_message_bubble', None)
+        shell = getattr(card, '_bubble_shell', None)
+        final_border = getattr(card, '_bubble_border', None)
+        final_bg = getattr(card, '_bubble_bg', None)
+        final_fg = getattr(card, '_bubble_fg', None)
+        if final_fg is None and bubble is not None:
+            try:
+                final_fg = bubble.cget('fg')
+            except Exception:
+                final_fg = self.colors['text_strong']
+        if bubble is None or shell is None or not bubble.winfo_exists() or not shell.winfo_exists():
+            return
+
+        # 目标高度：以创建时落定的 card 高度为准（pack_propagate 已关闭）
+        try:
+            target_h = int(card.cget('height'))
+        except Exception:
+            target_h = 0
+        if target_h <= 1:
+            try:
+                target_h = int(card.winfo_reqheight() or 0)
+            except Exception:
+                target_h = 0
+
+        panel = self.colors['panel']
+        glow = self.colors['gold_bright']
+        start_h = max(16, int(target_h * 0.55)) if target_h > 0 else 0
+
+        steps = 16
+        interval = 16
+        # 起始态：矮一截 + 底色贴近面板 + 金色描边微光，仿佛刚从桌面浮现
+        if target_h > 0:
+            try:
+                card.configure(height=start_h)
+            except Exception:
+                pass
+        try:
+            if final_bg is not None:
+                bubble.config(bg=panel, fg=final_fg)
+                self._paint_bubble_shell(shell, fill=panel, outline=glow)
+            elif final_border is not None:
+                self._paint_bubble_shell(shell, outline=glow)
+        except Exception:
+            pass
+
+        def _tick(step):
+            if not card.winfo_exists() or not bubble.winfo_exists():
+                return
+            p = _ease_out_cubic(step / steps)
+            if target_h > 0:
+                h = int(start_h + (target_h - start_h) * p)
+                try:
+                    card.configure(height=max(1, h))
+                except Exception:
+                    pass
+            try:
+                shell_fill = final_bg
+                shell_outline = final_border
+                if final_bg is not None:
+                    shell_fill = _blend_colors(panel, final_bg, p)
+                    bubble.config(bg=shell_fill, fg=final_fg)
+                if final_border is not None:
+                    shell_outline = _blend_colors(glow, final_border, p)
+                self._paint_bubble_shell(shell, fill=shell_fill, outline=shell_outline)
+            except Exception:
+                pass
+            if step < steps:
+                card._entrance_job = card.after(interval, lambda: _tick(step + 1))
+            else:
+                # 收尾：精确落定到目标值，避免插值残留
+                try:
+                    if target_h > 0:
+                        card.configure(height=target_h)
+                    if final_bg is not None:
+                        bubble.config(bg=final_bg, fg=final_fg)
+                    self._paint_bubble_shell(shell, fill=final_bg, outline=final_border)
+                except Exception:
+                    pass
+                card._entrance_job = None
+                if self._auto_follow_transcript:
+                    self._maybe_follow_transcript_end()
+
+        _tick(1)
+
+    def _bind_toggle_hover(self, toggle):
+        """折叠/展开链接的悬停反馈：颜色加深 + 下划线，明确它可点。"""
+        rest_fg = self.colors['accent']
+        hot_fg = self.colors['accent_dark']
+        base_font = self.fonts['small']
+        underline_font = (base_font[0], base_font[1], 'underline') if isinstance(base_font, tuple) and len(base_font) >= 2 else base_font
+
+        def _on(_event):
+            try:
+                toggle.config(fg=hot_fg, font=underline_font)
+            except Exception:
+                pass
+
+        def _off(_event):
+            try:
+                toggle.config(fg=rest_fg, font=base_font)
+            except Exception:
+                pass
+
+        toggle.bind('<Enter>', _on, add='+')
+        toggle.bind('<Leave>', _off, add='+')
 
     def _configure_markdown_tags(self, widget: tk.Text):
         if self._markdown_fonts is None:
@@ -3708,14 +5193,18 @@ class ChatWindow:
         h2_font = self._markdown_fonts['h2']
         h3_font = self._markdown_fonts['h3']
         widget._markdown_fonts = self._markdown_fonts
-        widget.tag_configure('md_h1', font=h1_font, spacing1=8, spacing3=4)
-        widget.tag_configure('md_h2', font=h2_font, spacing1=6, spacing3=4)
-        widget.tag_configure('md_h3', font=h3_font, spacing1=6, spacing3=3)
-        widget.tag_configure('md_bold', font=strong_font)
-        widget.tag_configure('md_inline_code', font=code_font, background='#F4EFE4', foreground='#7A5530')
-        widget.tag_configure('md_code_block', font=code_font, background='#F7F3EA', foreground='#5B4D3A', lmargin1=12, lmargin2=12)
-        widget.tag_configure('md_quote', foreground='#6B7C7E', lmargin1=12, lmargin2=12)
-        widget.tag_configure('md_list_marker', foreground='#68898C')
+        text_fg = getattr(widget, '_message_text_fg', self.colors['text_strong'])
+        code_fg = getattr(widget, '_message_code_fg', self.colors['text_strong'])
+        quote_fg = getattr(widget, '_message_quote_fg', self.colors['muted'])
+        marker_fg = getattr(widget, '_message_marker_fg', self.colors['gold_deep'])
+        widget.tag_configure('md_h1', font=h1_font, foreground=text_fg, spacing1=8, spacing3=4)
+        widget.tag_configure('md_h2', font=h2_font, foreground=text_fg, spacing1=6, spacing3=4)
+        widget.tag_configure('md_h3', font=h3_font, foreground=text_fg, spacing1=6, spacing3=3)
+        widget.tag_configure('md_bold', font=strong_font, foreground=text_fg)
+        widget.tag_configure('md_inline_code', font=code_font, background='#F6EBCB', foreground=code_fg)
+        widget.tag_configure('md_code_block', font=code_font, background='#FFF8DD', foreground=code_fg, lmargin1=12, lmargin2=12)
+        widget.tag_configure('md_quote', foreground=quote_fg, lmargin1=12, lmargin2=12)
+        widget.tag_configure('md_list_marker', foreground=marker_fg)
 
     def _markdown_to_plain_text(self, text: str) -> str:
         if not isinstance(text, str) or not text:
@@ -3861,6 +5350,9 @@ class ChatWindow:
         self._turn_thinking_text = ''
         self._turn_thinking_expanded = True  # 新一轮默认展开
         self._turn_thinking_user_closed = False
+        self._terminal_tool_input_texts.clear()
+        self._terminal_tool_block_keys.clear()
+        self._turn_terminal_summaries.clear()
 
     def _insert_terminal_event(self, role: str, text: str):
         text = (text or '').strip()
@@ -4147,13 +5639,15 @@ class ChatWindow:
         except Exception:
             return 50
 
-    def _calc_text_display_lines(self, text: str, char_width: int, *, max_lines: int = 40) -> int:
+    def _calc_text_display_lines(self, text: str, char_width: int, *, max_lines: int | None = 40) -> int:
         """估算文本在给定字符宽度下所需的显示行数。"""
         lines = text.count('\n') + 1
         # 为每行中超出宽度的部分增加额外的换行估算
         for line in text.split('\n'):
             if len(line) > char_width:
                 lines += len(line) // char_width
+        if max_lines is None:
+            return max(1, lines)
         return max(1, min(lines, max_lines))
 
     def _copy_to_clipboard(self, text: str):

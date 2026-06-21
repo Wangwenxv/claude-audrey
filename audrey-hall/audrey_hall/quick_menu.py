@@ -246,8 +246,13 @@ class QuickContextMenu:
         
         # 其他
         self.menu_items.append(QuickMenuItem(
-            label=self._get_chat_label,
-            callback=self._open_chat,
+            label='与奥黛丽聊聊 · Tk',
+            callback=self._open_tk_chat,
+        ))
+
+        self.menu_items.append(QuickMenuItem(
+            label='与奥黛丽聊聊 · WPF',
+            callback=self._open_wpf_chat,
         ))
 
         self.menu_items.append(QuickMenuItem(is_separator=True))
@@ -449,10 +454,6 @@ class QuickContextMenu:
             return "👁 隐藏"
         return "👁 显示"
 
-    def _get_chat_label(self) -> str:
-        """获取 AI 对话菜单文本"""
-        return '与奥黛丽聊聊'
-    
     def _toggle_visible(self):
         """切换显示/隐藏"""
         if self.manager.is_visible():
@@ -466,11 +467,19 @@ class QuickContextMenu:
         from .settings import show_settings_dialog
         show_settings_dialog(self.pet.root, self.manager, self.version)
 
-    def _open_chat(self):
-        """打开 AI 对话窗口"""
-        from .chat_window import show_chat_dialog
+    def _open_tk_chat(self):
+        """打开 Tk AI 对话窗口"""
+        if hasattr(self.manager, 'show_tk_chat_window'):
+            self.manager.show_tk_chat_window(self.pet.root, self.version)
+            return
+        self.manager.show_chat_window(self.pet.root, self.version)
 
-        show_chat_dialog(self.pet.root, self.manager, self.version)
+    def _open_wpf_chat(self):
+        """打开 WPF AI 对话窗口"""
+        if hasattr(self.manager, 'show_wpf_chat_window'):
+            self.manager.show_wpf_chat_window(self.pet.root, self.version)
+            return
+        self.manager.show_chat_window(self.pet.root, self.version)
     
     def _quit(self):
         """退出程序"""
@@ -514,11 +523,6 @@ class QuickContextMenu:
             from .settings import show_settings_dialog
             show_settings_dialog(self.pet.root, self.manager, self.version)
 
-        def on_chat(icon, item):
-            from .chat_window import show_chat_dialog
-
-            show_chat_dialog(self.pet.root, self.manager, self.version)
-        
         def on_quit(icon):
             self.manager.request_quit()
         
@@ -536,7 +540,13 @@ class QuickContextMenu:
                 on_toggle_click_through,
                 checked=lambda it: self.manager.click_through,
             ),
-            pystray.MenuItem("与奥黛丽聊聊", on_chat),
+            pystray.MenuItem(
+                "与奥黛丽聊聊",
+                pystray.Menu(
+                    pystray.MenuItem("Tk 经典窗口", lambda icon, item: self.manager.root.after(0, lambda: self._open_tk_chat())),
+                    pystray.MenuItem("WPF 原生窗口", lambda icon, item: self.manager.root.after(0, lambda: self._open_wpf_chat())),
+                ),
+            ),
             pystray.MenuItem("设置", on_settings),
             pystray.MenuItem("退出", on_quit),
         )
