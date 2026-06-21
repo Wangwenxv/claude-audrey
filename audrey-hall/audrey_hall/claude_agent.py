@@ -228,6 +228,7 @@ class ClaudeCodeSession:
         self._session_id = ''
         self._last_tool_summaries = {}
         self.resume_session_id = (resume_session_id or '').strip()
+        self._turn_id = ''
 
     def _tool_summary_cache_key(self, tool_name: str) -> tuple[str, str] | None:
         session_id = self._session_id.strip()
@@ -514,6 +515,67 @@ class ClaudeCodeSession:
         self._terminal_events.append(payload)
         self._emit(payload)
 
+    def _current_turn_id(self) -> str:
+        if not self._turn_id:
+            self._turn_id = str(uuid.uuid4())
+        return self._turn_id
+
+    def _emit_conversation_event(self, event_type: str, **payload):
+        payload.pop('kind', None)
+        self._emit(
+            {
+                'kind': 'conversation_event',
+                'event_type': event_type,
+                'session_id': self._session_id,
+                'turn_id': payload.pop('turn_id', self._current_turn_id()),
+                'timestamp': _timestamp_text(),
+                **payload,
+            }
+        )
+
+    def _handle_stream_event(self, message: dict):
+        event = message.get('event') or {}
+        stream_type = event.get('type')
+        if not stream_type:
+            return
+        if stream_type == 'message_start':
+            self._turn_id = str(uuid.uuid4())
+            self._emit_conversation_event('turn_request_started')
+            return
+        if stream_type == 'content_block_start':
+            block = event.get('content_block') or {}
+            block_type = block.get('type')
+            block_index = event.get('index')
+            if block_type == 'text':
+                self._emit_conversation_event('assistant_text_started', block_index=block_index)
+            elif block_type == 'thinking':
+                self._emit_conversation_event('thinking_started', block_index=block_index)
+            elif block_type == 'tool_use':
+                self._emit_conversation_event(
+                    'tool_input_started',
+                    block_index=block_index,
+                    tool_use_id=block.get('id'),
+                    tool_name=block.get('name') or '工具',
+                )
+            return
+        if stream_type == 'content_block_delta':
+            delta = event.get('delta') or {}
+            delta_type = delta.get('type')
+            block_index = event.get('index')
+            if delta_type == 'text_delta':
+                self._emit_conversation_event('assistant_text_delta', block_index=block_index, text=delta.get('text') or '')
+            elif delta_type == 'thinking_delta':
+                self._emit_conversation_event('thinking_delta', block_index=block_index, text=delta.get('thinking') or '')
+            elif delta_type == 'input_json_delta':
+                self._emit_conversation_event('tool_input_delta', block_index=block_index, partial_json=delta.get('partial_json') or '')
+            return
+        if stream_type == 'message_delta':
+            delta = event.get('delta') or {}
+            self._emit_conversation_event('turn_usage_updated', usage=event.get('usage') or {}, stop_reason=delta.get('stop_reason'))
+            return
+        if stream_type == 'message_stop':
+            self._emit_conversation_event('message_stream_completed')
+
     def _emit_terminal_line(self, line_kind: str, text: str, **extra):
         compact = text.strip() if isinstance(text, str) else ''
         if not compact:
@@ -647,6 +709,10 @@ class ClaudeCodeSession:
         self._update_session_id(message)
         msg_type = message.get('type')
 
+        if msg_type == 'stream_event':
+            self._handle_stream_event(message)
+            return
+
         if msg_type == 'control_response':
             response = message.get('response') or {}
             request_id = response.get('request_id')
@@ -727,6 +793,13 @@ class ClaudeCodeSession:
                             'tool_use_id': request.get('tool_use_id'),
                         }
                     )
+                    self._emit_conversation_event(
+                        'permission_requested',
+                        request_id=request_id,
+                        tool_name=tool_name,
+                        input=request.get('input') or {},
+                        tool_use_id=request.get('tool_use_id'),
+                    )
             return
 
         if msg_type == 'system':
@@ -751,6 +824,7 @@ class ClaudeCodeSession:
                         'session_id': self._session_id,
                     }
                 )
+                self._emit_conversation_event('thinking_tokens', estimated_tokens=message.get('estimated_tokens'))
                 return
 
             if subtype == 'task_started':
@@ -761,18 +835,21 @@ class ClaudeCodeSession:
                 payload['workflow_name'] = message.get('workflow_name') or ''
                 self._emit_terminal_line('task_progress', payload['summary'] or payload['description'] or '子任务已启动')
                 self._emit(payload)
+                self._emit_conversation_event('task_progress', **payload)
                 return
 
             if subtype == 'task_progress':
                 payload = _task_progress_event(message)
                 self._emit_terminal_line('task_progress', payload.get('summary') or payload.get('description') or '子任务进行中')
                 self._emit(payload)
+                self._emit_conversation_event('task_progress', **payload)
                 return
 
             if subtype == 'task_notification':
                 payload = _task_progress_event(message)
                 self._emit_terminal_line('task_progress', payload.get('summary') or payload.get('description') or '子任务通知')
                 self._emit(payload)
+                self._emit_conversation_event('task_progress', **payload)
                 return
 
             if subtype == 'session_state_changed':
@@ -811,6 +888,15 @@ class ClaudeCodeSession:
                         'status_detail': _extract_string(message.get('status_detail')),
                         'session_id': self._session_id,
                     }
+                )
+                self._emit_conversation_event(
+                    'post_turn_summary',
+                    title=_extract_string(message.get('title')),
+                    description=_extract_string(message.get('description')),
+                    recent_action=_extract_string(message.get('recent_action')),
+                    needs_action=_extract_string(message.get('needs_action')),
+                    status_category=_extract_string(message.get('status_category')),
+                    status_detail=_extract_string(message.get('status_detail')),
                 )
                 return
 
@@ -941,6 +1027,16 @@ class ClaudeCodeSession:
                         'session_id': self._session_id,
                     }
                 )
+                self._emit_conversation_event(
+                    'tool_use_started',
+                    tool_use_id=tool_use.get('id'),
+                    tool_name=tool_name,
+                    input=tool_use.get('input') or {},
+                    summary=summary_text,
+                    total_tokens=self._total_tokens,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                )
 
             # 提取 tool_result 块——包含 Edit/Write 的 diff 输出
             for tool_result in _extract_tool_result_blocks(content):
@@ -957,6 +1053,7 @@ class ClaudeCodeSession:
                             'session_id': self._session_id,
                         }
                     )
+                    self._emit_conversation_event('tool_result', summary=result_text)
 
             thinking_text = _safe_get_thinking_block(content)
             if thinking_text:
@@ -974,6 +1071,13 @@ class ClaudeCodeSession:
                         'session_id': self._session_id,
                     }
                 )
+                self._emit_conversation_event(
+                    'thinking_completed',
+                    text=thinking_text,
+                    total_tokens=self._total_tokens,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                )
 
             text = _safe_get_text_block(content)
             if text:
@@ -987,6 +1091,13 @@ class ClaudeCodeSession:
                         'output_tokens': output_tokens,
                         'session_id': self._session_id,
                     }
+                )
+                self._emit_conversation_event(
+                    'assistant_text_completed',
+                    text=text,
+                    total_tokens=self._total_tokens,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
                 )
             return
 
@@ -1004,6 +1115,12 @@ class ClaudeCodeSession:
                     'session_id': self._session_id,
                 }
             )
+            self._emit_conversation_event(
+                'tool_progress',
+                tool_name=tool_name,
+                elapsed_time_seconds=message.get('elapsed_time_seconds'),
+                task_id=_extract_string(message.get('task_id')),
+            )
             return
 
         if msg_type == 'tool_use_summary':
@@ -1020,6 +1137,7 @@ class ClaudeCodeSession:
                     'session_id': self._session_id,
                 }
             )
+            self._emit_conversation_event('tool_result', summary=summary_text)
             return
 
         if msg_type == 'streamlined_text':
@@ -1034,6 +1152,7 @@ class ClaudeCodeSession:
                         'session_id': self._session_id,
                     }
                 )
+                self._emit_conversation_event('assistant_text_completed', text=text, total_tokens=self._total_tokens)
             return
 
         if msg_type == 'streamlined_tool_use_summary':
@@ -1044,6 +1163,7 @@ class ClaudeCodeSession:
                     'session_id': self._session_id,
                 }
             )
+            self._emit_conversation_event('tool_result', summary=_extract_string(message.get('tool_summary')))
             return
 
         if msg_type == 'result':
@@ -1066,6 +1186,14 @@ class ClaudeCodeSession:
                         'session_id': self._session_id,
                     }
                 )
+                self._emit_conversation_event(
+                    'turn_completed',
+                    text=result_text,
+                    total_tokens=self._total_tokens,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                )
+                self._turn_id = ''
             else:
                 errors = message.get('errors') or []
                 error_text = '\n'.join(str(item) for item in errors if item)
@@ -1083,6 +1211,14 @@ class ClaudeCodeSession:
                         'session_id': self._session_id,
                     }
                 )
+                self._emit_conversation_event(
+                    'turn_failed',
+                    text=error_text,
+                    total_tokens=self._total_tokens,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                )
+                self._turn_id = ''
 
     def _update_session_id(self, message: dict):
         session_id = message.get('session_id')

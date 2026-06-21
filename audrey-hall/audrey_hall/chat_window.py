@@ -76,6 +76,7 @@ EVENT_POLL_INTERVAL_MS = 100
 EVENT_DRAIN_BUDGET_MS = 12
 EVENT_BATCH_LIMIT = 80
 INLINE_STATUS_DEBOUNCE_MS = 120
+STREAM_RENDER_INTERVAL_MS = 33
 MAX_COLLAPSED_MESSAGE_LINES = 12
 MAX_INLINE_TOOL_RESULT_CHARS = 12000
 MAX_INLINE_TOOL_RESULT_LINES = 120
@@ -115,6 +116,269 @@ def _normalize_permission_mode(mode: str | None) -> str:
     if not normalized:
         return 'default'
     return PERMISSION_MODE_ALIASES.get(normalized.lower(), normalized)
+
+
+class ChatTimelineStore:
+    def __init__(self):
+        self._items = []
+        self._by_key = {}
+
+    def clear(self):
+        self._items = []
+        self._by_key = {}
+
+    def append(self, item: dict) -> dict:
+        item = dict(item)
+        item.setdefault('id', f"timeline-{len(self._items) + 1}-{int(time.time() * 1000)}")
+        self._items.append(item)
+        key = item.get('key')
+        if key:
+            self._by_key[key] = item
+        return item
+
+    def upsert(self, key: str, item: dict) -> tuple[dict, bool]:
+        if key in self._by_key:
+            existing = self._by_key[key]
+            existing.update(item)
+            existing['key'] = key
+            return existing, False
+        item = dict(item)
+        item['key'] = key
+        return self.append(item), True
+
+    def complete(self, key: str, patch: dict) -> dict | None:
+        item = self._by_key.get(key)
+        if item is None:
+            return None
+        item.update(patch)
+        item.setdefault('state', 'done')
+        return item
+
+
+class TimelineRenderer:
+    def __init__(self, owner):
+        self.owner = owner
+        self.widgets = {}
+
+    def clear(self):
+        for bundle in self.widgets.values():
+            job = bundle.get('flush_job') if isinstance(bundle, dict) else None
+            if job is not None:
+                try:
+                    self.owner.window.after_cancel(job)
+                except Exception:
+                    pass
+        self.widgets = {}
+
+    def render(self, item: dict):
+        kind = item.get('kind')
+        item_id = item.get('id')
+        if kind in {'user_message', 'assistant_message'}:
+            role = 'user' if kind == 'user_message' else 'assistant'
+            self.owner._append_message(role, item.get('text') or '')
+            return
+        if kind == 'streaming_assistant_message':
+            self._upsert_streaming_message(item)
+            return
+        self._upsert_card(item_id, item)
+
+    def _upsert_streaming_message(self, item: dict):
+        item_id = item.get('id')
+        bundle = self.widgets.get(item_id)
+        text = item.get('text') or '...'
+        if bundle is None:
+            card = self.owner._create_message_widget('assistant', text)
+            self.owner._capture_transcript_follow_state()
+            self.owner.text_area.config(state=tk.NORMAL)
+            self.owner.text_area.insert(tk.END, '\n')
+            self.owner.text_area.window_create(tk.END, window=card, padx=4, pady=4)
+            self.owner.text_area.insert(tk.END, '\n')
+            self.owner.text_area.config(state=tk.DISABLED)
+            self.widgets[item_id] = {'card': card, 'text': text, 'kind': item.get('kind')}
+            self.owner._maybe_follow_transcript_end()
+            return
+        if bundle.get('text') == text:
+            return
+        if item.get('state') == 'done':
+            flush_job = bundle.get('flush_job')
+            if flush_job is not None and self.owner.window is not None:
+                try:
+                    self.owner.window.after_cancel(flush_job)
+                except Exception:
+                    pass
+                bundle['flush_job'] = None
+            self._flush_streaming_message(item_id, text)
+            return
+        bundle['pending_text'] = text
+        if bundle.get('flush_job') is not None:
+            return
+        if self.owner.window is None:
+            self._flush_streaming_message(item_id, text)
+            return
+        bundle['flush_job'] = self.owner.window.after(
+            STREAM_RENDER_INTERVAL_MS,
+            lambda key=item_id: self._flush_streaming_message(key),
+        )
+
+    def _flush_streaming_message(self, item_id: str, forced_text: str | None = None):
+        bundle = self.widgets.get(item_id)
+        if bundle is None:
+            return
+        bundle['flush_job'] = None
+        text = forced_text if forced_text is not None else bundle.get('pending_text')
+        if not isinstance(text, str) or bundle.get('text') == text:
+            return
+        bundle['text'] = text
+        bundle['pending_text'] = None
+        self.owner._update_message_widget_text(bundle.get('card'), text)
+
+    def _upsert_card(self, item_id: str, item: dict):
+        bundle = self.widgets.get(item_id)
+        if bundle is None:
+            card, labels, buttons = self._create_card(item)
+            self.widgets[item_id] = {'card': card, 'labels': labels, 'buttons': buttons, 'kind': item.get('kind')}
+            self.owner._insert_inline_card(card)
+            return
+        self._update_card(bundle, item)
+
+    def _timeline_colors(self, kind: str) -> tuple[str, str]:
+        tokens = self.owner.chat_theme.get('timeline', {})
+        if kind == 'permission_card':
+            return '#F8FBFA', tokens.get('permission_border', self.owner.colors['gold'])
+        if kind == 'question_card':
+            return '#F8FBFA', tokens.get('question_border', self.owner.colors['gold'])
+        if kind in {'tool_card', 'task_card'}:
+            return '#F8FBFA', tokens.get('tool_border', self.owner.colors['border_strong'])
+        if kind == 'thinking_card':
+            return '#F8FBFA', tokens.get('thinking_border', self.owner.colors['gold_bright'])
+        if kind == 'error_card':
+            return '#FFF7F7', tokens.get('error_border', '#DAB8BE')
+        if kind in {'tool_result_card', 'summary_card'}:
+            return '#FDFEFD', tokens.get('result_border', self.owner.colors['border'])
+        return '#F8FBFA', tokens.get('status_border', self.owner.colors['border'])
+
+    def _terminal_prefix(self, kind: str, state: str) -> str:
+        if state == 'error' or kind == 'error_card':
+            return '!'
+        if kind == 'thinking_card':
+            return '*'
+        if kind in {'tool_card', 'task_card'}:
+            return '>'
+        if kind == 'tool_result_card':
+            return '⎿'
+        if kind in {'permission_card', 'question_card'}:
+            return '?'
+        if kind == 'summary_card' or state == 'done':
+            return '✓'
+        return '•'
+
+    def _terminal_block_width(self) -> int:
+        return max(360, self.owner._transcript_width - 32)
+
+    def _terminal_wraplength(self) -> int:
+        return max(260, self._terminal_block_width() - 56)
+
+    def _badge_text(self, item: dict) -> str:
+        state = str(item.get('state') or 'running').upper()
+        return {'STREAMING': 'LIVE', 'RUNNING': 'RUNNING', 'WAITING': 'ACTION', 'DONE': 'DONE', 'ERROR': 'ERROR'}.get(state, state)
+
+    def _create_card(self, item: dict):
+        kind = item.get('kind') or 'status_card'
+        _bg, accent = self._timeline_colors(kind)
+        bg = self.owner.colors['panel']
+        state = str(item.get('state') or 'running').lower()
+        block_width = self._terminal_block_width()
+        wraplength = self._terminal_wraplength()
+        card = tk.Frame(self.owner.text_area, bg=bg, bd=0, highlightthickness=0, width=block_width)
+        body = tk.Frame(card, bg=bg, bd=0, highlightthickness=0, width=block_width)
+        body.pack(fill=tk.X, expand=True, padx=0, pady=1)
+        row = tk.Frame(body, bg=bg)
+        row.pack(fill=tk.X, padx=4, pady=(5, 1))
+        prefix = tk.Label(row, text=self._terminal_prefix(kind, state), font=('Consolas', 11, 'bold'), bg=bg, fg=accent, width=2, anchor='w')
+        prefix.pack(side=tk.LEFT, anchor='n')
+        title_text = item.get('title') or '状态更新'
+        title = tk.Label(row, text=title_text, font=('Consolas', 10, 'bold'), bg=bg, fg=self.owner.colors['text_strong'], anchor='w', justify='left')
+        title.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        badge = tk.Label(row, text=self._badge_text(item), font=('Consolas', 8), bg=bg, fg=self.owner.colors['muted'], padx=6, pady=0)
+        badge.pack(side=tk.RIGHT)
+        detail = tk.Label(body, text=item.get('text') or item.get('detail') or '', font=('Consolas', 9), bg=bg, fg=self.owner.colors['text'], anchor='w', justify='left', wraplength=wraplength)
+        detail.pack(fill=tk.X, padx=(30, 4), pady=(0, 1))
+        meta = tk.Label(body, text=item.get('meta_text') or item.get('timestamp') or '', font=('Consolas', 8), bg=bg, fg=self.owner.colors['muted'], anchor='w', justify='left', wraplength=wraplength)
+        meta.pack(fill=tk.X, padx=(30, 4), pady=(0, 5))
+        actions = tk.Frame(body, bg=bg)
+        buttons = {}
+        if item.get('actions'):
+            actions.pack(fill=tk.X, padx=(30, 4), pady=(0, 7))
+            for action in item.get('actions') or []:
+                label = action.get('label') or '确定'
+                buttons[label] = create_button(
+                    actions,
+                    text=label,
+                    command=action.get('command'),
+                    theme=self.owner.theme,
+                    variant=action.get('variant') or 'secondary',
+                    font=self.owner.fonts['control'],
+                    padx=12,
+                    pady=5,
+                )
+                buttons[label].pack(side=tk.LEFT, padx=(0, 8), pady=(0, 2))
+        return card, {'prefix': prefix, 'title': title, 'badge': badge, 'detail': detail, 'meta': meta}, buttons
+
+    def _update_card(self, bundle: dict, item: dict):
+        labels = bundle.get('labels') or {}
+        try:
+            title_text = item.get('title') or '状态更新'
+            badge_text = self._badge_text(item)
+            detail_text = item.get('text') or item.get('detail') or ''
+            meta_text = item.get('meta_text') or item.get('timestamp') or ''
+            if bundle.get('title_text') != title_text:
+                labels['title'].config(text=title_text)
+                bundle['title_text'] = title_text
+            if bundle.get('badge_text') != badge_text:
+                labels['badge'].config(text=badge_text)
+                bundle['badge_text'] = badge_text
+            if bundle.get('detail_text') != detail_text:
+                labels['detail'].config(text=detail_text)
+                bundle['detail_text'] = detail_text
+            if bundle.get('meta_text') != meta_text:
+                labels['meta'].config(text=meta_text)
+                bundle['meta_text'] = meta_text
+            labels['detail'].config(wraplength=self._terminal_wraplength())
+            labels['meta'].config(wraplength=self._terminal_wraplength())
+            prefix = labels.get('prefix')
+            if prefix is not None:
+                prefix.config(text=self._terminal_prefix(item.get('kind') or 'status_card', str(item.get('state') or 'running').lower()))
+            if item.get('state') in {'done', 'error'}:
+                for button in (bundle.get('buttons') or {}).values():
+                    button.config(state=tk.DISABLED)
+        except Exception:
+            pass
+
+
+class CommandIntentController:
+    def __init__(self, owner):
+        self.owner = owner
+
+    def detect(self, text: str) -> dict:
+        stripped = (text or '').strip()
+        lowered = stripped.lower()
+        if lowered.startswith('/model'):
+            return {'intent': 'model_select', 'confidence': 1.0, 'args': stripped[6:].strip()}
+        if lowered.startswith('/mode'):
+            return {'intent': 'mode_select', 'confidence': 1.0, 'args': stripped[5:].strip()}
+        if lowered.startswith('/btw'):
+            return {'intent': 'side_question', 'confidence': 1.0, 'args': stripped[4:].strip()}
+        if lowered.startswith('/raw'):
+            return {'intent': 'raw_toggle', 'confidence': 1.0, 'args': ''}
+        if any(cue in stripped for cue in ('切换模型', '换成 opus', '用 sonnet', '用 opus')):
+            return {'intent': 'model_select', 'confidence': 0.7, 'args': ''}
+        if any(cue in stripped for cue in ('计划模式', '自动模式', '允许改文件', '全权限')):
+            return {'intent': 'mode_select', 'confidence': 0.7, 'args': ''}
+        if self.owner._busy:
+            return {'intent': 'side_question_confirm', 'confidence': 0.8, 'args': stripped}
+        if stripped.startswith('/'):
+            return {'intent': 'local_help', 'confidence': 1.0, 'args': stripped}
+        return {'intent': 'normal', 'confidence': 1.0, 'args': stripped}
 
 
 class ChatWindow:
@@ -229,6 +493,14 @@ class ChatWindow:
         self._status_dot_phase = 0.0
         self._status_dot_tween = None
         self._status_fade_seq = 0  # 状态行淡入用的自增标签序号
+        self._timeline_store = ChatTimelineStore()
+        self._timeline_renderer = TimelineRenderer(self)
+        self._command_intents = CommandIntentController(self)
+        self._processed_conversation_events = set()
+        self._last_streaming_text_key = ''
+        self._terminal_tool_input_texts = {}
+        self._terminal_tool_block_keys = {}
+        self._using_conversation_events = False
 
         self.theme = get_theme()
         self.fonts = self.theme['fonts']
@@ -1090,6 +1362,27 @@ class ChatWindow:
         self.status_var.set(compact)
         self._set_agent_activity('status', title, compact, badge)
 
+    def _timeline_timestamp(self) -> str:
+        return datetime.now().strftime('%H:%M:%S')
+
+    def _timeline_append(self, item: dict):
+        item.setdefault('timestamp', self._timeline_timestamp())
+        rendered = self._timeline_store.append(item)
+        self._timeline_renderer.render(rendered)
+        return rendered
+
+    def _timeline_upsert(self, key: str, item: dict):
+        item.setdefault('timestamp', self._timeline_timestamp())
+        rendered, _created = self._timeline_store.upsert(key, item)
+        self._timeline_renderer.render(rendered)
+        return rendered
+
+    def _timeline_complete(self, key: str, patch: dict):
+        rendered = self._timeline_store.complete(key, patch)
+        if rendered is not None:
+            self._timeline_renderer.render(rendered)
+        return rendered
+
     def show(self):
         if self.window is not None and self.window.winfo_exists():
             self.window.lift()
@@ -1302,7 +1595,7 @@ class ChatWindow:
             anchor='w',
         ).pack(side=tk.LEFT, padx=(12, 0))
         self._refresh_terminal_button()
-        self._create_agent_activity_panel(content_frame)
+        self._agent_activity_packed = False
 
         # 先把底部的输入区和按钮行用 side=BOTTOM 占住空间，再让会话区填充剩余
         # 区域。这样无论窗口被压到多小（高 DPI / 小屏），输入框都不会被会话区
@@ -1533,6 +1826,30 @@ class ChatWindow:
             style_overrides=self._aurora_button_style(),
         )
         upload_button.pack(side=tk.LEFT, padx=(0, 8))
+
+        model_button = create_button(
+            action_group_secondary,
+            text='模型',
+            command=self._show_model_picker_card,
+            theme=self.theme,
+            variant='secondary',
+            width=10,
+            font=self.fonts['control'],
+            style_overrides=self._aurora_button_style(),
+        )
+        model_button.pack(side=tk.LEFT, padx=(0, 8))
+
+        mode_button = create_button(
+            action_group_secondary,
+            text='模式',
+            command=self._show_mode_picker_card,
+            theme=self.theme,
+            variant='secondary',
+            width=10,
+            font=self.fonts['control'],
+            style_overrides=self._aurora_button_style(),
+        )
+        mode_button.pack(side=tk.LEFT, padx=(0, 8))
 
         self.send_button = create_button(
             action_group_primary,
@@ -2156,9 +2473,15 @@ class ChatWindow:
     def _reset_transcript_view(self):
         self._conversation_history = []
         self._pending_perm_frames = {}
+        self._pending_question_cards = {}
         self._message_widgets = []
         self._task_widgets = {}
         self._tool_status_widget = None
+        self._timeline_store.clear()
+        self._timeline_renderer.clear()
+        self._processed_conversation_events.clear()
+        self._last_streaming_text_key = ''
+        self._using_conversation_events = False
         self._last_message_char_width = None
         self._last_status_texts.clear()
         self._last_thinking_tokens = None
@@ -2536,11 +2859,13 @@ class ChatWindow:
         if not text and not has_attachments:
             return
 
+        intent = self._command_intents.detect(text)
+
         if has_attachments and self._is_local_only_command(text):
             self._append_inline_status('图片附件暂不支持 /model、/mode、/btw、/raw 这类本地命令。')
             return
 
-        if text and self._handle_local_command(text):
+        if text and intent.get('intent') != 'normal' and self._handle_local_command(text, intent=intent):
             self.input_box.delete('1.0', tk.END)
             self._resize_input_to_content()
             return
@@ -2593,7 +2918,7 @@ class ChatWindow:
             except Exception:
                 pass
 
-        self._append_message('user', visible_text)
+        self._timeline_append({'kind': 'user_message', 'text': visible_text})
         self._set_agent_activity('thinking', '奥黛丽正在整理思路', self._task_progress_compact_text(visible_text), 'THINKING')
         self._set_status_and_agent('奥黛丽 正在思考...', '奥黛丽正在整理思路', 'THINKING')
         self._set_busy(True)
@@ -2610,8 +2935,17 @@ class ChatWindow:
             return False
         return True
 
-    def _handle_local_command(self, text: str) -> bool:
+    def _handle_local_command(self, text: str, intent: dict | None = None) -> bool:
         if not text.startswith('/'):
+            if intent and intent.get('intent') == 'side_question_confirm':
+                self._show_side_question_confirm_card(intent.get('args') or text)
+                return True
+            if intent and intent.get('intent') == 'model_select':
+                self._show_model_picker_card()
+                return True
+            if intent and intent.get('intent') == 'mode_select':
+                self._show_mode_picker_card()
+                return True
             return False
 
         command_text = text[1:].strip()
@@ -2623,37 +2957,29 @@ class ChatWindow:
         args = raw_args.strip()
 
         if command == 'model':
-            self._append_message('user', text, record_history=False)
             self._handle_model_command(args)
             return True
 
         if command == 'mode':
-            self._append_message('user', text, record_history=False)
             self._handle_mode_command(args)
             return True
 
         if command == 'btw':
-            self._append_message('user', text, record_history=False)
             self._handle_btw_command(args)
             return True
 
         if command == 'raw':
-            self._append_message('user', text, record_history=False)
             self._raw_mode = not self._raw_mode
             if self._terminal_view is not None:
                 self._terminal_view.set_show_raw(self._raw_mode)
             state = '开启' if self._raw_mode else '关闭'
-            self._append_inline_status(f'过程视图原始输出模式已{state}')
+            self._timeline_append({'kind': 'status_card', 'state': 'done', 'title': '原始 JSON', 'text': f'过程视图原始输出模式已{state}'})
             return True
 
         if command == 'cost':
             return False
 
-        self._append_message('user', text, record_history=False)
-        self._append_message(
-            'warn',
-            f'当前对话框尚未适配本地命令：/{command}。当前已支持：/model、/mode、/btw、/raw；/cost 将交给 Claude Code 处理。',
-        )
+        self._timeline_append({'kind': 'status_card', 'state': 'done', 'title': '可用本地命令', 'text': f'/{command} 不是本地控件。可用：/model、/mode、/btw、/raw；/cost 会交给 Claude Code。'})
         return True
 
     def _format_mode_status(self):
@@ -2693,10 +3019,7 @@ class ChatWindow:
         lowered = normalized.lower()
 
         if not normalized:
-            available = ' | '.join(mode for mode, _ in MODE_CHOICES)
-            self._append_inline_status(
-                f'当前模式：{MODE_LABELS.get(self._active_permission_mode, self._active_permission_mode)}；可用：{available}'
-            )
+            self._show_mode_picker_card()
             return
 
         if lowered in {'help', '-h', '--help', '?'}:
@@ -2709,7 +3032,7 @@ class ChatWindow:
 
         target_mode = PERMISSION_MODE_ALIASES.get(lowered)
         if target_mode is None:
-            self._append_message('warn', '不支持的模式。可用：default、acceptEdits、auto、plan。')
+            self._timeline_append({'kind': 'error_card', 'state': 'error', 'title': '模式不可用', 'text': '可用：default、acceptEdits、auto、plan。'})
             return
 
         self._apply_permission_mode(target_mode)
@@ -2787,6 +3110,27 @@ class ChatWindow:
 
         self._insert_inline_card(card)
 
+    def _show_mode_picker_card(self):
+        actions = []
+        for mode, label in MODE_CHOICES:
+            actions.append(
+                {
+                    'label': label,
+                    'variant': 'primary' if mode == self._active_permission_mode else 'secondary',
+                    'command': lambda selected=mode: self._apply_permission_mode(selected),
+                }
+            )
+        self._timeline_append(
+            {
+                'kind': 'status_card',
+                'state': 'waiting',
+                'title': '选择运行模式',
+                'text': '请选择奥黛丽接下来处理工具和文件改动的方式。',
+                'meta_text': f'当前模式：{self._format_mode_status()}',
+                'actions': actions,
+            }
+        )
+
     def _handle_model_choice(self, selected: str, card):
         try:
             card.destroy()
@@ -2861,6 +3205,25 @@ class ChatWindow:
             return
 
         self._pending_side_question_labels[request_id] = status_label
+
+    def _show_side_question_confirm_card(self, question: str):
+        compact = (question or '').strip()
+        if not compact:
+            return
+        self._timeline_append(
+            {
+                'kind': 'question_card',
+                'state': 'waiting',
+                'title': '当前奥黛丽还在工作',
+                'text': compact,
+                'meta_text': '要把这句话作为旁路问题发送吗？',
+                'actions': [
+                    {'label': '发送旁路问题', 'variant': 'primary', 'command': lambda q=compact: self._handle_btw_command(q)},
+                    {'label': '排队到下一轮', 'command': lambda q=compact: self._append_inline_status(f'已暂存：{q}')},
+                    {'label': '取消', 'command': lambda: self._append_inline_status('已取消旁路提问')},
+                ],
+            }
+        )
 
     def _update_side_question_result(self, status_label, text: str, is_error: bool):
         if status_label is None:
@@ -2938,6 +3301,14 @@ class ChatWindow:
         self._last_busy_event_time = datetime.now()
 
         if kind in {'terminal_line', 'stdout_raw_line', 'stderr_raw_line'}:
+            return
+
+        if kind == 'conversation_event':
+            self._using_conversation_events = True
+            self._handle_conversation_event(event)
+            return
+
+        if self._using_conversation_events and kind in {'assistant', 'working', 'thinking', 'task_progress', 'tool_use_summary', 'tool_progress'}:
             return
 
         if kind == 'assistant':
@@ -3174,6 +3545,197 @@ class ChatWindow:
             self._set_agent_activity('error', '工作流中断', error_text, 'ERROR')
             self._append_message('error', error_text)
 
+    def _conversation_event_identity(self, event: dict) -> tuple:
+        event_type = event.get('event_type')
+        turn_id = event.get('turn_id')
+        request_id = event.get('request_id')
+        tool_use_id = event.get('tool_use_id')
+        text = event.get('text') or event.get('summary') or ''
+        return (event_type, turn_id, request_id, tool_use_id, text[:80])
+
+    def _handle_conversation_event(self, event: dict):
+        event_type = event.get('event_type')
+        turn_id = event.get('turn_id') or 'turn'
+        identity = self._conversation_event_identity(event)
+        if event_type in {'assistant_text_completed', 'thinking_completed', 'tool_use_started', 'tool_result', 'permission_requested', 'task_progress'}:
+            if identity in self._processed_conversation_events:
+                return
+            self._processed_conversation_events.add(identity)
+
+        if event_type == 'turn_request_started':
+            self._timeline_upsert(
+                f'status:{turn_id}',
+                {
+                    'kind': 'status_card',
+                    'state': 'running',
+                    'title': 'requesting',
+                    'text': 'model stream opened; waiting for first content block',
+                    'meta_text': self._build_status_suffix().strip('<>'),
+                },
+            )
+            return
+
+        if event_type == 'assistant_text_started':
+            key = f'assistant-stream:{turn_id}:{event.get("block_index", 0)}'
+            self._last_streaming_text_key = key
+            self._timeline_upsert(key, {'kind': 'streaming_assistant_message', 'state': 'streaming', 'text': '...'})
+            self._timeline_upsert(
+                f'status:{turn_id}',
+                {'kind': 'status_card', 'state': 'running', 'title': 'responding', 'text': 'assistant text block is streaming'},
+            )
+            return
+
+        if event_type == 'assistant_text_delta':
+            key = f'assistant-stream:{turn_id}:{event.get("block_index", 0)}'
+            current = self._timeline_store._by_key.get(key) or {}
+            text = (current.get('text') or '')
+            if text == '...':
+                text = ''
+            self._timeline_upsert(key, {'kind': 'streaming_assistant_message', 'state': 'streaming', 'text': text + (event.get('text') or '')})
+            return
+
+        if event_type == 'assistant_text_completed':
+            text = event.get('text') or ''
+            key = self._last_streaming_text_key
+            if key:
+                self._timeline_complete(key, {'kind': 'streaming_assistant_message', 'state': 'done', 'text': text})
+            elif text:
+                self._timeline_append({'kind': 'assistant_message', 'text': text})
+            self._update_total_tokens(event.get('total_tokens'))
+            self._update_total_io_tokens(event.get('input_tokens'), event.get('output_tokens'))
+            self._maybe_show_choice_buttons(text)
+            return
+
+        if event_type in {'thinking_started', 'thinking_delta', 'thinking_tokens', 'thinking_completed'}:
+            key = f'thinking:{turn_id}'
+            token_text = ''
+            estimated = event.get('estimated_tokens')
+            if isinstance(estimated, int):
+                token_text = f'output tokens: {self._format_token_count(estimated)}'
+            if event_type == 'thinking_completed':
+                token_text = self._compose_arrow_tokens(input_tokens=event.get('input_tokens'), output_tokens=event.get('output_tokens')) or 'thinking block sealed'
+            self._timeline_upsert(
+                key,
+                {
+                    'kind': 'thinking_card',
+                    'state': 'done' if event_type == 'thinking_completed' else 'running',
+                    'title': 'thinking',
+                    'text': token_text or 'streaming hidden reasoning block',
+                    'meta_text': 'main transcript shows phase and token count; full raw stream stays in process view',
+                },
+            )
+            return
+
+        if event_type in {'tool_input_started', 'tool_input_delta', 'tool_use_started', 'tool_progress'}:
+            tool_name = event.get('tool_name') or '工具'
+            block_index = event.get('block_index', 0)
+            block_key = f'{turn_id}:{block_index}'
+            tool_id = event.get('tool_use_id') or event.get('task_id')
+            if tool_id:
+                self._terminal_tool_block_keys[block_key] = tool_id
+            else:
+                tool_id = self._terminal_tool_block_keys.get(block_key) or f'{turn_id}:{block_index}:{tool_name}'
+            key = f'tool:{tool_id}'
+            current = self._timeline_store._by_key.get(key) or {}
+            detail = event.get('summary') or current.get('text') or self._summarize_working_input(tool_name, event.get('input') or {})
+            title = self._format_tool_title(tool_name)
+            if event_type == 'tool_input_delta':
+                partial = event.get('partial_json') or ''
+                previous = self._terminal_tool_input_texts.get(key, '')
+                self._terminal_tool_input_texts[key] = previous + partial
+                detail = self._task_progress_compact_text(self._terminal_tool_input_texts[key]) or 'building tool input json'
+                title = f'tool-input: {tool_name}'
+            elif event_type == 'tool_input_started':
+                detail = detail or 'building tool input json'
+                title = f'tool-input: {tool_name}'
+            elif event_type == 'tool_use_started':
+                detail = detail or 'tool execution queued'
+                title = f'tool-use: {tool_name}'
+            if event_type == 'tool_progress':
+                detail = self._format_tool_progress(event)
+                title = f'tool-use: {tool_name}'
+            self._timeline_upsert(
+                key,
+                {
+                    'kind': 'tool_card',
+                    'state': 'running',
+                    'title': title,
+                    'text': detail or '正在准备工具调用。',
+                    'meta_text': self._build_status_suffix().strip('<>'),
+                },
+            )
+            return
+
+        if event_type == 'tool_result':
+            summary = event.get('summary') or ''
+            if summary:
+                preview_lines = summary.splitlines()
+                preview = preview_lines[0] if preview_lines else '工具已返回结果。'
+                self._timeline_append(
+                    {
+                        'kind': 'tool_result_card',
+                        'state': 'done',
+                        'title': f'tool-result: {len(preview_lines)} lines',
+                        'text': self._task_progress_compact_text(preview),
+                        'meta_text': 'open process view for complete raw output',
+                    }
+                )
+            return
+
+        if event_type == 'task_progress':
+            text = self._format_task_progress(event)
+            task_key = event.get('task_id') or event.get('tool_use_id') or text or turn_id
+            status = str(event.get('status') or 'running').lower()
+            self._timeline_upsert(
+                f'task:{task_key}',
+                {
+                    'kind': 'task_card',
+                    'state': 'done' if status in {'completed', 'failed', 'stopped'} else 'running',
+                    'title': 'task-agent',
+                    'text': text or '子代理正在处理任务。',
+                    'meta_text': self._build_status_suffix(self._task_usage_total_tokens(event.get('usage'))).strip('<>'),
+                },
+            )
+            return
+
+        if event_type == 'permission_requested':
+            self._handle_permission_request(
+                {
+                    'request_id': event.get('request_id'),
+                    'tool_name': event.get('tool_name'),
+                    'input': event.get('input') or {},
+                    'tool_use_id': event.get('tool_use_id'),
+                }
+            )
+            return
+
+        if event_type == 'post_turn_summary':
+            self._render_post_turn_summary(event)
+            return
+
+        if event_type == 'turn_completed':
+            self._timeline_upsert(f'status:{turn_id}', {'kind': 'summary_card', 'state': 'done', 'title': 'turn-complete', 'text': 'assistant turn closed; Audrey is idle'})
+            return
+
+        if event_type == 'turn_failed':
+            self._timeline_append({'kind': 'error_card', 'state': 'error', 'title': 'turn-failed', 'text': event.get('text') or 'Claude Code 返回错误。'})
+
+    def _format_tool_title(self, tool_name: str) -> str:
+        labels = {
+            'Read': '读取文件',
+            'Grep': '搜索内容',
+            'Glob': '匹配文件',
+            'Bash': '执行命令',
+            'PowerShell': '执行命令',
+            'Edit': '修改文件',
+            'Write': '写入文件',
+            'WebFetch': '访问网络',
+            'WebSearch': '搜索网络',
+            'Task': '子代理任务',
+            'Agent': '子代理任务',
+        }
+        return labels.get(str(tool_name or '').strip(), str(tool_name or '工具'))
+
     def _handle_permission_request(self, event: dict):
         tool_name = event.get('tool_name') or '未知工具'
         request_id = event.get('request_id')
@@ -3364,13 +3926,23 @@ class ChatWindow:
             updated_input['answers'] = answers
             self.session.respond_permission(request_id, True, updated_input=updated_input)
             self._pending_question_cards.pop(request_id, None)
-            status_label.config(text='已提交答案，奥黛丽继续处理中...', fg=self.colors['muted'])
+            status_label.config(text='已回答：' + '；'.join(f'{key}: {value}' for key, value in answers.items()), fg=self.colors['muted'])
+            for child in action_row.winfo_children():
+                try:
+                    child.config(state=tk.DISABLED)
+                except Exception:
+                    pass
             self._append_inline_status('已回答奥黛丽的问题')
 
         def decline_answers():
             self.session.respond_permission(request_id, False)
             self._pending_question_cards.pop(request_id, None)
-            self._destroy_widget(card)
+            status_label.config(text='已拒绝回答，奥黛丽会据此继续处理。', fg=self.colors['accent_dark'])
+            for child in action_row.winfo_children():
+                try:
+                    child.config(state=tk.DISABLED)
+                except Exception:
+                    pass
 
         action_row = tk.Frame(card, bg=self.colors['assistant'])
         action_row.pack(fill=tk.X, padx=10, pady=(0, 10))
@@ -3399,78 +3971,16 @@ class ChatWindow:
         self._pending_question_cards[request_id] = card
 
     def _show_permission_card(self, request_id, tool_name, input_payload):
-        """在对话流中内嵌一张权限确认卡片，不再弹出抢焦点的模态窗。"""
-        follow_transcript = self._capture_transcript_follow_state()
         summary = json.dumps(input_payload, ensure_ascii=False, indent=2)
         if len(summary) > self.chat_theme['permission_summary_max_chars']:
             summary = summary[: self.chat_theme['permission_summary_max_chars']] + ' …'
-        style = self._permission_card_style()
-
-        self.text_area.config(state=tk.NORMAL)
-        self.text_area.insert(tk.END, '\n')
-
-        card = tk.Frame(
-            self.text_area,
-            bg=style['card_border'],
-            bd=0,
-            highlightthickness=0,
-        )
-        card_body = tk.Frame(card, bg=style['card_bg'], bd=0, highlightthickness=0)
-        card_body.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
-
-        accent_bar = tk.Frame(card_body, bg=style['accent_line'], height=3)
-        accent_bar.pack(fill=tk.X)
-
-        header = tk.Frame(card_body, bg=style['card_bg'])
-        header.pack(fill=tk.X, padx=14, pady=(10, 6))
-        tk.Label(
-            header,
-            text='AURORA PERMISSION',
-            font=self.fonts['small'],
-            bg=style['card_bg'],
-            fg=self.colors['gold'],
-            anchor='w',
-        ).pack(anchor='w')
-        tk.Label(
-            header,
-            text=f'请求执行工具：{tool_name}',
-            font=self.fonts['control'],
-            bg=style['card_bg'],
-            fg=style['title_fg'],
-            anchor='w',
-            justify='left',
-        ).pack(anchor='w', pady=(4, 0))
-
-        if input_payload:
-            summary_frame = tk.Frame(card_body, bg=style['summary_bg'])
-            summary_frame.pack(fill=tk.X, padx=14, pady=(0, 10))
-            tk.Label(
-                summary_frame,
-                text=summary,
-                font=self.fonts['small'],
-                bg=style['summary_bg'],
-                fg=style['summary_fg'],
-                anchor='w',
-                justify='left',
-                wraplength=self.chat_theme['permission_wraplength'],
-                padx=12,
-                pady=10,
-            ).pack(fill=tk.X)
-
-        btn_row = tk.Frame(card_body, bg=style['card_bg'])
-        btn_row.pack(fill=tk.X, padx=14, pady=(0, 12))
+        key = f'permission:{request_id}'
 
         def resolve(allow, always=False):
             if always and allow:
                 self._auto_allow_tools.add(tool_name)
             self.session.respond_permission(request_id, allow)
             self._clear_inline_status()
-            frame = self._pending_perm_frames.pop(request_id, None)
-            if frame is not None:
-                try:
-                    frame.destroy()
-                except Exception:
-                    pass
             if allow:
                 txt = f'总是允许工具：{tool_name}' if always else f'已允许工具调用：{tool_name}'
                 self._update_bubble_state(
@@ -3482,48 +3992,23 @@ class ChatWindow:
                 )
             else:
                 txt = f'已拒绝工具调用：{tool_name}'
-            self._render_main_status(txt)
+            self._timeline_complete(key, {'kind': 'permission_card', 'state': 'done', 'title': 'permission-resolved', 'text': txt, 'meta_text': 'permission request handled'})
 
-        create_button(
-            btn_row,
-            text='允许',
-            command=lambda: resolve(True),
-            theme=self.theme,
-            variant='primary',
-            font=self.fonts['control'],
-            style_overrides=style['button_primary'],
-            padx=12,
-            pady=7,
-        ).pack(side=tk.LEFT)
-        create_button(
-            btn_row,
-            text='总是允许',
-            command=lambda: resolve(True, always=True),
-            theme=self.theme,
-            variant='secondary',
-            font=self.fonts['control'],
-            style_overrides=style['button_secondary'],
-            padx=12,
-            pady=7,
-        ).pack(side=tk.LEFT, padx=(8, 0))
-        create_button(
-            btn_row,
-            text='拒绝',
-            command=lambda: resolve(False),
-            theme=self.theme,
-            variant='secondary',
-            font=self.fonts['control'],
-            style_overrides=style['button_danger'],
-            padx=12,
-            pady=7,
-        ).pack(side=tk.LEFT, padx=(8, 0))
-
-        self.text_area.window_create(tk.END, window=card, padx=6, pady=4)
-        self.text_area.insert(tk.END, '\n\n')
-        self.text_area.config(state=tk.DISABLED)
-        self._auto_follow_transcript = follow_transcript
-        self._maybe_follow_transcript_end()
-        self._pending_perm_frames[request_id] = card
+        self._timeline_upsert(
+            key,
+            {
+                'kind': 'permission_card',
+                'state': 'waiting',
+                'title': f'permission-request: {tool_name}',
+                'text': summary,
+                'meta_text': 'choose allow, always allow, or deny; the decision is sent back to Claude Code',
+                'actions': [
+                    {'label': '允许', 'variant': 'primary', 'command': lambda: resolve(True)},
+                    {'label': f'总是允许 {tool_name}', 'command': lambda: resolve(True, always=True)},
+                    {'label': '拒绝', 'command': lambda: resolve(False)},
+                ],
+            },
+        )
 
     def _set_busy(self, busy: bool):
         self._busy = busy
@@ -4505,6 +4990,27 @@ class ChatWindow:
         self._maybe_follow_transcript_end()
         return 'break'
 
+    def _update_message_widget_text(self, container, text: str):
+        bubble = getattr(container, '_message_bubble', None)
+        if bubble is None or not bubble.winfo_exists():
+            return
+        text_width_chars = int(bubble.cget('width')) if str(bubble.cget('width')).isdigit() else self._pixels_to_chars(min(500, max(320, int(self._transcript_width * 0.68))))
+        plain_text, text_height, is_collapsible = self._build_message_layout(text, text_width_chars)
+        try:
+            bubble.configure(state=tk.NORMAL, height=text_height)
+            bubble.delete('1.0', tk.END)
+            self._insert_markdown_text(bubble, text)
+            bubble.configure(state=tk.DISABLED)
+            container._message_text = text
+            container._message_plain_text = plain_text
+            container._message_is_expanded = not is_collapsible
+            self._resize_bubble_shell(container)
+            container.update_idletasks()
+            container.configure(height=container.winfo_reqheight())
+        except Exception:
+            pass
+        self._maybe_follow_transcript_end()
+
     def _append_message(self, role: str, text: str, *, record_history: bool = True):
         reminder_text = self._translate_system_reminder(text)
         if reminder_text:
@@ -4823,6 +5329,8 @@ class ChatWindow:
         self._turn_thinking_text = ''
         self._turn_thinking_expanded = True  # 新一轮默认展开
         self._turn_thinking_user_closed = False
+        self._terminal_tool_input_texts.clear()
+        self._terminal_tool_block_keys.clear()
 
     def _insert_terminal_event(self, role: str, text: str):
         text = (text or '').strip()
